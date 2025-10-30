@@ -9,6 +9,8 @@ from transformers import PreTrainedTokenizerBase
 from ab.gpt.util.prompt.Prompt import Prompt
 from tqdm import tqdm
 
+from ab.nn.api import JoinConf
+
 
 def shuffle_data(df: DataFrame):
     return df.sample(frac=1).reset_index(drop=True)
@@ -39,55 +41,22 @@ class NNGenPrompt(Prompt):
             dataframe = DataFrame(columns=['instruction', 'context', 'response', 'category', 'text'])
             prompt_lists.append(dataframe)
             prompt = '\n'.join(prompt_dict[key]['prompt'])
-            # Get nn-dataset codes
             print('Preparing Data...', flush=True)
-            data = lemur.data(only_best_accuracy=only_best_accuracy, task=prompt_dict[key]['task']#, sql='''  '''
-            )
-            data = shuffle_data(data)
+            key_dict = prompt_dict[key]
+            num_joint_nns = key_dict.get('num_joint_nns') or 1
+            data = lemur.data(only_best_accuracy=only_best_accuracy, task=key_dict.get('task'),
+                              nn_prefixes=tuple(key_dict.get('nn_prefixes')), max_rows=n_training_prompts,
+                              sql=None if num_joint_nns < 2 else JoinConf(num_joint_nns=num_joint_nns,
+                                                                          same_columns=tuple(key_dict.get('keep_same')),
+                                                                          diff_columns=tuple(key_dict.get('no_repeat')),
+                                                                          enhance_nn=key_dict.get('improve')))
             print('Data acquisition complete', flush=True)
-            with_addons = prompt_dict[key]['addon_list']
-
             for _, row in tqdm(data.iterrows(), total=n_training_prompts or len(data)):
                 if n_training_prompts and len(dataframe) >= n_training_prompts:
                     break
                 para_dict = dict()
                 for it in prompt_dict[key]['input_list']:
                     para_dict[it['para']] = row[it['value']]
-
-                if with_addons:
-                    param_names = prompt_dict[key]['keep_same']
-                    params = {k: row[k] for k in param_names}
-                    addon_task = prompt_dict[key]['addon_task']
-                    if addon_task:
-                        params['task'] = addon_task
-                    addon_data = lemur.data(only_best_accuracy=only_best_accuracy, **params)
-
-                    filter_q = f"nn!='{row['nn']}'"
-                    if 'same_pref' in prompt_dict[key] and prompt_dict[key]['same_pref'] == True:
-                        filter_q += f"&nn.str.split('-',n=1).str[0]=='{row['nn'].split('-')[0]}'"  # Default addon filter in this case should be models with same prefix
-
-                    if 'improve' in prompt_dict[key] and prompt_dict[key]['improve'] == True:
-                        filter_q += f"&accuracy>{row['accuracy']}"  # model result with higher accuracy
-
-                    ## Apply non-repeat filter if exists:
-                    if 'no_repeat' in prompt_dict[key]:  # Compact test_prompt.json, items in prm is not supported
-                        for filter_it in prompt_dict[key]['no_repeat']:
-                            if isinstance(row[filter_it], str):
-                                filter_q += f"&{filter_it}!='{row[filter_it]}'"
-                            else:
-                                filter_q += f"&{filter_it}!={row[filter_it]}"
-                    filtered_addon_data = addon_data.query(filter_q)
-                    del addon_data
-
-                    if len(filtered_addon_data) > 0:
-                        shuffled = shuffle_data(filtered_addon_data)
-                        addon_row = shuffled.sample(n=1).iloc[0]
-                        del filtered_addon_data, shuffled
-                    else:
-                        continue  # The case no result matches requirement
-                    for it in prompt_dict[key]['addon_list']:
-                        para_dict[it['para']] = addon_row[it['value']]
-
                 inst = prompt.format(**para_dict)
                 # Having the same name prefix before '-'
                 output = '\n'.join(prompt_dict[key]['output'])

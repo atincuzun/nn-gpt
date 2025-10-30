@@ -12,25 +12,23 @@
                        {"para": "metric","value": "metric"},
                        {"para": "metric_code","value": "metric_code"},
                        {"para": "transform_code","value": "transform_code"},
-                       {"para": "prm","value": "prm"}
-        ],
-        "addon_list": [{"para": "addon_accuracy","value": "accuracy"},
-                       {"para": "addon_epoch","value": "epoch"},
-                       {"para": "addon_dataset","value": "dataset"},
-                       {"para": "addon_task","value": "task"},
-                       {"para": "addon_metric","value": "metric"},
-                       {"para": "addon_nn_code","value": "nn_code"},
-                       {"para": "addon_transform_code","value": "transform_code"},
-                       {"para": "addon_prm","value": "prm"}
+                       {"para": "prm","value": "prm"},
+
+                       {"para": "addon_accuracy","value": "accuracy_2"},
+                       {"para": "addon_epoch","value": "epoch_2"},
+                       {"para": "addon_nn_code","value": "nn_code_2"},
+                       {"para": "addon_transform_code","value": "transform_code_2"},
+                       {"para": "addon_prm","value": "prm_2"}
         ],
         "no_repeat": ["nn"],
         "keep_same": ["epoch", "metric", "dataset", "task"],
+        "nn_prefixes": [],
+        "num_joint_nns": 2,
         "improve": true,
-        "same_pref": true,
-      "prompt":  [
+        "prompt":  [
         "You are a machine learning model designer.",
-        "Your task is to generate a LEMUR Dataset neural network model that increases the '{addon_metric}' metric value to at least {addon_accuracy} at training epoch {addon_epoch} on the '{addon_dataset}' dataset for an '{addon_task}' task.",
-        "Use the following reference model, which achieved an accuracy of {accuracy} under identical evaluation conditions (metric, dataset, task, and epoch), as the baseline for architectural and training hyperparameter inspiration. Improve upon it through principled model design changes and training adjustments.",
+        "Your task is to generate a LEMUR Dataset neural network model that increases the '{metric}' metric value to at least {addon_accuracy} at training epoch {epoch} on the '{dataset}' dataset for an '{task}' task.",
+        "Use the following reference model, which achieved an accuracy of {accuracy} under identical evaluation conditions (metric, dataset, task, and epoch), as the baseline for architectural and training hyperparameter inspiration. Improve it by making fundamental changes to the model design and adjusting the training process.",
         "Respond with:",
         "1. A <hp> XML tag containing the training hyperparameters in valid JSON format.",
         "2. A <tr> XML tag containing the corresponding transformer code, ready to be used on the LEMUR dataset.",
@@ -38,12 +36,12 @@
         "Constraints:",
         "- Make any changes to hyperparameters or architecture that lead to improved performance.",
         "- Output only the XML tags <hp>, <tr> and <nn> with their corresponding contents — no additional explanation or text.",
-        "Reference hyperparameters and codes within the corresponding tags:",
-        "<metric>{metric_code}</metric>",
+        "Baseline hyperparameters and codes:",
         "<hp>{prm}</hp>",
         "<tr>{transform_code}</tr>",
-        "<nn>{nn_code}</nn>"
-      ],
+        "<nn>{nn_code}</nn>",
+        "<metric>{metric_code}</metric>"
+        ],
       "output":  [
         "<hp>{addon_prm}</hp>",
         "<tr>{addon_transform_code}</tr>",
