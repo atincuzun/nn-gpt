@@ -76,5 +76,4 @@ class SimpleCodeLogger:
         print(f"log save to {self.log_file}")
 
 
-code_logger = SimpleCodeLogger()
 

@@ -1,1 +1,1 @@
-##  Brute Force and Other Non-LLM Algorithms for Neural Network and Transformer Generation
+##  Brute-Force/Algorithmic Strategies for Generating Neural Network and Data Transformation Code

@@ -9,12 +9,25 @@ from peft import (
     prepare_model_for_kbit_training
 )
 from transformers import (
-    Trainer,
     TrainingArguments,
-    DataCollatorForLanguageModeling,
     PreTrainedModel,
     PreTrainedTokenizerBase
 )
+from trl import SFTTrainer, SFTConfig
+from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+
+# Try to import DataCollatorForCompletionOnlyLM (may not be available in all trl versions)
+try:
+    from trl.trainer.sft_trainer import DataCollatorForCompletionOnlyLM
+except ImportError:
+    try:
+        from trl import DataCollatorForCompletionOnlyLM
+    except ImportError:
+        try:
+            from trl.trainer import DataCollatorForCompletionOnlyLM
+        except ImportError:
+            # If not available, set to None and fall back to DataCollatorForLanguageModeling
+            DataCollatorForCompletionOnlyLM = None
 
 
 # When using deepspeed, no Training arguments' initialization after model initialization, if pre-trained model is used
@@ -92,12 +105,30 @@ class LoRA:
         self.model = prepare_model_for_kbit_training(self.model)
         self.model.gradient_checkpointing_enable()
         self.peft_model = get_peft_model(self.model, self.peft_config)
+        
+        # Log trainable parameters immediately after adapters are attached
+        print(f"[LoRA] Adapters attached. Effective target_modules: {self.peft_config.target_modules}")
+        print("[LoRA] Trainable parameter summary:")
+        print_trainable_parameters(self.peft_model)
 
-    def train(self, dataset: Dataset, tokenizer, output_dir: str):
+    def train(self, dataset: Dataset, tokenizer, output_dir: str, train_on_completions_only=False, response_template=None):
+        """
+        Train the model using SFTTrainer.
+        
+        Args:
+            dataset: Dataset with pre-rendered text (from chat template) or raw text
+            tokenizer: Tokenizer instance
+            output_dir: Directory to save the trained model
+            train_on_completions_only: If True, mask loss on system+user tokens (train only on assistant responses)
+            response_template: String that precedes assistant answer in rendered text (e.g., "Assistant:" for DeepSeek)
+        """
         self.peft_model.config.use_cache = False
+        
+        # Check if dataset has "text" field (pre-rendered) or needs formatting
+        has_text_field = "text" in dataset.column_names if hasattr(dataset, 'column_names') else False
+        
         # Split The dataset
         dataset = dataset.train_test_split(test_size=0.1)
-
         train_dataset = dataset['train']
         eval_dataset = dataset['test']
 
@@ -105,13 +136,122 @@ class LoRA:
         print("Parameter configuration of the model")
         print_trainable_parameters(self.peft_model)
 
-        trainer = Trainer(
-            model=self.peft_model,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            args=self.training_args,
-            data_collator=DataCollatorForLanguageModeling(self.tokenizer, pad_to_multiple_of=8, return_tensors="pt", mlm=False)
-        )
+        # Determine data collator and trainer kwargs
+        if train_on_completions_only:
+            if response_template is None:
+                # Try to auto-detect response template from first example
+                if has_text_field and len(train_dataset) > 0:
+                    sample_text = train_dataset[0]["text"]
+                    print(f"[INFO] Inspecting sample text to detect response template:")
+                    print(f"Sample (first 500 chars):\n{sample_text[:500]}")
+                    
+                    # Common patterns for DeepSeek and similar models
+                    possible_templates = ["Assistant:", "assistant:", "<|assistant|>", "### Assistant:"]
+                    for template in possible_templates:
+                        if template in sample_text:
+                            response_template = template
+                            print(f"[INFO] Auto-detected response template: '{response_template}'")
+                            break
+                    
+                    if response_template is None:
+                        print("[WARN] Could not auto-detect response template. Please set response_template manually.")
+                        print("[WARN] Falling back to training on all tokens.")
+                        train_on_completions_only = False
+                else:
+                    print("[WARN] Cannot auto-detect response template. Dataset missing 'text' field or is empty.")
+                    print("[WARN] Falling back to training on all tokens.")
+                    train_on_completions_only = False
+            
+            if train_on_completions_only and response_template and DataCollatorForCompletionOnlyLM is not None:
+                print(f"[INFO] Using completion-only training with response template: '{response_template}'")
+                collator = DataCollatorForCompletionOnlyLM(
+                    response_template=response_template,
+                    tokenizer=self.tokenizer
+                )
+            else:
+                if train_on_completions_only and DataCollatorForCompletionOnlyLM is None:
+                    print("[WARN] DataCollatorForCompletionOnlyLM not available, using DataCollatorForLanguageModeling with completion_only_loss=True")
+                # TRL's DataCollatorForLanguageModeling uses pad_token_id and completion_only_loss
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                collator = DataCollatorForLanguageModeling(
+                    pad_token_id=pad_token_id,
+                    completion_only_loss=train_on_completions_only if train_on_completions_only else True,
+                    pad_to_multiple_of=8,
+                    return_tensors="pt"
+                )
+        else:
+            # TRL's DataCollatorForLanguageModeling uses pad_token_id
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            collator = DataCollatorForLanguageModeling(
+                pad_token_id=pad_token_id,
+                completion_only_loss=True,
+                pad_to_multiple_of=8,
+                return_tensors="pt"
+            )
+
+        # Use SFTTrainer for pre-rendered text, or fallback to Trainer if needed
+        # TL;DR: Feed Dataset.from_list([...{"text": ...}...]) to SFTTrainer with dataset_text_field="text"
+        # Choose:
+        #   Simple: train on full text (packing=True)
+        #   Precise: DataCollatorForCompletionOnlyLM with response_template + packing=False
+        if has_text_field:
+            print("[INFO] Using SFTTrainer with pre-rendered text (dataset_text_field='text')")
+            # Packing: enable when NOT using completion-only masking (completion-only requires packing=False)
+            # Simple mode: packing=True (train on full text)
+            # Precise mode: packing=False + DataCollatorForCompletionOnlyLM (train on completions only)
+            use_packing = not train_on_completions_only
+            print(f"[INFO] Packing enabled: {use_packing} ({'Simple mode: full text' if use_packing else 'Precise mode: completions only'})")
+            
+            # Configure tokenizer for SFT: truncate from left (keep assistant response), pad on right
+            # This ensures sequences are truncated correctly when SFTTrainer tokenizes
+            self.tokenizer.truncation_side = "left"
+            self.tokenizer.padding_side = "right"
+            self.tokenizer.model_max_length = 4096  # DeepSeek-Coder-7B-Instruct-v1.5 has ~4K context
+            
+            # Suppress sequence length warnings - SFTTrainer will handle truncation correctly
+            import warnings
+            warnings.filterwarnings("ignore", message=".*sequence length.*longer than.*maximum.*")
+            warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
+            
+            # Set packing, max_seq_length, and dataset_text_field in SFTConfig to avoid warnings
+            # Convert to SFTConfig if not already, or set attributes directly
+            if isinstance(self.training_args, SFTConfig):
+                self.training_args.remove_unused_columns = False  # critical when using raw text
+                self.training_args.packing = use_packing  # Simple: True, Precise: False
+                self.training_args.max_seq_length = 4096  # DeepSeek-Coder-7B-Instruct-v1.5 has ~4K context (4k/4.1k)
+                self.training_args.dataset_text_field = "text"  # Feed Dataset with {"text": ...} format
+            else:
+                # If training_args is TrainingArguments, create SFTConfig with all attributes
+                sft_config = SFTConfig(**self.training_args.to_dict())
+                sft_config.remove_unused_columns = False  # critical when using raw text
+                sft_config.packing = use_packing  # Simple: True, Precise: False
+                sft_config.max_seq_length = 4096  # DeepSeek-Coder-7B-Instruct-v1.5 has ~4K context (4k/4.1k)
+                sft_config.dataset_text_field = "text"  # Feed Dataset with {"text": ...} format
+                self.training_args = sft_config
+            
+            # SFTTrainer will handle tokenization and truncation internally
+            # Since chat_template already added special tokens, tokenizer will use add_special_tokens=False internally
+            trainer = SFTTrainer(
+                model=self.peft_model,
+                tokenizer=self.tokenizer,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                args=self.training_args,
+                data_collator=collator  # Simple: DataCollatorForLanguageModeling, Precise: DataCollatorForCompletionOnlyLM
+                # packing, max_seq_length, and dataset_text_field are in training_args (SFTConfig)
+                # SFTTrainer will handle truncation based on max_seq_length and tokenizer settings
+            )
+        else:
+            print("[WARN] Dataset does not have 'text' field. Using standard Trainer.")
+            # Fallback to original Trainer if dataset format is different
+            from transformers import Trainer
+            trainer = Trainer(
+                model=self.peft_model,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                args=self.training_args,
+                data_collator=collator
+            )
 
         # verifying the datatypes before training
         dtypes = {}

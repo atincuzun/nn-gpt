@@ -41,36 +41,10 @@
         "value": "prm"
       }
     ],
-    "addon_list": [
-      {
-        "para": "addon_epoch",
-        "value": "epoch"
-      },
-      {
-        "para": "addon_dataset",
-        "value": "dataset"
-      },
-      {
-        "para": "addon_task",
-        "value": "task"
-      },
-      {
-        "para": "addon_metric",
-        "value": "metric"
-      },
-      {
-        "para": "addon_nn_code",
-        "value": "nn_code"
-      },
-      {
-        "para": "addon_prm",
-        "value": "prm"
-      }
-    ],
     "no_repeat": [],
     "keep_same": [],
     "prompt": [
-      "Provide the training hyperparameters (as a JSON object between XML tags <hp> and </hp>), corresponding transformer code (as a Python code between XML tags <tr> and </tr>) and neural network model (as a Python code between XML tags <nn> and </nn>) that achieves a maximum value for the metric '{addon_metric}' at epoch {addon_epoch} on the '{addon_dataset}' dataset for the task '{addon_task}'.",
+            "Provide the training hyperparameters (as a JSON object between XML tags <hp> and </hp>), corresponding transformer code (as a Python code between XML tags <tr> and </tr>) and neural network model (as a Python code between XML tags <nn> and </nn>) that achieves a maximum value for the metric '{metric}' after first epoch of training on the '{dataset}' dataset for the task '{task}'.",
       "1. Training hyperparameters (JSON object between XML tags <hp> and </hp>):",
       "  Obligatory keys \"batch\", \"transform\", and all keys from the 'supported_hyperparameters' function in model code. Do not use any other keys like \"hp*\".",
       "  If unsure, use: \"batch\": 64, \"transform\": \"norm_128_flip\".",

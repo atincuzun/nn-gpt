@@ -8,7 +8,7 @@ from ab.gpt.util.Const import conf_test_dir
 def main():
     parser = argparse.ArgumentParser(description="Generate revised neural-network architectures models of captioning task.")
     parser.add_argument("-e", "--epochs", type=int, default=5, help="Number of generation epochs.")
-    parser.add_argument("-c", "--conf", type=str, default="NN_Cap.json", help="Config file in conf_test directory. (e.g. NN_Caption.json, NN_Caption_master.json)")
+    parser.add_argument("-c", "--conf", type=str, default="NN_CAPU.json", help="Config file in conf_test directory. (e.g. NN_Caption.json, NN_Caption_master.json)")
     parser.add_argument("-nn", type=str, default=None, help="To generate variants ONLY for this models (e.g. RESNETLSTM, ResNetTransformer) otherwise default all.")
     parser.add_argument("-m", "--model", type=str, default="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", help="HF model id or local model path.Choose a smaller model for faster generation. e.g. 'open-r1/OlympicCoder-7B' or 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B' or 'deepseek-ai/deepseek-coder-7b-instruct'.")
     parser.add_argument("--gguf", type=str, default=None, help="Optional GGUF file path if using a local/llama.cpp backend.")
