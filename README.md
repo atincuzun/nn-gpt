@@ -14,24 +14,16 @@ For Linux/Mac:
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   python -m pip install --upgrade pip
+   python3 -m pip install --upgrade pip
    ```
 For Windows:
    ```bash
    python3 -m venv .venv
    .venv\Scripts\activate
-   python -m pip install -- pip
+   python3 -m pip install --upgrade pip
    ```
 
 It is assumed that CUDA 12.6 is installed; otherwise, consider replacing 'cu126' with the appropriate version. Most LLM usage scenarios require GPUs with at least 24 GB of memory.
-
-## Installation of NNGPT with pip
-
-```bash
-   pip install nn-gpt --extra-index-url https://download.pytorch.org/whl/cu126
-   pip install nn-gpt[flash] --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu126
-   ```
-
 
 ## Environment for NNGPT Developers
 ### Pip package manager
@@ -63,6 +55,13 @@ and export/generate:
 ```bash
 python -m ab.stat.export
 ```
+
+## Installation of NNGPT with pip
+
+```bash
+   pip install nn-gpt --extra-index-url https://download.pytorch.org/whl/cu126
+   pip install nn-gpt[flash] --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu126
+   ```
 
 ## Use
 

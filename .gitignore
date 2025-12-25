@@ -9,3 +9,10 @@ data/
 curation_output/
 iterative_pipeline.log
 .gitignore
+
+# Run artifacts (do not commit)
+out/
+**/checkpoint-*
+**/tokenizer/
+output.log
+stat/

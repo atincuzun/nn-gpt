@@ -1,8 +1,10 @@
 import argparse
 import os
 import json
+import sys
 from typing import Literal
 
+import torch
 from peft import LoraConfig
 from transformers import TrainingArguments
 
@@ -50,6 +52,62 @@ TEMPERATURE = 0.8
 TOP_K = 70
 TOP_P = 0.9
 TEST_METRIC = None  # 'bleu' or other metric for evaluation
+ONNX_RUN = False
+
+# --- Pipeline-Optimized Defaults (for iterative_finetune.py) ---
+# These defaults are optimized for multi-cycle iterative fine-tuning
+PIPELINE_LEARNING_RATE = 1e-5  # Conservative for stability (vs standalone 1e-6)
+PIPELINE_WEIGHT_DECAY = 0.01  # Regularization
+PIPELINE_WARMUP_STEPS = 20  # ~2% of samples for stable start
+PIPELINE_NUM_TRAIN_EPOCHS = 5  # More epochs per cycle (vs standalone 3)
+PIPELINE_LOGGING_STEPS = 10  # More frequent logging (vs standalone 96)
+PIPELINE_TARGET_MODULES = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj')  # Extended to include MLP
+PIPELINE_MAX_NEW_TOKENS = 8192  # Balanced length (vs standalone 16*1024)
+PIPELINE_TEMPERATURE = 0.2  # More deterministic (vs standalone 0.8)
+PIPELINE_TOP_K = 50  # Less randomness (vs standalone 70)
+PIPELINE_EVAL_STEPS = 100  # Less frequent evaluation to reduce memory spikes
+PIPELINE_SAVE_STEPS = 100  # Match eval_steps for consistency
+PIPELINE_SAVE_TOTAL_LIMIT = 3  # Keep last 3 checkpoints
+PIPELINE_PER_DEVICE_EVAL_BATCH_SIZE = 1  # Reduce eval batch size to save memory
+PIPELINE_EVALUATION_STRATEGY = 'steps'
+PIPELINE_LOAD_BEST_MODEL_AT_END = True
+PIPELINE_METRIC_FOR_BEST_MODEL = 'eval_loss'
+
+def get_pipeline_defaults():
+    """
+    Get pipeline-optimized training defaults for iterative fine-tuning.
+    
+    Returns:
+        dict: Dictionary of default values for pipeline mode, suitable for
+              converting to command-line arguments or direct function calls.
+    """
+    return {
+        'learning_rate': PIPELINE_LEARNING_RATE,
+        'weight_decay': PIPELINE_WEIGHT_DECAY,
+        'warmup_steps': PIPELINE_WARMUP_STEPS,
+        'num_train_epochs': PIPELINE_NUM_TRAIN_EPOCHS,
+        'logging_steps': PIPELINE_LOGGING_STEPS,
+        'max_grad_norm': MAX_GRAD_NORM,  # Same as standalone
+        'target_modules': ','.join(PIPELINE_TARGET_MODULES),  # Convert tuple to comma-separated string
+        'max_new_tokens': PIPELINE_MAX_NEW_TOKENS,
+        'temperature': PIPELINE_TEMPERATURE,
+        'top_k': PIPELINE_TOP_K,
+        'evaluation_strategy': PIPELINE_EVALUATION_STRATEGY,
+        'eval_steps': PIPELINE_EVAL_STEPS,
+        'per_device_eval_batch_size': PIPELINE_PER_DEVICE_EVAL_BATCH_SIZE,
+        'save_strategy': PIPELINE_EVALUATION_STRATEGY,  # Same as evaluation_strategy
+        'save_steps': PIPELINE_SAVE_STEPS,
+        'save_total_limit': PIPELINE_SAVE_TOTAL_LIMIT,
+        'load_best_model_at_end': PIPELINE_LOAD_BEST_MODEL_AT_END,
+        'metric_for_best_model': PIPELINE_METRIC_FOR_BEST_MODEL,
+    }
+
+def _best_dtype_args():
+    """Detect best mixed precision dtype based on hardware support.
+    Returns dict with bf16=True if supported, otherwise fp16=True.
+    This aligns with model loading which uses torch.bfloat16."""
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    return {"bf16": bf16_ok, "fp16": not bf16_ok}
 
 def main(num_train_epochs=NUM_TRAIN_EPOCHS, lr_scheduler=LR_SCHEDULER, max_grad_norm=MAX_GRAD_NORM, test_metric=TEST_METRIC,
          tune_layers=TUNE_LAYERS, r=R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, target_modules=TARGET_MODULES,
@@ -60,7 +118,8 @@ def main(num_train_epochs=NUM_TRAIN_EPOCHS, lr_scheduler=LR_SCHEDULER, max_grad_
          nn_train_epochs=NN_TRAIN_EPOCHS, temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P, data_dir=None, 
          # Pipeline-specific overrides (for backward compatibility with iterative_finetune.py)
          evaluation_strategy=None, eval_steps=None, save_strategy=None, save_steps=None, 
-         save_total_limit=None, load_best_model_at_end=False, metric_for_best_model=None, warmup_steps=None, weight_decay=None, per_device_eval_batch_size=None):
+         save_total_limit=None, load_best_model_at_end=False, metric_for_best_model=None, warmup_steps=None, weight_decay=None,
+         per_device_eval_batch_size=None, onnx_run=ONNX_RUN):
     print(f'''All hyperparameters: 
 num_train_epochs={num_train_epochs}, lr_scheduler={lr_scheduler}, max_grad_norm={max_grad_norm}, tune_layers={tune_layers}, test_metric={test_metric}, 
 r={r}, lora_alpha={lora_alpha}, lora_dropout={lora_dropout}, target_modules={target_modules}, task_type={task_type}, bias={bias}, 
@@ -68,7 +127,7 @@ learning_rate={learning_rate}, llm_tune_conf={llm_tune_conf}, nn_gen_conf={nn_ge
 llm_conf={llm_conf}, test_nn={test_nn}, nn_train_epochs={nn_train_epochs}, peft={peft}, skip_epoches={skip_epoches}, 
 per_device_train_batch_size={per_device_train_batch_size}, gradient_accumulation_steps={gradient_accumulation_steps}, warmup_ratio={warmup_ratio}, 
 logging_steps={logging_steps}, optimizer={optimizer}, max_prompts={max_prompts}, save_llm_output={save_llm_output}, max_new_tokens={max_new_tokens}, 
-use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={temperature}, top_k={top_k}, top_p={top_p} ''')
+use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={temperature}, top_k={top_k}, top_p={top_p}, onnx_run={onnx_run} ''')
 
     # Build test_prm for standalone mode (epoch-based evaluation)
     # Pipeline mode will override with step-based evaluation via evaluation_strategy
@@ -81,6 +140,11 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
         'load_best_model_at_end': False
     } if test_metric else {}
     
+    # Detect best mixed precision dtype (aligns with model loading which uses bfloat16)
+    # This fixes the mismatch where model is loaded in bfloat16 but training used fp16,
+    # which caused: NotImplementedError: "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
+    dtype_flags = _best_dtype_args()
+    
     # Build TrainingArguments kwargs
     # Pipeline mode (when evaluation_strategy is passed): use step-based eval with pipeline overrides
     # Standalone mode: use epoch-based eval with test_metric
@@ -91,7 +155,6 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
             'per_device_train_batch_size': per_device_train_batch_size,
             'gradient_accumulation_steps': gradient_accumulation_steps,
             'learning_rate': learning_rate,
-            'fp16': True,
             'logging_steps': logging_steps,
             'output_dir': nngpt_dir / 'outputs',
             'optim': optimizer,
@@ -99,6 +162,7 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
             'gradient_checkpointing': True,
             'max_grad_norm': max_grad_norm,
             'num_train_epochs': num_train_epochs,  # Use parameter from command-line or default
+            **dtype_flags,  # Use bf16 if supported, otherwise fp16
         }
         
         # Add warmup - pipeline may pass warmup_steps (override) or use warmup_ratio
@@ -138,12 +202,12 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
             'gradient_accumulation_steps': gradient_accumulation_steps,
             'warmup_ratio': warmup_ratio,
             'learning_rate': learning_rate,
-            'fp16': True,
             'logging_steps': logging_steps,
             'output_dir': nngpt_dir / 'outputs',
             'optim': optimizer,
             'deepspeed': ds_conf if use_deepspeed else None,
             'gradient_checkpointing': True,
+            **dtype_flags,  # Use bf16 if supported, otherwise fp16
             **test_prm  # Add test metric configuration if provided
         }
     
@@ -186,7 +250,7 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
 
     tune(test_nn, nn_train_epochs, skip_epoches, peft, llm_tune_conf, nn_gen_conf, nn_gen_conf_id, llm_conf, training_args, peft_config,
          max_prompts=max_prompts, save_llm_output=save_llm_output, max_new_tokens=max_new_tokens, nn_name_prefix=nn_name_prefix, 
-         temperature=temperature, top_k=top_k, top_p=top_p, data_dir=data_dir)
+         temperature=temperature, top_k=top_k, top_p=top_p, onnx_run=onnx_run)
     
     print("\n" + "="*70)
     print("FINE-TUNING CONFIGURATION SUMMARY")
@@ -217,6 +281,44 @@ use_deepspeed={use_deepspeed}, nn_name_prefix={nn_name_prefix}, temperature={tem
 if __name__ == '__main__':
     TARGET_MODULES_STR = ','.join(TARGET_MODULES)
     parser = argparse.ArgumentParser(description='Evaluate Neural Networks generated by NNAlter.py.')
+    
+    # Iterative pipeline mode flag
+    parser.add_argument('--run_iterative_pipeline', action='store_true', default=False,
+                        help='Run the full iterative fine-tuning pipeline instead of standalone fine-tuning')
+    
+    # Iterative pipeline-specific arguments (only used when --run_iterative_pipeline is set)
+    parser.add_argument("--base_data_dir", type=str, default=None,
+                        help="[Pipeline] Path to original chat_data directory (required when --run_iterative_pipeline is set)")
+    parser.add_argument("--output_dir", type=str, default="out/iterative_cycles",
+                        help="[Pipeline] Output directory for all cycle results (default: out/iterative_cycles)")
+    parser.add_argument("--cycles", type=int, default=5,
+                        help="[Pipeline] Number of fine-tuning cycles to run (default: 5)")
+    parser.add_argument("--models_per_cycle", type=int, default=150,
+                        help="[Pipeline] Number of models to generate per cycle (default: 150)")
+    parser.add_argument("--samples_per_prompt", type=int, default=1,
+                        help="[Pipeline] Number of models to generate per prompt (default: 1). "
+                             "Total models = prompts * samples_per_prompt")
+    parser.add_argument("--accuracy_threshold", type=float, default=0.40,
+                        help="[Pipeline] Minimum first-epoch accuracy to select models (0.0-1.0, default: 0.40)")
+    parser.add_argument("--min_selected_k", type=int, default=15,
+                        help="[Pipeline] Minimum models to select via fallback (default: 15)")
+    parser.add_argument("--fallback_threshold", type=float, default=0.35,
+                        help="[Pipeline] Lower bound accuracy for fallback selection (default: 0.35)")
+    parser.add_argument("--adaptive_threshold", action="store_true", default=False,
+                        help="[Pipeline] Enable adaptive threshold (60-70th percentile)")
+    parser.add_argument("--novelty_check", action="store_true", default=True,
+                        help="[Pipeline] Enable novelty checking (default: True)")
+    parser.add_argument("--no_novelty_check", dest="novelty_check", action="store_false",
+                        help="[Pipeline] Disable novelty checking")
+    parser.add_argument("--resume_from_cycle", type=int, default=None,
+                        help="[Pipeline] Resume pipeline from a specific cycle (1-cycles)")
+    parser.add_argument("--max_retries", type=int, default=3,
+                        help="[Pipeline] Maximum retry attempts for transient failures (default: 3)")
+    parser.add_argument("--use_optimized_training", action="store_true", default=True,
+                        help="[Pipeline] Use optimized training hyperparameters for stability and quality (default: True)")
+    parser.add_argument("--no_optimized_training", dest="use_optimized_training", action="store_false",
+                        help="[Pipeline] Use original default training hyperparameters")
+    # Note: --num_train_epochs is already defined below for standalone mode, but pipeline can override it
     
     # Standalone-specific parameters
     parser.add_argument('-ne', '--num_train_epochs', type=int, default=NUM_TRAIN_EPOCHS,
@@ -316,8 +418,51 @@ if __name__ == '__main__':
                         help=f"[Pipeline] Warmup steps override (default: None, uses warmup_ratio for standalone).")
     parser.add_argument('--weight_decay', type=float, default=None,
                         help=f"[Pipeline] Weight decay for regularization (default: None).")
+    parser.add_argument('--onnx_run', type=float, default=ONNX_RUN,
+                        help=f"Run model generation step with LLM in ONNX format (default: {ONNX_RUN}).")
 
     args = parser.parse_args()
+    
+    # Check if iterative pipeline mode is requested
+    if args.run_iterative_pipeline:
+        # Validate required arguments for pipeline mode
+        if args.base_data_dir is None:
+            parser.error("--base_data_dir is required when --run_iterative_pipeline is set")
+        if args.llm_conf is None:
+            parser.error("--llm_conf is required when --run_iterative_pipeline is set")
+        
+        # Validate resume cycle if provided
+        if args.resume_from_cycle is not None:
+            if args.resume_from_cycle < 1 or args.resume_from_cycle > args.cycles:
+                parser.error(f"--resume_from_cycle must be between 1 and {args.cycles}, got {args.resume_from_cycle}")
+        
+        # Import and run iterative pipeline
+        from ab.gpt.iterative_finetune import IterativeFinetuner
+        
+        pipeline = IterativeFinetuner(
+            base_data_dir=args.base_data_dir,
+            output_dir=args.output_dir,
+            llm_conf=args.llm_conf,
+            cycles=args.cycles,
+            models_per_cycle=args.models_per_cycle,
+            samples_per_prompt=args.samples_per_prompt,
+            accuracy_threshold=args.accuracy_threshold,
+            min_selected_k=args.min_selected_k,
+            fallback_threshold=args.fallback_threshold,
+            adaptive_threshold=args.adaptive_threshold,
+            novelty_check=args.novelty_check,
+            resume_from_cycle=args.resume_from_cycle,
+            max_retries=args.max_retries,
+            use_optimized_training=args.use_optimized_training,
+            num_train_epochs=args.num_train_epochs,  # Pipeline-specific epochs override
+        )
+        
+        # Run the pipeline
+        pipeline.run()
+        # Exit early, don't run standalone fine-tuning
+        sys.exit(0)
+    
+    # Standalone fine-tuning mode (default behavior)
     main(num_train_epochs=args.num_train_epochs,
          lr_scheduler=args.lr_scheduler,
          max_grad_norm=args.max_grad_norm,
@@ -363,4 +508,5 @@ if __name__ == '__main__':
          metric_for_best_model=args.metric_for_best_model,
          warmup_steps=args.warmup_steps,
          weight_decay=args.weight_decay,
+         onnx_run=args.onnx_run
          )

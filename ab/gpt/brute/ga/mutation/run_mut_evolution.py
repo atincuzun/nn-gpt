@@ -11,6 +11,7 @@ import time
 import hashlib
 from MutNet_evolvable import Net, SEARCH_SPACE, generate_model_code_string
 from genetic_algorithm import GeneticAlgorithm
+from ab.gpt.util.Eval import Eval
 
 # Config
 POPULATION_SIZE = 60
@@ -54,58 +55,10 @@ def fitness_function(chromosome: dict) -> float:
 
     try:
         print(f"  - Evaluating unique arch (checksum: {model_checksum[:8]}...)")
-        start_time = time.time()
-        in_shape = (3, 32, 32)
-        out_shape = (10,)
-        model = Net(in_shape, out_shape, chromosome, device)
-        model.train_setup(prm=chromosome)
-
+        
         current_arch_number = architecture_counter
         model_base_name = f"ga-mut-{current_arch_number}"
-        model_stats_dir_path = os.path.join(STATS_SAVE_DIR, f"img-classification_cifar-10_acc_{model_base_name}")
-        os.makedirs(model_stats_dir_path, exist_ok=True)
-
-        epoch_accuracies = []
-        for epoch in range(NUM_EPOCHS_PER_EVAL):
-            model.learn(train_loader)
-            model.eval()
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for inputs, labels in val_loader:
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    outputs = model(inputs)
-                    _, predicted = torch.max(outputs.data, 1)
-                    total += labels.size(0)
-                    correct += (predicted == labels).sum().item()
-            epoch_accuracy = 100 * correct / total
-            epoch_accuracies.append(epoch_accuracy)
-            print(f"    - Epoch {epoch+1}/{NUM_EPOCHS_PER_EVAL} Accuracy: {epoch_accuracy:.2f}%")
-
-            # ✅ FIX: Save as 1.json, 2.json, ..., NOT 0.json
-            epoch_stats_filename = f"{epoch + 1}.json"
-            epoch_stats_filepath = os.path.join(model_stats_dir_path, epoch_stats_filename)
-
-            # Only include lr, momentum, dropout
-            epoch_stats_data = {
-                "accuracy": round(epoch_accuracy / 100.0, 4),
-                "batch": BATCH_SIZE,
-                "dropout": round(chromosome.get('dropout', 0.0), 4),
-                "lr": round(chromosome.get('lr', 0.0), 4),
-                "momentum": round(chromosome.get('momentum', 0.0), 4),
-                "transform": "norm_256_flip",
-                "uid": model_checksum,
-            }
-            try:
-                with open(epoch_stats_filepath, 'w') as f:
-                    json.dump([epoch_stats_data], f, indent=4)
-            except Exception as e:
-                print(f"      - Failed to save {epoch_stats_filepath}: {e}")
-
-        final_accuracy = epoch_accuracies[-1] if epoch_accuracies else 0.0
-        duration_ns = int((time.time() - start_time) * 1_000_000_000)
-
-        # Save model code
+        
         arch_filepath = os.path.join(ARCHITECTURE_SAVE_DIR, f"{model_base_name}.py")
         try:
             with open(arch_filepath, 'w') as f:
@@ -114,9 +67,53 @@ def fitness_function(chromosome: dict) -> float:
             architecture_counter += 1
         except Exception as e:
             print(f"  - Failed to save arch: {e}")
+            return 0.0
 
-        seen_checksums.add(model_checksum)
-        return final_accuracy
+        eval_prm = {
+            'lr': chromosome['lr'],
+            'momentum': chromosome['momentum'],
+            'dropout': chromosome['dropout'],
+            'batch': BATCH_SIZE,
+            'epoch': NUM_EPOCHS_PER_EVAL,
+            'transform': "norm_256_flip"
+        }
+
+        model_stats_dir_name = f"img-classification_cifar-10_acc_{model_base_name}"
+        model_stats_dir_path = os.path.join(STATS_SAVE_DIR, model_stats_dir_name)
+        os.makedirs(model_stats_dir_path, exist_ok=True)
+        evaluator = Eval(
+            model_source_package=ARCHITECTURE_SAVE_DIR,
+            task='img-classification',
+            dataset='cifar-10',
+            metric='acc',
+            prm=eval_prm,
+            save_to_db=True, # Required to generate JSON stats
+            prefix=model_base_name,
+            save_path=model_stats_dir_path
+        )
+
+        try:
+            result = evaluator.evaluate(arch_filepath)
+            
+            if isinstance(result, dict) and 'accuracy' in result:
+                final_accuracy = result['accuracy'] * 100
+            elif isinstance(result, tuple) and len(result) >= 2:
+                final_accuracy = float(result[1]) * 100
+            elif isinstance(result, float):
+                final_accuracy = result * 100
+            elif result is not None:
+                try:
+                    final_accuracy = float(result) * 100
+                except:
+                    pass
+            
+            print(f"  - Eval result: {final_accuracy:.2f}%")
+            seen_checksums.add(model_checksum)
+            return final_accuracy
+
+        except Exception as e:
+            print(f"  - Evaluation error (Eval): {e} → fitness = 0")
+            return 0.0
 
     except Exception as e:
         print(f"  - Evaluation error: {e} → fitness = 0")

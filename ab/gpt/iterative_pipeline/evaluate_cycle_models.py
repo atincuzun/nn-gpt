@@ -197,17 +197,8 @@ def evaluate_cycle_models(cycle: int, nneval_dir: Path):
                         # Generate model name using UUID (same as NNEval.py)
                         code_content = read_py_file_as_string(code_file)
                         nn_name = uuid4(code_content)
-                        
-                        # Create a dataframe-like dict with task, dataset, metric info
-                        # This matches what NNEval.py does when it has a dataframe
-                        df_dict = {
-                            'task': 'img-classification',
-                            'dataset': 'cifar-10',
-                            'metric': 'acc'
-                        }
-                        
                         # Call copy_to_lemur to create stat folder structure
-                        copy_to_lemur(df_dict, model_dir, nn_name)
+                        copy_to_lemur(model_dir, nn_name, 'img-classification', 'cifar-10','acc')
                         print(f"  [STAT] Copied to LEMUR stat folder")
                     except Exception as e:
                         # Don't fail evaluation if stat copy fails
