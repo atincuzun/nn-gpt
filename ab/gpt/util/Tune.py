@@ -122,10 +122,6 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
         model = model.merge_and_unload()
 
-    # initialize deepspeed before we do infer in ChatBot
-    if use_deepspeed:
-        deepspeed.initialize(model=model, config_params=ds_conf)
-
     lora_tuner = LoRA(
         model,
         tokenizer,
@@ -134,10 +130,25 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         peft_config=peft_config,
         use_unsloth=use_unsloth)
 
+    # Initialize DeepSpeed ONCE after LoRA adapters are attached so the engine
+    # wraps the PEFT model.  Both inference and fine-tuning share this single engine.
+    # ds_engine.module is the underlying PEFT model used for model.generate().
+    ds_engine = None
+    inference_model = lora_tuner.peft_model
+    if use_deepspeed:
+        ds_engine, _, _, _ = deepspeed.initialize(
+            model=lora_tuner.peft_model,
+            model_parameters=lora_tuner.peft_model.parameters(),
+            config_params=ds_conf
+        )
+        inference_model = ds_engine.module  # unwrapped model for generate()
+        print('[DeepSpeed] Engine initialized. Using ds_engine.module for inference.')
+
     print('Using Max Length:', model_loader.get_max_length())
 
-    # loop train and eval cycles
-    chat_bot = ChatBot(model, tokenizer, temperature=temperature, top_k=top_k, top_p=top_p) # Only initialize ONCE
+    # ChatBot always receives the unwrapped model so that model.generate() works
+    # correctly regardless of whether DeepSpeed wraps it or not.
+    chat_bot = ChatBot(inference_model, tokenizer, temperature=temperature, top_k=top_k, top_p=top_p)  # Only initialize ONCE
 
     shutil.rmtree(epoch_dir(), ignore_errors=True)
     for epoch in range(llm_tune_epochs):
@@ -153,6 +164,12 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
 
         # fine tune model for 1 epoch / Using training_args and save copy
         print(f'[DEBUG]Perform finetune at epoch {epoch}.')
+
+        # Switch model to train mode before preparing the dataset
+        if ds_engine is not None:
+            ds_engine.train()
+        else:
+            model.train()
 
         # Select data processor based on mode
         if trans_mode:
@@ -172,9 +189,15 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         dataset = data_processor.get_dataset(only_best_accuracy, max_prompts=max_prompts, max_new_tokens=max_new_tokens)
 
         print('Dataset length:', len(dataset))
-        model.train()
-        model = lora_tuner.train(dataset, tokenizer, out_path / base_model_name)
+        if use_deepspeed and ds_engine is not None:
+            # train_deepspeed operates on the engine in-place; no return value needed.
+            lora_tuner.train_deepspeed(dataset, out_path / base_model_name, ds_engine)
+        else:
+            model.train()
+            model = lora_tuner.train(dataset, tokenizer, out_path / base_model_name)
         del dataset
+        # After training, put the inference model back in eval mode
+        inference_model.eval()
         release_memory()
 
 
@@ -245,7 +268,10 @@ def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, t
     for start in range(0, len(pending), prompt_batch):
         batch = pending[start:start + prompt_batch]
         batch_prompts = [item[1] for item in batch]
-        if prompt_batch > 1 and hasattr(chat_bot, 'chat_batch'):
+        # Prefer chat_batch_direct: works with DeepSpeed-wrapped models via model.generate()
+        if prompt_batch > 1 and hasattr(chat_bot, 'chat_batch_direct'):
+            batch_outputs = chat_bot.chat_batch_direct(batch_prompts, engineer_prompt=False, max_new_tokens=max_new_tokens)
+        elif prompt_batch > 1 and hasattr(chat_bot, 'chat_batch'):
             batch_outputs = chat_bot.chat_batch(batch_prompts, engineer_prompt=False, max_new_tokens=max_new_tokens)
         else:
             batch_outputs = [chat_bot.chat(p, engineer_prompt=False, max_new_tokens=max_new_tokens) for p in batch_prompts]

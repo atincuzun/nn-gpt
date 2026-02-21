@@ -317,3 +317,114 @@ class LoRA:
         # del trainer
         release_memory()
         return self.peft_model
+
+    def train_deepspeed(self, dataset: Dataset, output_dir: str, ds_engine):
+        """
+        Fine-tune the PEFT model using a pre-initialized DeepSpeed engine.
+
+        DeepSpeed is initialized ONCE externally (in Tune.py) and passed in here.
+        This function only handles dataset preparation and the training loop.
+        It does NOT reinitialize DeepSpeed and does NOT return anything — the engine
+        already wraps self.peft_model in-place, so the caller keeps the same reference.
+
+        The simplest correct approach for causal-LM fine-tuning:
+          - Tokenize the 'text' column (prompt + response already formatted)
+          - Use DataCollatorForLanguageModeling(mlm=False): pads sequences and
+            sets labels = input_ids, with -100 on padding positions so padded
+            tokens are excluded from the loss — no TRL dependency needed.
+          - Standard forward → ds_engine.backward → ds_engine.step loop.
+
+        Args:
+            dataset:    HuggingFace Dataset with a 'text' field (pre-formatted).
+            output_dir: Directory to save checkpoints.
+            ds_engine:  DeepSpeed engine wrapping self.peft_model.
+        """
+        import os
+        from torch.utils.data import DataLoader
+        from tqdm import tqdm
+        from transformers import DataCollatorForLanguageModeling as HFDataCollator
+
+        # ── 1. Disable caching (incompatible with gradient checkpointing) ───
+        ds_engine.module.config.use_cache = False
+        print("Trainable parameter summary:")
+        print_trainable_parameters(ds_engine.module)
+
+        # ── 2. Dataset split ────────────────────────────────────────────────
+        split         = dataset.train_test_split(test_size=0.1)
+        train_dataset = split['train']
+        eval_dataset  = split['test']
+
+        # ── 3. Tokenize ─────────────────────────────────────────────────────
+        # Truncate from the left so the assistant response is always preserved.
+        # Do not pad here — the collator handles padding per-batch.
+        self.tokenizer.padding_side    = "right"   # pad on the right during collation
+        self.tokenizer.truncation_side = "left"    # keep the end (assistant answer)
+        max_length = 4096
+
+        def _tokenize(examples):
+            return self.tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=max_length,
+                padding=False,   # collator pads
+            )
+
+        print("Tokenizing dataset...")
+        remove_cols  = train_dataset.column_names
+        train_dataset = train_dataset.map(_tokenize, batched=True, remove_columns=remove_cols)
+        eval_dataset  = eval_dataset.map(_tokenize,  batched=True, remove_columns=remove_cols)
+
+        # ── 4. Collator ─────────────────────────────────────────────────────
+        # DataCollatorForLanguageModeling with mlm=False:
+        #   - pads input_ids / attention_mask to the longest sequence in the batch
+        #   - sets labels = input_ids, with -100 at padding positions
+        #   This is the standard HuggingFace approach for causal LM fine-tuning.
+        collator = HFDataCollator(tokenizer=self.tokenizer, mlm=False)
+
+        # ── 5. DataLoaders ──────────────────────────────────────────────────
+        batch_size = self.training_args.per_device_train_batch_size
+        eval_batch  = getattr(self.training_args, 'per_device_eval_batch_size', batch_size)
+
+        train_loader = DataLoader(train_dataset, shuffle=True,  collate_fn=collator, batch_size=batch_size)
+        eval_loader  = DataLoader(eval_dataset,  shuffle=False, collate_fn=collator, batch_size=eval_batch)
+
+        # ── 6. Training loop ────────────────────────────────────────────────
+        num_epochs = int(self.training_args.num_train_epochs)
+        print(f"[DeepSpeed] Starting training for {num_epochs} epoch(s)...")
+
+        for epoch in range(num_epochs):
+            ds_engine.train()
+            total_loss = 0.0
+            pbar = tqdm(train_loader, desc=f"Train epoch {epoch + 1}/{num_epochs}")
+            for batch in pbar:
+                batch   = {k: v.to(ds_engine.device) for k, v in batch.items()}
+                loss    = ds_engine(**batch).loss
+                ds_engine.backward(loss)
+                ds_engine.step()
+                total_loss += loss.item()
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            print(f"[DeepSpeed] Epoch {epoch + 1} | avg train loss: {total_loss / max(len(train_loader), 1):.4f}")
+
+            # Eval pass
+            ds_engine.eval()
+            eval_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(eval_loader, desc="Eval"):
+                    batch = {k: v.to(ds_engine.device) for k, v in batch.items()}
+                    eval_loss += ds_engine(**batch).loss.item()
+            print(f"[DeepSpeed] Epoch {epoch + 1} | avg eval  loss: {eval_loss / max(len(eval_loader), 1):.4f}")
+
+        # ── 7. Save ─────────────────────────────────────────────────────────
+        ds_engine.module.config.use_cache = True
+        print("Saving checkpoint...")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # DeepSpeed checkpoint (all ZeRO shards, resumable)
+        ds_engine.save_checkpoint(output_dir)
+
+        # Standard PEFT adapter weights on rank 0 (for later merge/load with from_pretrained)
+        if not hasattr(ds_engine, 'global_rank') or ds_engine.global_rank == 0:
+            ds_engine.module.save_pretrained(output_dir)
+
+        release_memory()
