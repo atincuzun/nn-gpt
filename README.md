@@ -35,6 +35,8 @@ pip install -r requirements.txt --extra-index-url https://download.pytorch.org/w
 pip install -r req-no-isolation.txt --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu126
 ```
 
+The `req-no-isolation.txt` step installs package-only dependencies that are imported directly from Python, including Tutel. The MoE utilities under `ab/gpt/moe/` now import `tutel` as a normal package and no longer rely on a local `sys.path` hack or a vendored Tutel checkout.
+
 If there are installation problems, install the dependencies from the 'requirements.txt' file one by one.
 
 ## Update of NN Dataset

@@ -1,2 +1,6 @@
+# flash_attn 2.8.3 ships a matching Linux x86_64 wheel for Python 3.12 + torch 2.9 + cu12,
+# but not for Python 3.13. Install the published wheel directly to avoid source builds on the cluster.
 deepspeed==0.18.3
-flash_attn==2.8.3
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+# Tutel v0.4.1 is installed from the official source tarball with --no-build-isolation.
+https://github.com/microsoft/tutel/archive/refs/tags/v0.4.1.tar.gz
