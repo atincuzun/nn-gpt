@@ -92,13 +92,17 @@ class LoRA:
                  training_args: TrainingArguments,
                  access_token=None,
                  peft_config=None,
-                 use_unsloth=False
+                 use_unsloth=False,
+                 enable_lora=True,
+                 external_trainable_prefixes=None,
                  ):
         self.model = model
         self.tokenizer = tokenizer
         self.training_args = training_args
         self.access_token = access_token
         self._use_unsloth = use_unsloth
+        self.enable_lora = enable_lora
+        self.external_trainable_prefixes = tuple(external_trainable_prefixes or ())
         
         if peft_config is None:
             modules = find_all_linear_names(self.model)
@@ -106,7 +110,7 @@ class LoRA:
         else:
             self.peft_config = peft_config
         
-        if use_unsloth:
+        if use_unsloth and enable_lora:
             # Use Unsloth's native LoRA attachment (keeps bfloat16 dtypes)
             try:
                 from unsloth import FastModel
@@ -125,18 +129,41 @@ class LoRA:
                 print(f"[LoRA] Unsloth get_peft_model failed: {e}, falling back to standard PEFT")
                 use_unsloth = False
                 self._use_unsloth = False
-        
+
         if not use_unsloth:
             # Standard PEFT flow for non-Unsloth models
             self.model = prepare_model_for_kbit_training(self.model)
             self.model.gradient_checkpointing_enable()
-            self.peft_model = get_peft_model(self.model, self.peft_config)
+            if enable_lora:
+                self.peft_model = get_peft_model(self.model, self.peft_config)
+            else:
+                self.peft_model = self.model
+                print("[LoRA] LoRA attachment disabled. Training only external trainable modules.")
+
+        self._enable_external_trainables()
         
         self.peft_model._hf_peft_config_loaded = True 
         # Log trainable parameters immediately after adapters are attached
         print(f"[LoRA] Adapters attached. Effective target_modules: {self.peft_config.target_modules}")
         print("[LoRA] Trainable parameter summary:")
         print_trainable_parameters(self.peft_model)
+
+    def _enable_external_trainables(self):
+        if not self.external_trainable_prefixes:
+            return
+
+        enabled = []
+        for name, parameter in self.peft_model.named_parameters():
+            if any(name.startswith(prefix) for prefix in self.external_trainable_prefixes):
+                parameter.requires_grad_(True)
+                enabled.append(name)
+
+        if enabled:
+            print(f"[LoRA] Enabled external trainables for prefixes {self.external_trainable_prefixes}")
+            for name in enabled[:10]:
+                print(f"  [LoRA] trainable: {name}")
+            if len(enabled) > 10:
+                print(f"  [LoRA] ... and {len(enabled) - 10} more")
 
     def train(self, dataset: Dataset, tokenizer, output_dir: str, train_on_completions_only=False, response_template=None):
         """

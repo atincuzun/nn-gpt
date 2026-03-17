@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -516,6 +517,23 @@ def configure_trainable_parameters(model: nn.Module, train_base_model: bool) -> 
 
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(name.startswith("tutel_adapter"))
+
+
+def save_tutel_adapter_state(model: nn.Module, output_path: Path) -> bool:
+    adapter = getattr(model, "tutel_adapter", None)
+    if adapter is None:
+        return False
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "state_dict": adapter.state_dict(),
+            "class_name": adapter.__class__.__name__,
+        },
+        output_path,
+    )
+    return True
 
 
 def random_batch(vocab_size: int, batch_size: int, seq_len: int, device: torch.device):

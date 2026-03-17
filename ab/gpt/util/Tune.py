@@ -15,9 +15,15 @@ from peft import (PeftModel)
 from tqdm import tqdm
 
 import ab.gpt.NNEval as NNEval
+from ab.gpt.moe.experiment import (
+    load_tutel_adapter_checkpoint,
+    persist_moe_artifacts,
+    save_tutel_adapter_checkpoint,
+)
 from ab.gpt.util.Chatbot import ChatBot
 from ab.gpt.util.Const import *
 
+from ab.gpt.moe.config import normalize_moe_edit_config
 from ab.gpt.util.LLMUtil import quantization_config_4bit
 from ab.gpt.util.LoRA import LoRA
 from ab.gpt.util.Util import exists, extract_delta, extract_code, extract_hyperparam, extract_transform
@@ -100,6 +106,8 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
     use_unsloth = config.get('use_unsloth', False)
     unsloth_load_in_4bit = config.get('load_in_4bit', True)
     max_new_tokens = config.get('max_new_tokens', max_new_tokens)
+    moe_edit_config = normalize_moe_edit_config(config.get('moe_edit'), base_model_name=str(base_model_name))
+    llm_quantization_config = quantization_config_4bit if unsloth_load_in_4bit else None
 
     access_token = None
     if token_from_file:
@@ -120,25 +128,60 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
     # Load model and tokenizer
     model_loader = LLM(
         base_model_name,
-        quantization_config_4bit,
+        llm_quantization_config,
         access_token=access_token,
         use_deepspeed=use_deepspeed,
         context_length=context_length,
         training_args=training_args,
         use_unsloth=use_unsloth,
-        load_in_4bit=unsloth_load_in_4bit
+        load_in_4bit=unsloth_load_in_4bit,
+        moe_edit_config=moe_edit_config,
     )
     model = model_loader.get_model()
     tokenizer = model_loader.get_tokenizer()
     # print(model)
     if llm_path:
-        print(f'Load saved LoRA layer from path: {llm_path}')
-        model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
-        model = model.merge_and_unload()
+        llm_path_obj = Path(llm_path)
+        has_local_peft_adapter = False
+        if llm_path_obj.exists():
+            has_local_peft_adapter = (
+                (llm_path_obj / 'adapter_config.json').exists()
+                or (llm_path_obj / 'adapter_model.bin').exists()
+                or bool(list(llm_path_obj.glob('adapter_model*.safetensors')))
+            )
+
+        if not llm_path_obj.exists() or has_local_peft_adapter:
+            print(f'Load saved LoRA layer from path: {llm_path}')
+            model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
+            model = model.merge_and_unload()
+        else:
+            print(f"[LoRA] No PEFT adapter checkpoint found in {llm_path}; skipping LoRA restore and checking MoE adapter state later")
+
+    model, moe_runtime = model_loader.apply_moe_edit_if_enabled(model=model, selected_model_id=str(base_model_name))
+    if moe_runtime.get('enabled', False):
+        print(f"[MoE] Enabled runtime edit mode={moe_runtime.get('mode')} selected_model={moe_runtime.get('selected_model_id')}")
+        print(f"[MoE] Adapter attached={moe_runtime.get('adapter_attached', False)} routing_changes={len(moe_runtime.get('routing_changes', []))}")
+        resume_moe_source = None
+        if llm_path:
+            resume_moe_source = Path(llm_path)
+        else:
+            base_model_path = Path(str(base_model_name))
+            if base_model_path.exists():
+                resume_moe_source = base_model_path
+
+        if resume_moe_source is not None and moe_runtime.get('adapter_attached', False):
+            adapter_filename = moe_runtime.get('adapter_state_filename', 'tutel_adapter.pt')
+            restored = load_tutel_adapter_checkpoint(model, resume_moe_source, filename=adapter_filename)
+            print(f"[MoE] Adapter checkpoint restored={restored} source={resume_moe_source}")
 
     # initialize deepspeed before we do infer in ChatBot
     if use_deepspeed:
         deepspeed.initialize(model=model, config_params=ds_conf)
+
+    moe_trainable_prefixes = ('tutel_adapter',) if moe_runtime.get('adapter_trainable', False) else ()
+    lora_enabled = bool(moe_runtime.get('train_lora', True))
+    if moe_runtime.get('adapter_trainable', False) and not moe_runtime.get('joint_lora', True):
+        lora_enabled = False
 
     lora_tuner = LoRA(
         model,
@@ -146,7 +189,9 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         training_args=training_args,
         access_token=access_token,
         peft_config=peft_config,
-        use_unsloth=use_unsloth)
+        use_unsloth=use_unsloth,
+        enable_lora=lora_enabled,
+        external_trainable_prefixes=moe_trainable_prefixes)
 
     print('Using Max Length:', model_loader.get_max_length())
 
@@ -157,6 +202,16 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
     for epoch in range(llm_tune_epochs):
         print(f'[INFO]Start Epoch {epoch}')
         out_path = epoch_dir(epoch)
+        if moe_runtime.get('enabled', False):
+            persist_moe_artifacts(
+                out_path,
+                {**moe_runtime, 'epoch': epoch},
+                extra={
+                    'stage': 'pre_generation',
+                    'llm_conf': llm_conf,
+                    'prompt_conf': llm_tune_conf,
+                },
+            )
         if epoch < skip_epoch:
             print(f'Skipped generation at epoch {epoch}')
         else:
@@ -186,7 +241,38 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
 
         print('Dataset length:', len(dataset))
         model.train()
-        model = lora_tuner.train(dataset, tokenizer, out_path / base_model_name)
+        checkpoint_dir = out_path / Path(str(base_model_name))
+        model = lora_tuner.train(dataset, tokenizer, checkpoint_dir)
+        if moe_runtime.get('enabled', False):
+            runtime_payload = {**moe_runtime, 'epoch': epoch}
+            persist_moe_artifacts(
+                out_path,
+                runtime_payload,
+                extra={
+                    'stage': 'post_train',
+                    'dataset_length': len(dataset),
+                    'train_lora': lora_enabled,
+                    'adapter_trainable': bool(moe_trainable_prefixes),
+                },
+            )
+            persist_moe_artifacts(
+                checkpoint_dir,
+                runtime_payload,
+                extra={
+                    'stage': 'checkpoint_export',
+                    'dataset_length': len(dataset),
+                    'train_lora': lora_enabled,
+                    'adapter_trainable': bool(moe_trainable_prefixes),
+                },
+            )
+            if moe_runtime.get('persist_adapter', True):
+                adapter_filename = moe_runtime.get('adapter_state_filename', 'tutel_adapter.pt')
+                adapter_path = out_path / 'moe' / adapter_filename
+                saved = save_tutel_adapter_checkpoint(model, adapter_path)
+                print(f"[MoE] Adapter checkpoint saved={saved} path={adapter_path}")
+                checkpoint_adapter_path = checkpoint_dir / adapter_filename
+                checkpoint_saved = save_tutel_adapter_checkpoint(model, checkpoint_adapter_path)
+                print(f"[MoE] Self-contained checkpoint saved={checkpoint_saved} path={checkpoint_adapter_path}")
         del dataset
         release_memory()
 

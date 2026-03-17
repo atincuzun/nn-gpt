@@ -6,6 +6,7 @@ from .hf_moe_editor import (
     MoEEditResult,
     load_and_edit_hf_moe_model,
     load_hf_moe_model,
+    save_tutel_adapter_state,
     main,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "MoEEditResult",
     "load_hf_moe_model",
     "load_and_edit_hf_moe_model",
+    "save_tutel_adapter_state",
     "main",
 ]
