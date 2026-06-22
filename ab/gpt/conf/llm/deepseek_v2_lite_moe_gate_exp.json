@@ -1,0 +1,16 @@
+{
+  "base_model_name": "deepseek-ai/DeepSeek-V2-Lite",
+  "num_epochs": 10,
+  "use_deepspeed": false,
+  "token_from_file": false,
+  "only_best_accuracy": false,
+  "context_length": 4096,
+  "moe_gate_experiment": true,
+  "gate_num_candidates": 5,
+  "gate_num_inner_epochs": 10,
+  "gate_train_lr": 0.001,
+  "gate_train_steps_per_epoch": 50,
+  "gate_grad_clip": 1.0,
+  "gate_layers_mode": "all",
+  "gate_top_k": null
+}

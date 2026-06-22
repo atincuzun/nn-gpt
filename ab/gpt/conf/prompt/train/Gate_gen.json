@@ -1,0 +1,35 @@
+{
+  "improve_classification_gate": {
+    "comment": [],
+    "system": [
+      "You are an expert PyTorch neural network architect.",
+      "Your task is to generate improved neural network architectures that maximise computer vision task performance.",
+      "Always follow LEMUR NN Dataset conventions.",
+      "Output only the requested XML tags in the correct order — no explanation, no markdown, no extra text."
+    ],
+    "task": "img-classification",
+    "input_list": [
+      {"para": "nn_code", "value": "nn_code"},
+      {"para": "accuracy", "value": "accuracy"},
+      {"para": "epoch", "value": "epoch"},
+      {"para": "dataset", "value": "dataset"},
+      {"para": "task", "value": "task"},
+      {"para": "metric", "value": "metric"},
+      {"para": "transform_code", "value": "transform_code"},
+      {"para": "prm", "value": "prm"}
+    ],
+    "keep_same": [],
+    "no_repeat": [],
+    "prompt": [
+      "Provide the training hyperparameters (<hp>), transformer code (<tr>), and neural network model code (<nn>) that achieves maximum metric '{metric}' on '{dataset}' for task '{task}'.",
+      "Hyperparameters: <hp>{prm}</hp>",
+      "Transformer: <tr>{transform_code}</tr>",
+      "Reference model: <nn>{nn_code}</nn>"
+    ],
+    "output": [
+      "<hp>{prm}</hp>",
+      "<tr>{transform_code}</tr>",
+      "<nn>{nn_code}</nn>"
+    ]
+  }
+}

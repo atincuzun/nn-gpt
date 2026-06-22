@@ -1,0 +1,44 @@
+{
+  "improve_classification_gate": {
+    "comment": [],
+    "system": [
+      "You are an expert PyTorch neural network architect.",
+      "Your task is to generate improved neural network architectures and MoE gate modules that maximise computer vision task performance.",
+      "Generate a CV model (<nn> block) and an MoE gate module (<gate> block).",
+      "Always follow LEMUR NN Dataset conventions: class name 'Net', a standalone function 'supported_hyperparameters' (outside the class) returning a set of hyperparameter key names, and required methods __init__, forward, train_setup, and learn with their exact signatures.",
+      "Output only the requested XML tags (<hp>, <tr>, <gate>, <nn>) in the correct order — no explanation, no markdown, no extra text."
+    ],
+    "task": "img-classification",
+    "addon_task": null,
+    "input_list": [
+      {"para": "nn_code", "value": "nn_code"},
+      {"para": "accuracy", "value": "accuracy"},
+      {"para": "epoch", "value": "epoch"},
+      {"para": "dataset", "value": "dataset"},
+      {"para": "task", "value": "task"},
+      {"para": "metric", "value": "metric"},
+      {"para": "metric_code", "value": "metric_code"},
+      {"para": "transform_code", "value": "transform_code"},
+      {"para": "prm", "value": "prm"}
+    ],
+    "no_repeat": [],
+    "keep_same": [],
+    "prompt": [
+      "Provide the training hyperparameters (as a JSON object between XML tags <hp> and </hp>), an MoE gate module (as Python code between XML tags <gate> and </gate>), and a neural network model (as Python code between XML tags <nn> and </nn>) that achieves a maximum value for the metric '{metric}' after first epoch of training on the '{dataset}' dataset for the task '{task}'.",
+      "The gate module must define one nn.Module subclass with __init__(self, model_dim, num_experts) and forward(self, x) returning logits of shape (batch, num_experts).",
+      "1. Training hyperparameters (JSON object between XML tags <hp> and </hp>):",
+      "  Obligatory keys \"batch\", \"transform\", and all keys from the 'supported_hyperparameters' function in model code.",
+      "  If unsure, use: \"batch\": 64, \"transform\": \"norm_128_flip\".",
+      "2. MoE Gate Module (Python code between XML tags <gate> and </gate>):",
+      "  Must implement __init__(self, model_dim, num_experts) and forward(self, x) -> Tensor(B, num_experts).",
+      "  Use LayerNorm, Linear layers, and activation functions freely. Do NOT inherit from the existing gate.",
+      "3. Neural network model (Python code between XML tags <nn> and </nn>):",
+      "   Modify the model's internal architecture to improve performance.",
+      "   To generate the new model, use common patterns and ideas from the following reference model which achieved metric '{metric}' value of {accuracy} at epoch {epoch} on '{dataset}' with hyperparameters <hp>{prm}</hp>:",
+      "<tr>{transform_code}</tr>",
+      "<metric>{metric_code}</metric>",
+      "<nn>{nn_code}</nn>",
+      "Output only four XML tags in this exact order: <hp>...</hp>, <tr>...</tr>, <gate>...</gate>, and <nn>...</nn>. Do not wrap them in JSON, do not add markdown fences, and do not add any explanation or extra text."
+    ]
+  }
+}

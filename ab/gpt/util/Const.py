@@ -18,6 +18,7 @@ conf_llm_dir = conf_dir / 'llm'
 conf_chat_template_dir = conf_dir / 'chat_template'
 
 nngpt_dir = out_dir / 'nngpt'
+nngpt_gate_dir = nngpt_dir / 'gates'
 
 # ── Branch isolation override ─────────────────────────────────────────────────
 # Setting NNGPT_DIR_OVERRIDE env var to redirect all nngpt output to a custom path.

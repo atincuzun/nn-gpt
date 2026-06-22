@@ -49,6 +49,7 @@ from ab.gpt.brute.trans.TransformEval import run_eval
 from ab.gpt.util.prompt.TransformGenPrompt import TransformGenPrompt, load_data_from_folders
 from ab.gpt.agents.state import AgentState
 import ab.gpt.util.training_runtime as TrainingRuntime
+from ab.gpt.util.moe_gate_experiment import gate_experiment_run
 
 ds_conf = conf_dir / 'DeepSpeed.json'
 TRANSFORM_OUT_DIR = trans_dir / 'dataset_epoch1'
@@ -984,6 +985,7 @@ def tune(
     sft_dataset=None,
     num_cycles=None,
     epoch_root=None,
+    moe_gate_experiment: bool = False,
 ):
     if not isinstance(conf_keys, (list, tuple)):
         conf_keys = (conf_keys,)
@@ -1075,6 +1077,84 @@ def tune(
 
     chat_bot = ChatBot(
         model, tokenizer, temperature=temperature, top_k=top_k, top_p=top_p)
+
+    # ── MoE Gate Experiment branch ──────────────────────────────────────
+    gate_experiment_enabled = moe_gate_experiment or config.get("moe_gate_experiment", False)
+    if gate_experiment_enabled:
+        n_gates = config.get("gate_num_candidates", 5)
+        n_inner_epochs = config.get("gate_num_inner_epochs", 10)
+        gate_train_lr = config.get("gate_train_lr", 1e-3)
+        gate_train_steps = config.get("gate_train_steps_per_epoch", 50)
+        gate_grad_clip = config.get("gate_grad_clip", 1.0)
+        gate_layers_mode = config.get("gate_layers_mode", "all")
+        gate_top_k = config.get("gate_top_k", None)
+
+        gate_layers: Optional[List[int]] = None
+        if gate_layers_mode == "last_n":
+            gate_layers = list(range(-4, 0))
+
+        def gen_fn(inner_epoch: int, out_path: Path) -> None:
+            _prev_override = os.environ.get("NNGPT_DIR_OVERRIDE")
+            os.environ["NNGPT_DIR_OVERRIDE"] = str(out_path)
+            try:
+                nn_gen(
+                    inner_epoch, out_path, chat_bot, conf_keys,
+                    nn_train_epochs, prompt_dict, test_nn, max_new_tokens,
+                    save_llm_output, nn_name_prefix, unsloth_max_input_length,
+                    prompt_batch, use_backbone=use_backbone,
+                )
+                _evaluate_epoch(
+                    inner_epoch, out_path, nn_name_prefix,
+                    nn_train_epochs, trans_mode, classification_mode,
+                )
+            finally:
+                if _prev_override is not None:
+                    os.environ["NNGPT_DIR_OVERRIDE"] = _prev_override
+                else:
+                    os.environ.pop("NNGPT_DIR_OVERRIDE", None)
+
+        def train_dataset_builder():
+            from torch.utils.data import DataLoader
+            if not use_unsloth:
+                data_processor = NNGenPrompt(
+                    context_length if context_length else model_loader.get_max_length(),
+                    tokenizer, train_config_path,
+                )
+            else:
+                data_processor = NNGenPrompt(
+                    unsloth_max_input_length if unsloth_max_input_length else model_loader.get_max_length(),
+                    tokenizer, train_config_path,
+                )
+            dataset = data_processor.get_dataset(
+                only_best_accuracy, max_prompts=max_prompts, max_new_tokens=max_new_tokens,
+            )
+
+            def collate(batch):
+                ids = [item["input_ids"] for item in batch]
+                max_len = max(len(i) for i in ids)
+                pad_id = tokenizer.pad_token_id or 0
+                padded_ids = [i + [pad_id] * (max_len - len(i)) for i in ids]
+                input_ids_t = torch.tensor(padded_ids, dtype=torch.long)
+                return {"input_ids": input_ids_t, "labels": input_ids_t.clone()}
+
+            train_loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate)
+            val_loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate)
+            return train_loader, val_loader
+
+        return gate_experiment_run(
+            model=model,
+            tokenizer=tokenizer,
+            gen_fn=gen_fn,
+            train_dataset_builder=train_dataset_builder,
+            n_gates=n_gates,
+            n_inner_epochs=n_inner_epochs,
+            gate_layers=gate_layers,
+            gate_train_lr=gate_train_lr,
+            gate_train_steps=gate_train_steps,
+            gate_grad_clip=gate_grad_clip,
+            chat_bot=chat_bot,
+            top_k=gate_top_k,
+        )
 
     state = {
         "experiment_id": nn_name_prefix or "exp_default",
