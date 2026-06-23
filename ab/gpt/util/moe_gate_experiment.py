@@ -43,20 +43,17 @@ except ImportError:
         "(e.g., export PYTHONPATH=<path-to-moe_gate_only>)."
     )
 
-# ── Default baseline gate ────────────────────────────────────────────────────
-_BASELINE_GATE_CODE = r"""
-import torch
-import torch.nn as nn
-
-class BaselineGate(nn.Module):
-    def __init__(self, model_dim, num_experts):
-        super().__init__()
-        self.fc = nn.Linear(model_dim, num_experts, bias=False)
-        nn.init.normal_(self.fc.weight, std=0.02)
-
-    def forward(self, x):
-        return self.fc(x)
-""".strip()
+# ── Default baseline gate (fallback only) ────────────────────────────────────
+_DEFAULT_GATE_CODE = (
+    "import torch\nimport torch.nn as nn\n\n"
+    "class BaselineGate(nn.Module):\n"
+    "    def __init__(self, model_dim, num_experts):\n"
+    "        super().__init__()\n"
+    "        self.fc = nn.Linear(model_dim, num_experts, bias=False)\n"
+    "        nn.init.normal_(self.fc.weight, std=0.02)\n"
+    "    def forward(self, x):\n"
+    "        return self.fc(x)\n"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,7 +337,6 @@ def gate_experiment_run(
     gate_grad_clip: float = 1.0,
     baseline_gate_code: Optional[str] = None,
     chat_bot=None,
-    nn_gen_args: Optional[dict] = None,
     top_k: Optional[int] = None,
 ) -> List[dict]:
     """Run the full gate experiment.

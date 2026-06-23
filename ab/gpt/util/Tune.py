@@ -184,6 +184,10 @@ def nn_gen(
             if nn_code_max_chars and "nn_code" in para_dict and isinstance(para_dict["nn_code"], str):
                 para_dict["nn_code"] = para_dict["nn_code"][:nn_code_max_chars]
 
+            # Inject static config-provided placeholder values (not from DB)
+            for placeholder_name, value in key_config.get("static_values", {}).items():
+                para_dict[placeholder_name] = value
+
             if addon_data is not None and not addon_data.empty:
                 available_addon = addon_data.loc[addon_data.nn != row["nn"]]
                 if not available_addon.empty:
@@ -1088,6 +1092,7 @@ def tune(
         gate_grad_clip = config.get("gate_grad_clip", 1.0)
         gate_layers_mode = config.get("gate_layers_mode", "all")
         gate_top_k = config.get("gate_top_k", None)
+        baseline_gate_code = config.get("baseline_gate_code", None)
 
         gate_layers: Optional[List[int]] = None
         if gate_layers_mode == "last_n":
@@ -1096,10 +1101,21 @@ def tune(
         def gen_fn(inner_epoch: int, out_path: Path) -> None:
             _prev_override = os.environ.get("NNGPT_DIR_OVERRIDE")
             os.environ["NNGPT_DIR_OVERRIDE"] = str(out_path)
+
+            # Inject baseline_gate_code from config into prompt's static_values
+            import copy
+            pd_patched = prompt_dict
+            if baseline_gate_code:
+                pd_patched = copy.deepcopy(prompt_dict)
+                for key in conf_keys:
+                    sv = pd_patched.get(key, {}).get("static_values")
+                    if isinstance(sv, dict):
+                        sv["gate_code"] = baseline_gate_code
+
             try:
                 nn_gen(
                     inner_epoch, out_path, chat_bot, conf_keys,
-                    nn_train_epochs, prompt_dict, test_nn, max_new_tokens,
+                    nn_train_epochs, pd_patched, test_nn, max_new_tokens,
                     save_llm_output, nn_name_prefix, unsloth_max_input_length,
                     prompt_batch, use_backbone=use_backbone,
                 )
@@ -1152,6 +1168,7 @@ def tune(
             gate_train_lr=gate_train_lr,
             gate_train_steps=gate_train_steps,
             gate_grad_clip=gate_grad_clip,
+            baseline_gate_code=baseline_gate_code,
             chat_bot=chat_bot,
             top_k=gate_top_k,
         )

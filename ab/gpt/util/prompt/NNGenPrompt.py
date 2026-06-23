@@ -132,6 +132,10 @@ class NNGenPrompt(Prompt):
                 if nn_code_max_chars and 'nn_code' in para_dict and isinstance(para_dict['nn_code'], str):
                     para_dict['nn_code'] = para_dict['nn_code'][:nn_code_max_chars]
 
+                # Inject static config-provided placeholder values (not from DB)
+                for placeholder_name, value in key_dict.get('static_values', {}).items():
+                    para_dict[placeholder_name] = value
+
                 # Inject columns referenced in the output template but absent from input_list
                 if key_dict.get('output_type') == 'classification':
                     output_template = '\n'.join(key_dict['output'])

@@ -12,5 +12,6 @@
   "gate_train_steps_per_epoch": 50,
   "gate_grad_clip": 1.0,
   "gate_layers_mode": "all",
-  "gate_top_k": null
+  "gate_top_k": null,
+  "baseline_gate_code": "import torch\nimport torch.nn as nn\n\nclass BaselineGate(nn.Module):\n    def __init__(self, model_dim, num_experts):\n        super().__init__()\n        self.fc = nn.Linear(model_dim, num_experts, bias=False)\n        nn.init.normal_(self.fc.weight, std=0.02)\n\n    def forward(self, x):\n        return self.fc(x)"
 }
