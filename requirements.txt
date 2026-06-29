@@ -1,5 +1,5 @@
 wheel
-nn-dataset>=2.2.9
+nn-dataset>=2.2.10
 nn-rag>=2.2.4
 nn-dup>=2.2.4
 bitsandbytes>=0.45.0
