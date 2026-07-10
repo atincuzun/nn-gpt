@@ -1,0 +1,46 @@
+{
+  "experiment_name": "standalone_moe_codegen_sweep",
+  "shared_tune_args": {
+    "llm_tune_conf": "NN_gen.json",
+    "nn_gen_conf": "NN_gen.json",
+    "num_train_epochs": 1,
+    "nn_train_epochs": 1,
+    "test_nn": 4,
+    "max_prompts": 256,
+    "prompt_batch": 1,
+    "temperature": 0.6,
+    "top_k": 70,
+    "top_p": 0.9
+  },
+  "ranking": {
+    "primary": "best_accuracy",
+    "secondary": "avg_accuracy",
+    "tertiary": "success_rate"
+  },
+  "variants": [
+    {
+      "name": "tiny_mixtral_trainable_custom",
+      "llm_conf": "nngpt_tiny_mixtral_moe_trainable_custom.json"
+    },
+    {
+      "name": "tiny_mixtral_more_experts_custom_gate",
+      "base_llm_conf": "nngpt_tiny_mixtral_moe_trainable_custom.json",
+      "moe_edit": {
+        "hf_top_k_override": 1,
+        "tutel_num_local_experts": 4,
+        "tutel_top_k": 2,
+        "use_custom_gate": true,
+        "use_custom_expert": true,
+        "adapter_hidden_mult": 3
+      }
+    },
+    {
+      "name": "qwen_moe_trainable_adapter",
+      "llm_conf": "nngpt_qwen1_5_moe_a2_7b_trainable_adapter.json"
+    },
+    {
+      "name": "mixtral_8x7b_inference_adapter",
+      "llm_conf": "nngpt_mixtral_8x7b_instruct_moe_infer.json"
+    }
+  ]
+}

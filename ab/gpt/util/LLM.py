@@ -1,6 +1,6 @@
 # ab/gpt/util/LLM.py
 from ab.nn.util.Const import out_dir
-from ab.gpt.util.Const import conf_chat_template_dir, llm_dir, llm_tokenizer_dir
+from ab.gpt.util.Const import llm_dir, llm_tokenizer_dir
 from ab.gpt.util.LLMUtil import quantization_config_4bit
 from ab.gpt.util.Util import exists
 
@@ -8,7 +8,7 @@ import os
 import json
 import tempfile
 import shutil
-from pathlib import Path
+from copy import deepcopy
 import torch
 import torch.cuda
 from transformers import (
@@ -35,15 +35,20 @@ class LLM:
                  training_args=None,
                  use_unsloth=False,
                  load_in_4bit=True,
-                 chat_template_path=None):
+                 moe_edit_config=None):
+        self.model_path = model_path
         self.context_length = context_length
         self._use_unsloth = use_unsloth
-        self.chat_template_path = chat_template_path
+        self._moe_edit_config = deepcopy(moe_edit_config) if moe_edit_config is not None else None
+        self._moe_edit_runtime = {
+            "enabled": False,
+            "mode": "disabled",
+            "base_model_name": model_path,
+        }
         
         # ===== Unsloth Fast Path =====
         if use_unsloth:
-            from unsloth import FastLanguageModel
-            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            self.model, self.tokenizer = FastModel.from_pretrained(
                 model_name=model_path,
                 dtype = None,
                 max_seq_length=context_length or 4096,
@@ -55,14 +60,12 @@ class LLM:
             if self.tokenizer.pad_token_id is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "right"
-            self._apply_chat_template_override()
             print(f"[Unsloth] Loaded {model_path}, 4bit={load_in_4bit}")
             return
         
         # ===== Original HuggingFace Path =====
         # --- Tokenizer ---
         tok_fl_nm = llm_tokenizer_dir(base_path, model_path)
-        
         raw_fl_nm = llm_dir(base_path, model_path)
         tokenizer_exists = exists(tok_fl_nm)
 
@@ -76,7 +79,6 @@ class LLM:
             # This is safer for LLaMA-like models (e.g., DeepSeek-Coder)
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
-        self._apply_chat_template_override()
 
         if tokenizer_exists:
             print("Loading Tokenizer from local files:", tok_fl_nm)
@@ -174,16 +176,41 @@ class LLM:
             self.model.save_pretrained(raw_fl_nm, access_token=access_token)
             print("Model saved to: ", raw_fl_nm)
 
-    def _apply_chat_template_override(self) -> None:
-        if not self.chat_template_path:
-            return
-        template_path = Path(str(self.chat_template_path)).expanduser()
-        if not template_path.is_absolute():
-            template_path = conf_chat_template_dir / template_path
-        if not template_path.exists():
-            raise FileNotFoundError(f"chat_template_path not found: {template_path}")
-        self.tokenizer.chat_template = template_path.read_text(encoding="utf-8")
-        print(f"[LLM] Applied chat template override: {template_path}")
+    def apply_moe_edit_if_enabled(self, model=None, selected_model_id=None):
+        model = model or self.model
+        from ab.gpt.moe.config import build_edit_config, normalize_moe_edit_config, is_moe_edit_enabled
+        from ab.gpt.moe.hf_moe_editor import HFMoEEditor
+
+        runtime_cfg = normalize_moe_edit_config(self._moe_edit_config, base_model_name=self.model_path)
+        if not is_moe_edit_enabled(runtime_cfg):
+            self._moe_edit_runtime = runtime_cfg
+            self.model = model
+            return model, runtime_cfg
+
+        if getattr(model, "_moe_edit_result", None) is not None:
+            runtime_cfg["selected_model_id"] = selected_model_id or self.model_path
+            self._moe_edit_runtime = runtime_cfg
+            self.model = model
+            return model, runtime_cfg
+
+        editor = HFMoEEditor(build_edit_config(runtime_cfg))
+        edited_model, edit_result = editor.apply(model, selected_model_id=selected_model_id or self.model_path)
+        runtime_cfg.update(
+            {
+                "selected_model_id": edit_result.selected_model_id,
+                "routing_before": edit_result.routing_before,
+                "routing_after": edit_result.routing_after,
+                "routing_changes": edit_result.routing_changes,
+                "adapter_attached": edit_result.adapter_attached,
+                "adapter_summary": edit_result.adapter_summary,
+            }
+        )
+        self._moe_edit_runtime = runtime_cfg
+        self.model = edited_model
+        return edited_model, runtime_cfg
+
+    def get_moe_edit_runtime(self):
+        return deepcopy(self._moe_edit_runtime)
 
     def get_model(self) -> PreTrainedModel:
         return self.model

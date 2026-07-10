@@ -28,7 +28,7 @@ Repository = 'https://github.com/ABrain-One/nn-gpt'
 
 [tool.setuptools.dynamic]
 version = { file = 'version' }
-dependencies = { file = ['requirements.txt', 'requirements-no-isolation.txt'] }
+dependencies = { file = ['requirements.txt', 'req-no-isolation.txt'] }
 
 [tool.setuptools.packages.find]
 where = ['']
