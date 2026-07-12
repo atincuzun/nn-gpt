@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from moe_gate_only import (  # noqa: E402
     GATE_FACTORIES,
+    GateInstall,
     assert_hf_native_model,
     count_parameters,
     explain_gate_candidates,
@@ -19,9 +20,18 @@ from moe_gate_only import (  # noqa: E402
     get_gate_candidate_report,
     get_gate_logits,
     install_gates,
+    teacher_student_distillation_loss,
     trainable_parameter_names,
 )
-from moe_gate_only.universal import _extract_logits_from_gate_output  # noqa: E402
+from ab.gpt.util.Chatbot import _validate_input_ids  # noqa: E402
+from moe_gate_only.universal import (  # noqa: E402
+    GateSite,
+    _DeepSeekV2Gate,
+    _DeepSeekV2TeacherStudentGate,
+    _extract_logits_from_gate_output,
+    _initialize_from_original_projection,
+    _new_gate_for_site,
+)
 
 
 def zero_gate(model_dim: int, num_experts: int) -> torch.nn.Module:
@@ -270,6 +280,183 @@ def test_sparse_sigmoid_extractor_prefers_logits():
     logits = torch.randn(1, 4, requires_grad=True)
     extracted = _extract_logits_from_gate_output((scores, logits), num_experts=4)
     assert extracted is logits
+
+
+def test_input_validation_accepts_added_special_tokens_within_model_vocab():
+    class Tokenizer:
+        vocab_size = 100000
+
+        def __len__(self):
+            return 100002
+
+    model = _ToyMoeModel(vocab_size=102400)
+    inputs = {"input_ids": torch.tensor([[100000, 100001]])}
+    _validate_input_ids(inputs, model, Tokenizer())
+    assert inputs["input_ids"].tolist() == [[100000, 100001]]
+
+
+def test_deepseek_replacement_preserves_float32_native_routing():
+    class NativeDeepSeekGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 8, dtype=torch.bfloat16))
+            self.n_routed_experts = 4
+            self.top_k = 2
+            self.topk_method = "greedy"
+            self.scoring_func = "softmax"
+            self.seq_aux = False
+            self.norm_topk_prob = False
+            self.routed_scaling_factor = 1.0
+            self.alpha = 0.0
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            logits = torch.nn.functional.linear(flat.float(), self.weight.float())
+            scores = logits.softmax(dim=-1, dtype=torch.float32)
+            weights, indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+            return indices, weights, None
+
+    class GeneratedGate(torch.nn.Module):
+        def __init__(self, model_dim, num_experts):
+            super().__init__()
+            self.base = torch.nn.Linear(model_dim, num_experts, bias=False)
+            self.residual = torch.nn.Linear(model_dim, num_experts, bias=False)
+            torch.nn.init.zeros_(self.residual.weight)
+
+        def forward(self, x):
+            return self.base(x) + self.residual(x)
+
+    native = NativeDeepSeekGate()
+    block = torch.nn.Module()
+    block.gate = native
+    site = GateSite(0, block, native, "gate", 8, 4, "parameter_gate")
+    generated = _new_gate_for_site(GeneratedGate, site)
+    assert generated.base.weight.dtype == torch.float32
+    _initialize_from_original_projection(generated, site)
+    replacement = _DeepSeekV2Gate(generated, top_k=2)
+    for name in (
+        "topk_method", "scoring_func", "seq_aux", "norm_topk_prob",
+        "routed_scaling_factor", "alpha",
+    ):
+        setattr(replacement, name, getattr(native, name))
+
+    hidden_states = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    native_indices, native_weights, _ = native(hidden_states)
+    replacement_indices, replacement_weights, _ = replacement(hidden_states)
+    assert torch.equal(native_indices, replacement_indices)
+    torch.testing.assert_close(native_weights, replacement_weights, rtol=0, atol=0)
+
+
+def test_deepseek_teacher_student_shadow_trains_only_random_student():
+    class NativeDeepSeekGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(4, 8))
+            self.top_k = 2
+            self.topk_method = "greedy"
+            self.scoring_func = "softmax"
+            self.seq_aux = False
+            self.norm_topk_prob = False
+            self.routed_scaling_factor = 1.0
+            self.alpha = 0.0
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            scores = torch.nn.functional.linear(flat.float(), self.weight.float()).softmax(-1)
+            weights, indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+            return indices, weights, None
+
+    teacher = NativeDeepSeekGate()
+    student = torch.nn.Linear(8, 4, bias=False)
+    wrapper = _DeepSeekV2TeacherStudentGate(teacher, student, top_k=2)
+    for name in (
+        "topk_method", "scoring_func", "seq_aux", "norm_topk_prob",
+        "routed_scaling_factor", "alpha",
+    ):
+        setattr(wrapper, name, getattr(teacher, name))
+    block = torch.nn.Module()
+    block.gate = wrapper
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(8, 8)
+    model.block = block
+    site = GateSite(0, block, teacher, "gate", 8, 4, "parameter_gate")
+    install = GateInstall(
+        site,
+        teacher,
+        wrapper,
+        block,
+        "gate",
+        teacher,
+        mode="teacher_student",
+        teacher_gate=teacher,
+        student_gate=student,
+    )
+
+    hidden_states = torch.randn(2, 3, 8)
+    expected = teacher(hidden_states)
+    actual = wrapper(hidden_states)
+    assert torch.equal(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+    freeze_except_gates(model, [install])
+    trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert trainable_ids == {id(parameter) for parameter in student.parameters()}
+    loss = teacher_student_distillation_loss([install])
+    loss.backward()
+    assert teacher.weight.grad is None
+    assert student.weight.grad is not None
+    assert torch.isfinite(student.weight.grad).all()
+    assert float(student.weight.grad.norm()) > 0
+
+
+def test_deepseek_teacher_student_blends_logits_before_topk():
+    class NativeDeepSeekGate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([
+                [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0],
+            ]))
+            self.top_k = 2
+            self.topk_method = "greedy"
+            self.scoring_func = "softmax"
+            self.seq_aux = False
+            self.norm_topk_prob = False
+            self.routed_scaling_factor = 1.0
+            self.alpha = 0.0
+
+        def forward(self, hidden_states):
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            scores = torch.nn.functional.linear(flat.float(), self.weight.float()).softmax(-1)
+            weights, indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+            return indices, weights, None
+
+    teacher = NativeDeepSeekGate()
+    student = torch.nn.Linear(2, 4, bias=False)
+    with torch.no_grad():
+        student.weight.copy_(torch.tensor([
+            [0.0, -1.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0],
+        ]))
+    wrapper = _DeepSeekV2TeacherStudentGate(
+        teacher, student, top_k=2, student_weight=0.25
+    )
+    for name in (
+        "topk_method", "scoring_func", "seq_aux", "norm_topk_prob",
+        "routed_scaling_factor", "alpha",
+    ):
+        setattr(wrapper, name, getattr(teacher, name))
+
+    hidden_states = torch.tensor([[[2.0, 1.0], [1.0, -2.0]]])
+    flat = hidden_states.reshape(-1, 2)
+    teacher_logits = torch.nn.functional.linear(flat, teacher.weight)
+    student_logits = student(flat)
+    expected_logits = torch.lerp(teacher_logits, student_logits, 0.25)
+    expected_weights, expected_indices = torch.topk(
+        expected_logits.softmax(-1), 2, dim=-1, sorted=False
+    )
+    indices, weights, _ = wrapper(hidden_states)
+    torch.testing.assert_close(wrapper._last_gate_logits, expected_logits)
+    assert torch.equal(indices, expected_indices)
+    torch.testing.assert_close(weights, expected_weights)
 
 
 def test_nested_wrapped_linear_rolls_back_on_verify_failure():

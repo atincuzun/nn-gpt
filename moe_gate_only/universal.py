@@ -46,6 +46,10 @@ class GateInstall:
     attr: Optional[str] = None
     old_child: Optional[nn.Module] = None
     hook_handles: List[Any] = field(default_factory=list)
+    mode: str = "direct"
+    teacher_gate: Optional[nn.Module] = None
+    student_gate: Optional[nn.Module] = None
+    teacher_requires_grad: Optional[Tuple[bool, ...]] = None
 
 
 @dataclass
@@ -1164,6 +1168,213 @@ class _TopKWeightsIndicesGate(nn.Module):
         return weights.to(x.dtype), indices
 
 
+class _DeepSeekV2Gate(nn.Module):
+    """Preserve the remote-code DeepSeek-V2 ``MoEGate`` return contract."""
+
+    def __init__(self, new_gate: nn.Module, top_k: int):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+        self._last_topk_idx: Optional[torch.Tensor] = None
+        self._last_topk_weight: Optional[torch.Tensor] = None
+        self._last_aux_loss: Optional[torch.Tensor] = None
+        self._last_gate_logits: Optional[torch.Tensor] = None
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        _, gate_dtype = _module_device_dtype(self.gate)
+        gate_input = flat.to(dtype=gate_dtype) if gate_dtype is not None else flat
+        logits = self.gate(gate_input).float()
+        return self._route_from_logits(hidden_states, logits)
+
+    def _route_from_logits(self, hidden_states: torch.Tensor, logits: torch.Tensor):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_dim)
+        self._last_gate_logits = logits
+        scoring_func = getattr(self, "scoring_func", "softmax")
+        if scoring_func != "softmax":
+            raise NotImplementedError(f"Unsupported DeepSeek-V2 scoring function: {scoring_func}")
+        scores = logits.softmax(dim=-1, dtype=torch.float32)
+
+        topk_method = getattr(self, "topk_method", "greedy")
+        if topk_method == "greedy":
+            topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+        elif topk_method == "group_limited_greedy":
+            n_group = int(getattr(self, "n_group"))
+            topk_group = int(getattr(self, "topk_group"))
+            group_scores = scores.view(flat.shape[0], n_group, -1).max(dim=-1).values
+            group_idx = torch.topk(group_scores, topk_group, dim=-1, sorted=False).indices
+            group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+            group_mask.scatter_(1, group_idx, True)
+            score_mask = group_mask.unsqueeze(-1).expand(
+                flat.shape[0], n_group, scores.shape[-1] // n_group
+            ).reshape(flat.shape[0], -1)
+            choice_scores = scores.masked_fill(~score_mask, 0.0)
+            topk_weight, topk_idx = torch.topk(
+                choice_scores, self.top_k, dim=-1, sorted=False
+            )
+        else:
+            raise NotImplementedError(f"Unsupported DeepSeek-V2 top-k method: {topk_method}")
+
+        if self.top_k > 1 and bool(getattr(self, "norm_topk_prob", False)):
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        else:
+            topk_weight = topk_weight * float(getattr(self, "routed_scaling_factor", 1.0))
+
+        alpha = float(getattr(self, "alpha", 0.0))
+        aux_loss = None
+        if self.training and alpha > 0.0:
+            topk_idx_by_batch = topk_idx.view(batch_size, -1)
+            if bool(getattr(self, "seq_aux", False)):
+                scores_by_sequence = scores.view(batch_size, sequence_length, -1)
+                counts = torch.zeros(
+                    batch_size,
+                    scores.shape[-1],
+                    device=hidden_states.device,
+                )
+                counts.scatter_add_(
+                    1,
+                    topk_idx_by_batch,
+                    torch.ones(
+                        batch_size,
+                        sequence_length * self.top_k,
+                        device=hidden_states.device,
+                    ),
+                ).div_(sequence_length * self.top_k / scores.shape[-1])
+                aux_loss = (counts * scores_by_sequence.mean(dim=1)).sum(dim=1).mean() * alpha
+            else:
+                assignment = F.one_hot(
+                    topk_idx_by_batch.reshape(-1), num_classes=scores.shape[-1]
+                ).float().mean(0)
+                aux_loss = (scores.mean(0) * assignment * scores.shape[-1]).sum() * alpha
+        self._last_topk_idx = topk_idx.detach()
+        self._last_topk_weight = topk_weight.detach()
+        self._last_aux_loss = aux_loss.detach() if aux_loss is not None else None
+        return topk_idx, topk_weight, aux_loss
+
+
+class _DeepSeekV2TeacherStudentGate(_DeepSeekV2Gate):
+    """Train a random student while the frozen native gate controls startup."""
+
+    def __init__(
+        self,
+        teacher_gate: nn.Module,
+        student_gate: nn.Module,
+        top_k: int,
+        *,
+        student_weight: float = 0.0,
+        distillation_temperature: float = 1.0,
+    ) -> None:
+        super().__init__(student_gate, top_k)
+        if not 0.0 <= student_weight <= 1.0:
+            raise ValueError("student_weight must be between 0 and 1")
+        if distillation_temperature <= 0:
+            raise ValueError("distillation_temperature must be positive")
+        self.teacher = teacher_gate
+        student_device, _ = _module_device_dtype(student_gate)
+        self.register_buffer(
+            "_student_weight_tensor",
+            torch.tensor(
+                float(student_weight),
+                dtype=torch.float32,
+                device=student_device or torch.device("cpu"),
+            ),
+            persistent=False,
+        )
+        self.distillation_temperature = float(distillation_temperature)
+        self._last_teacher_logits: Optional[torch.Tensor] = None
+        self._last_student_logits: Optional[torch.Tensor] = None
+        self._last_teacher_topk_idx: Optional[torch.Tensor] = None
+        self._last_student_topk_idx: Optional[torch.Tensor] = None
+        self._last_distillation_loss: Optional[torch.Tensor] = None
+        self._last_distillation_value: Optional[float] = None
+        self.reset_teacher_student_metrics()
+
+    @property
+    def student(self) -> nn.Module:
+        return self.gate
+
+    @property
+    def student_weight(self) -> float:
+        return float(self._student_weight_tensor.item())
+
+    def set_student_weight(self, value: float) -> None:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("student_weight must be between 0 and 1")
+        self._student_weight_tensor.fill_(float(value))
+
+    def reset_teacher_student_metrics(self) -> None:
+        self._metric_tokens = 0
+        self._metric_topk_matches = 0.0
+        self._metric_topk_total = 0
+        self._metric_kl_weighted_sum = 0.0
+
+    def _teacher_logits(self, flat: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.teacher, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError("DeepSeek teacher gate must expose a weight tensor")
+        return F.linear(flat.float(), weight.detach().float())
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        teacher_logits = self._teacher_logits(flat)
+        _, student_dtype = _module_device_dtype(self.student)
+        student_input = flat.to(dtype=student_dtype) if student_dtype is not None else flat
+        student_logits = self.student(student_input).float()
+        if student_logits.shape != teacher_logits.shape:
+            raise ValueError(
+                "Student router logits do not match teacher shape: "
+                f"{tuple(student_logits.shape)} != {tuple(teacher_logits.shape)}"
+            )
+        if not torch.isfinite(student_logits).all():
+            raise ValueError("Student router produced non-finite logits")
+
+        temperature = self.distillation_temperature
+        teacher_probabilities = (teacher_logits / temperature).softmax(dim=-1).detach()
+        student_log_probabilities = (student_logits / temperature).log_softmax(dim=-1)
+        self._last_distillation_loss = F.kl_div(
+            student_log_probabilities,
+            teacher_probabilities,
+            reduction="batchmean",
+        ) * (temperature * temperature)
+        self._last_distillation_value = float(self._last_distillation_loss.detach().item())
+
+        with torch.no_grad():
+            teacher_scores = teacher_logits.softmax(dim=-1, dtype=torch.float32)
+            student_scores = student_logits.softmax(dim=-1, dtype=torch.float32)
+            self._last_teacher_topk_idx = torch.topk(
+                teacher_scores, self.top_k, dim=-1, sorted=False
+            ).indices
+            self._last_student_topk_idx = torch.topk(
+                student_scores, self.top_k, dim=-1, sorted=False
+            ).indices
+            self._last_teacher_logits = teacher_logits.detach()
+            self._last_student_logits = student_logits.detach()
+            matches = (
+                self._last_teacher_topk_idx.unsqueeze(-1)
+                == self._last_student_topk_idx.unsqueeze(-2)
+            ).any(dim=-1)
+            tokens = int(teacher_logits.shape[0])
+            self._metric_tokens += tokens
+            self._metric_topk_matches += float(matches.sum().item())
+            self._metric_topk_total += int(matches.numel())
+            self._metric_kl_weighted_sum += self._last_distillation_value * tokens
+
+        if self.student_weight == 0.0:
+            output = self.teacher(hidden_states, *args, **kwargs)
+            if not isinstance(output, (tuple, list)) or len(output) < 3:
+                raise TypeError("DeepSeek teacher gate returned an unexpected routing contract")
+            self._last_gate_logits = teacher_logits
+            self._last_topk_idx = output[0].detach()
+            self._last_topk_weight = output[1].detach()
+            aux_loss = output[2]
+            self._last_aux_loss = aux_loss.detach() if isinstance(aux_loss, torch.Tensor) else None
+            return output
+
+        combined_logits = torch.lerp(teacher_logits, student_logits, self.student_weight)
+        return self._route_from_logits(hidden_states, combined_logits)
+
+
 class _ScoreFnTopKGate(nn.Module):
     """Wraps routers that score logits with a custom score_fn before top-k."""
 
@@ -1276,6 +1487,18 @@ def _detect_post_processing(gate: nn.Module) -> str:
     cached = _POST_PROCESSING_CACHE.get(key)
     if cached is not None:
         return cached
+
+    # DeepSeek-V2 remote-code routers return (indices, weights, aux_loss) and
+    # optionally perform group-limited expert selection.
+    if (
+        hasattr(gate, "n_routed_experts")
+        and hasattr(gate, "topk_method")
+        and hasattr(gate, "scoring_func")
+        and hasattr(gate, "seq_aux")
+    ):
+        result = "deepseek_v2"
+        _POST_PROCESSING_CACHE[key] = result
+        return result
 
     # DeepSeek-V4-style routers expose the routing activation as a callable
     # score_fn plus a routed_scaling_factor.  Hash-MoE variants also carry a
@@ -1427,6 +1650,11 @@ def _wrap_gate_for_contract(
             new_gate,
             top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
         )
+    if post == "deepseek_v2":
+        return _DeepSeekV2Gate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+        )
     if post == "logits_indices_weights":
         return _SoftmaxTopKGate(
             new_gate,
@@ -1451,9 +1679,37 @@ def _new_gate_for_site(factory: GateFactory, site: GateSite) -> nn.Module:
     device, dtype = _module_device_dtype(site.gate)
     if device is not None:
         new_gate = new_gate.to(device=device)
-    if dtype is not None and dtype.is_floating_point:
+    # DeepSeek-V2 computes its native router projection in float32 even when
+    # router weights and hidden states are bfloat16. Preserve that behavior.
+    if (
+        dtype is not None
+        and dtype.is_floating_point
+        and _detect_post_processing(site.gate) != "deepseek_v2"
+    ):
         new_gate = new_gate.to(dtype=dtype)
     return new_gate
+
+
+def _initialize_from_original_projection(new_gate: nn.Module, site: GateSite) -> None:
+    """Copy the native router projection into a generated gate's base path."""
+    source = getattr(site.gate, "weight", None)
+    base = getattr(new_gate, "base", None)
+    target = getattr(base, "weight", None)
+    if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
+        raise ValueError(
+            "Original-weight initialization requires generated gate attribute "
+            "base = nn.Linear(model_dim, num_experts, bias=False)"
+        )
+    if source.shape != target.shape:
+        raise ValueError(
+            f"Generated base projection shape {tuple(target.shape)} does not match "
+            f"native router shape {tuple(source.shape)}"
+        )
+    with torch.no_grad():
+        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        bias = getattr(base, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            bias.zero_()
 
 
 def _install_gate_site(site: GateSite, new_gate: nn.Module, top_k: Optional[int]) -> GateInstall:
@@ -1473,12 +1729,14 @@ def _install_gate_site(site: GateSite, new_gate: nn.Module, top_k: Optional[int]
         else:
             wrapped = _wrap_gate_for_contract(site, new_gate, top_k)
             _copy_gate_attrs(site.gate, wrapped)
+            wrapped.train(site.gate.training)
             _assign_child(site.block, site.gate_attr, wrapped)
             installed_gate = wrapped
 
     elif site.pattern == "parameter_gate":
         wrapped = _wrap_gate_for_contract(site, new_gate, top_k)
         _copy_gate_attrs(site.gate, wrapped)
+        wrapped.train(site.gate.training)
         _assign_child(site.block, site.gate_attr, wrapped)
         installed_gate = wrapped
 
@@ -1495,6 +1753,51 @@ def _install_gate_site(site: GateSite, new_gate: nn.Module, top_k: Optional[int]
     )
 
 
+def _install_teacher_student_site(
+    site: GateSite,
+    student_gate: nn.Module,
+    top_k: Optional[int],
+    student_weight: float,
+    distillation_temperature: float,
+) -> GateInstall:
+    if site.pattern != "parameter_gate" or _detect_post_processing(site.gate) != "deepseek_v2":
+        raise ValueError(
+            "Teacher-student mode currently supports DeepSeek-V2 parameter gates only"
+        )
+    teacher_requires_grad = tuple(
+        parameter.requires_grad for parameter in site.gate.parameters()
+    )
+    try:
+        wrapper = _DeepSeekV2TeacherStudentGate(
+            site.gate,
+            student_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+            student_weight=student_weight,
+            distillation_temperature=distillation_temperature,
+        )
+        _copy_gate_attrs(site.gate, wrapper)
+        wrapper.train(site.gate.training)
+        for parameter in site.gate.parameters():
+            parameter.requires_grad_(False)
+        _assign_child(site.block, site.gate_attr, wrapper)
+    except Exception:
+        for parameter, requires_grad in zip(site.gate.parameters(), teacher_requires_grad):
+            parameter.requires_grad_(requires_grad)
+        raise
+    return GateInstall(
+        site=site,
+        old_gate=site.gate,
+        new_gate=wrapper,
+        owner=site.block,
+        attr=site.gate_attr,
+        old_child=site.gate,
+        mode="teacher_student",
+        teacher_gate=site.gate,
+        student_gate=student_gate,
+        teacher_requires_grad=teacher_requires_grad,
+    )
+
+
 def install_gates(
     model: nn.Module,
     gate: str | GateFactory,
@@ -1507,6 +1810,11 @@ def install_gates(
     allow_remote_code: bool = False,
     require_hf_native: bool = False,
     allow_generic: bool = True,
+    dynamic_discovery: bool = True,
+    initialize_from_original: bool = False,
+    teacher_student: bool = False,
+    student_weight: float = 0.0,
+    distillation_temperature: float = 1.0,
 ) -> List[GateInstall]:
     """Replace MoE gate/scorer modules across any HF MoE model.
 
@@ -1538,6 +1846,17 @@ def install_gates(
     allow_generic:
         Allow heuristic fallback discovery if primary structural discovery
         finds no gates.
+    dynamic_discovery:
+        Use runtime candidate discovery when ``sample_input`` is provided.
+        Disable this to use structural discovery while still retaining the
+        sample for transactional post-install forward verification.
+    initialize_from_original:
+        Copy each native router projection into ``new_gate.base`` before
+        installation. This lets generated residual gates preserve pretrained
+        routing at step zero.
+    teacher_student:
+        Keep each native DeepSeek-V2 router frozen as a teacher and install the
+        generated gate as a random trainable student.
 
     Returns
     -------
@@ -1565,9 +1884,14 @@ def install_gates(
     else:
         factory = gate
 
+    if teacher_student and initialize_from_original:
+        raise ValueError(
+            "Teacher-student mode requires a random student; do not initialize it from the teacher"
+        )
+
     selected_layers = set(layers) if layers is not None else None
     global _LAST_CANDIDATE_REPORT
-    if sample_input is not None:
+    if sample_input is not None and dynamic_discovery:
         sites, reports = _find_moe_gates_dynamic(
             model,
             sample_input,
@@ -1585,7 +1909,7 @@ def install_gates(
     else:
         sites = find_moe_gates(
             model,
-            sample_input=sample_input,
+            sample_input=None,
             allow_generic=allow_generic,
         )
 
@@ -1595,7 +1919,20 @@ def install_gates(
             if selected_layers is not None and site.layer_index not in selected_layers:
                 continue
 
-            install = _install_gate_site(site, _new_gate_for_site(factory, site), top_k)
+            new_gate = _new_gate_for_site(factory, site)
+            if teacher_student:
+                install = _install_teacher_student_site(
+                    site,
+                    new_gate,
+                    top_k,
+                    student_weight,
+                    distillation_temperature,
+                )
+            elif initialize_from_original:
+                _initialize_from_original_projection(new_gate, site)
+                install = _install_gate_site(site, new_gate, top_k)
+            else:
+                install = _install_gate_site(site, new_gate, top_k)
             installs.append(install)
             logger.info(
                 "Replaced gate at layer %d (%s.%s, pattern=%s, %d->%d)",
@@ -1745,11 +2082,72 @@ def freeze_except_gates(
     """Freeze all parameters except those belonging to replacement gates."""
     trainable_gate_ids: set[int] = set()
     for inst in installs:
-        for param in inst.new_gate.parameters():
+        parameters = (
+            inst.student_gate.parameters()
+            if inst.student_gate is not None
+            else inst.new_gate.parameters()
+        )
+        for param in parameters:
             trainable_gate_ids.add(id(param))
 
     for param in model.parameters():
         param.requires_grad_(id(param) in trainable_gate_ids)
+
+
+def gate_trainable_parameters(installs: Iterable[GateInstall]) -> List[nn.Parameter]:
+    """Return unique trainable gate parameters, excluding frozen teachers."""
+    seen: set[int] = set()
+    parameters: List[nn.Parameter] = []
+    for install in installs:
+        candidates = (
+            install.student_gate.parameters()
+            if install.student_gate is not None
+            else install.new_gate.parameters()
+        )
+        for parameter in candidates:
+            if parameter.requires_grad and id(parameter) not in seen:
+                seen.add(id(parameter))
+                parameters.append(parameter)
+    return parameters
+
+
+def teacher_student_distillation_loss(installs: Iterable[GateInstall]) -> torch.Tensor:
+    """Average the current forward pass's teacher-to-student router KL losses."""
+    losses: List[torch.Tensor] = []
+    for install in installs:
+        loss = getattr(install.new_gate, "_last_distillation_loss", None)
+        if isinstance(loss, torch.Tensor):
+            if torch.is_grad_enabled() and not loss.requires_grad:
+                raise RuntimeError(
+                    "Router distillation loss has no gradient; use non-reentrant checkpointing"
+                )
+            losses.append(loss)
+            install.new_gate._last_distillation_loss = None
+    if not losses:
+        raise RuntimeError("No teacher-student distillation losses were captured")
+    return torch.stack(losses).mean()
+
+
+def set_teacher_student_weight(installs: Iterable[GateInstall], value: float) -> None:
+    """Set one routing handoff weight across all teacher-student gates."""
+    found = False
+    for install in installs:
+        setter = getattr(install.new_gate, "set_student_weight", None)
+        if callable(setter):
+            setter(value)
+            found = True
+    if not found:
+        raise RuntimeError("No teacher-student gates are installed")
+
+
+def restore_gates(installs: Iterable[GateInstall]) -> None:
+    """Restore gate replacements created by :func:`install_gates`.
+
+    This is the public counterpart to the installer's transactional rollback.
+    It removes logit hooks and correctly restores indexed module-container
+    children as well as ordinary module attributes.
+    """
+    _rollback(list(installs))
 
 
 def trainable_parameter_names(model: nn.Module) -> List[str]:
@@ -1830,7 +2228,8 @@ def _install_gate_logit_hook(inst: GateInstall) -> None:
             logits = getattr(mod, "_last_gate_logits", None)
             if not isinstance(logits, torch.Tensor):
                 raise
-        mod._gate_logits.append(logits)  # keep grad
+        mod._gate_logits.clear()
+        mod._gate_logits.append(logits)  # keep only the latest forward's graph
 
     handle = target.register_forward_hook(hook_fn)
     inst.hook_handles.append(handle)
@@ -2046,5 +2445,10 @@ def _rollback(installs: List[GateInstall]) -> None:
             attr = inst.attr or inst.site.gate_attr
             old_child = inst.old_child or inst.old_gate
             _assign_child(owner, attr, old_child)
+            if inst.teacher_requires_grad is not None:
+                for parameter, requires_grad in zip(
+                    inst.old_gate.parameters(), inst.teacher_requires_grad
+                ):
+                    parameter.requires_grad_(requires_grad)
         except (AttributeError, TypeError):
             pass
