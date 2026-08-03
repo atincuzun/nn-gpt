@@ -46,7 +46,7 @@ def main():
                         help='Do not save results to database')
     args = parser.parse_args()
 
-    from ab.gpt.NNEval import main as nneval_main
+    from ab.gpt.act.eval.Eval import main as nneval_main
     nneval_main(
         custom_synth_dir=args.synth_dir,
         nn_name_prefix=args.prefix,

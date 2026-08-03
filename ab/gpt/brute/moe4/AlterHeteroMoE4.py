@@ -16,7 +16,7 @@ Constraint:   All 4 experts must be **different** base architectures
 Pattern follows AlterNNFN.py / AlterHeteroMoE.py:
   combinatorial generation → compile check → forward-pass probe → write new_nn.py
 Evaluation via existing NNEval.py:
-  python -m ab.gpt.NNEval --custom_synth_dir <output> --nn_name_prefix MoE4
+  python -m ab.gpt.act.eval.Eval --custom_synth_dir <output> --nn_name_prefix MoE4
 """
 
 import re

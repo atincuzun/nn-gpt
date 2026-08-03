@@ -59,6 +59,11 @@ class Eval:
                     return_node = node.body[0].value
                     prm_keys = ast.literal_eval(return_node)
         
+        # batch_size is controlled by the training framework (Train.py), not by
+        # generated model code — skip it to avoid false "declared-but-unused" failures.
+        _SKIP_PARAM_VALIDATION = {'batch_size'}
+        prm_keys = [k for k in prm_keys if k not in _SKIP_PARAM_VALIDATION]
+
         if self.use_ast_validation:
             for prm_key in prm_keys:
                 param_used = False

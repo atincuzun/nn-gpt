@@ -925,7 +925,7 @@ def main(
                                 break
 
                         if forward_structural_check:
-                            from ab.gpt.markov.structural_check import quick_structural_check
+                            from ab.gpt.act.markov.structural_check import quick_structural_check
 
                             ok_forward, forward_msg = quick_structural_check(code)
                             if not ok_forward:

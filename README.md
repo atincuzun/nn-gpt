@@ -9,52 +9,6 @@ short alias  <a href='https://pypi.python.org/pypi/lmurg'>lmurg</a>
 
 This Python-based <a href='https://github.com/ABrain-One/nn-gpt'>NNGPT</a> project leverages large language models (LLMs) to automate the creation of neural network architectures, streamlining the design process for machine learning practitioners. It leverages various neural networks from the <a href="https://github.com/ABrain-One/nn-dataset">LEMUR Dataset</a> to fine-tune LLMs and provide insights into potential architectures during the creation of new neural network models.
 
-## LangGraph Multi-Agent Workflow
-
-NNGPT supports an optional LangGraph-based multi-agent orchestration mode. The agent system integrates directly inside `tune()` — no separate entry point, no duplicated logic.
-
-### Design Principle
-
-All pipeline logic remains in `ab/gpt/util/Tune.py` as the **single source of truth**. Agent nodes are thin wrappers only — they read from state and call the existing functions. No logic is reimplemented inside any agent file.
-
-### Agent Flow
-
-The professor-specified flow is: **Finetuner → Generator → Evaluator → Predictor**
-
-
-- **manager** — controls routing, checks epoch stop condition, decides next node
-- **generator** — calls `nn_gen()` / `trans_gen()`; skips if epoch < skip_epoch; skips evaluator if no code generated
-- **evaluator** — calls `_evaluate_epoch()`; stores accuracy and all predictor inputs in state
-- **finetuner** — calls `_finetune_epoch()`; increments epoch counter, returns to manager
-- **predictor** — optional; activates after epoch 1 and epoch 2 accuracies are both available
-
-Any future improvement to `nn_gen()`, `trans_gen()`, `_evaluate_epoch()`, or `_finetune_epoch()` automatically applies to both classic and agent modes.
-
-### Crash Recovery
-
-Agent mode uses LangGraph `MemorySaver` checkpointing. If the pipeline crashes mid-epoch (e.g. GPU OOM), re-running with the same `nn_name_prefix` resumes from the last completed node — no restart from epoch 0.
-
-### Usage
-
-The agent mode is enabled by default.
-
-To use the accuracy predictor agent:
-
-```bash
-python -m ab.gpt.TuneNNGen --use_predictor
-```
-
-### Agent Files
-
-| File | Purpose |
-|---|---|
-| `ab/gpt/agents/run_agent.py` | Builds and runs the LangGraph StateGraph |
-| `ab/gpt/agents/manager.py` | Routing logic and epoch stop condition |
-| `ab/gpt/agents/predictor.py` | Optional accuracy prediction node |
-| `ab/gpt/agents/state.py` | Shared `AgentState` TypedDict — field names match LEMUR DB columns |
-| `ab/gpt/util/Tune.py` | Single source of truth: `nn_gen`, `trans_gen`, `_evaluate_epoch`, `_finetune_epoch`, `generate_step`, `evaluate_step`, `finetune_step` |
-| `ab/gpt/AccPredictor.py` | Accuracy predictor: data prep, fine-tuning, and evaluation |
-
 ## Create and Activate a Virtual Environment (recommended)
 For Linux/Mac:
    ```bash
@@ -78,8 +32,9 @@ Create a virtual environment, activate it, and run the following command to inst
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
-pip install -r req-no-isolation.txt --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cu130
+MAX_JOBS=4 NVCC_THREADS=1 pip install -r req-no-isolation.txt --no-build-isolation --no-cache -v --extra-index-url https://download.pytorch.org/whl/cu130
 ```
+Removing the --no-cache parameter allows previously built packages to be retrieved from the cache, but it can lead to problems if the PyTorch version has changed.
 
 
 If there are installation problems, install the dependencies from the 'requirements.txt' file one by one.
@@ -115,14 +70,14 @@ python -m ab.stat.export
 
 ## Use
 
-- **`ab.gpt.NNAlter*`** – Generates modified neural network models.  
+- **`ab.gpt.act.alter.*`** – Generates modified neural network models.  
   Use the `-e` argument to set the number of epochs for the initial CV model generation.
 
-- **`ab.gpt.NNEval`** – Evaluates the models generated in the previous step.
+- **`ab.gpt.act.eval.Eval`** – Evaluates the models generated in the previous step.
 
-- **`ab.gpt.TuneNNGen*`** – Performs fine-tuning and evaluation of an LLM. For evaluation purposes, the LLM generates neural network models, which are then trained to assess improvements in the LLM’s performance on this task. The -s flag allows skipping model generation for the specified number of epochs.
+- **`ab.gpt.act.tune.Tune*`** – Performs fine-tuning and evaluation of an LLM. For evaluation purposes, the LLM generates neural network models, which are then trained to assess improvements in the LLM’s performance on this task. The -s flag allows skipping model generation for the specified number of epochs.
 
-- **`ab.gpt.AccPredictor`** – Fine-tunes and evaluates a Qwen3-8B accuracy predictor from LEMUR training runs. Given early-epoch accuracies and neural network code, it predicts final `best_accuracy` and `best_epoch`.
+- **`ab.gpt.act.AccPredictor`** – Fine-tunes and evaluates a Qwen3-8B accuracy predictor from LEMUR training runs. Given early-epoch accuracies and neural network code, it predicts final `best_accuracy` and `best_epoch`.
 
   Running the script runs four steps in order:
 
@@ -132,14 +87,14 @@ python -m ab.stat.export
   4. **Model testing** — runs inference on the test split and writes `ab/gpt/data/test_predictions.csv` and `test_metrics.log`
 
   ```bash
-  python -m ab.gpt.AccPredictor
+  python -m ab.gpt.act.AccPredictor
   ```
 
   Individual steps can also be imported:
 
   ```python
-  from ab.gpt.AccPredictor import data_preprocessing, prepare_llm_datasets, train_model, test_model, predict_best_accuracy
-  from ab.gpt.AccPredictor import DEFAULT_TRAIN_PATH, DEFAULT_VAL_PATH, DEFAULT_OUTPUT_DIR, DEFAULT_TEST_PATH
+  from ab.gpt.act.AccPredictor import data_preprocessing, prepare_llm_datasets, train_model, test_model, predict_best_accuracy
+  from ab.gpt.act.AccPredictor import DEFAULT_TRAIN_PATH, DEFAULT_VAL_PATH, DEFAULT_OUTPUT_DIR, DEFAULT_TEST_PATH
 
   data_preprocessing()
   prepare_llm_datasets()
@@ -152,11 +107,58 @@ python -m ab.stat.export
 
   Requires a GPU with ≥24 GB VRAM, `unsloth`, and the LEMUR/nn-dataset package installed.
 
-- **`ab.gpt.TuneNNGen_delta.py`** – Delta-based fine-tuning entry point (see [arXiv:2605.04903](https://arxiv.org/abs/2605.04903)). The LLM generates compact unified diffs (deltas) to refine baseline architectures instead of full code. Uses paper-aligned hyperparameters (lr=1e-5, temperature=0.35, top-k=50, LoRA with `lm_head`). Calls `TuneNNGen.main()` with delta defaults — no upstream behavior is changed.
+- **`ab.gpt.act.tune.delta.py`** – Delta-based fine-tuning entry point (see [arXiv:2605.04903](https://arxiv.org/abs/2605.04903)). The LLM generates compact unified diffs (deltas) to refine baseline architectures instead of full code. Uses paper-aligned hyperparameters (lr=1e-5, temperature=0.35, top-k=50, LoRA with `lm_head`). Calls `TuneNNGen.main()` with delta defaults — no upstream behavior is changed.
   ```bash
-  python -m ab.gpt.TuneNNGen_delta
-  python -m ab.gpt.TuneNNGen_delta --llm_conf qwen2.5_coder_7b_instruct.json
+  python -m ab.gpt.act.tune.delta
+  python -m ab.gpt.act.tune.delta --llm_conf qwen2.5_coder_7b_instruct.json
   ```
+
+## LangGraph Multi-Agent Workflow
+
+NNGPT supports an optional LangGraph-based multi-agent orchestration mode. The agent system integrates directly inside `tune()` — no separate entry point, no duplicated logic.
+
+### Design Principle
+
+All pipeline logic remains in `ab/gpt/util/Tune.py` as the **single source of truth**. Agent nodes are thin wrappers only — they read from state and call the existing functions. No logic is reimplemented inside any agent file.
+
+### Agent Flow
+
+The professor-specified flow is: **Finetuner → Generator → Evaluator → Predictor**
+
+
+- **manager** — controls routing, checks epoch stop condition, decides next node
+- **generator** — calls `nn_gen()` / `trans_gen()`; skips if epoch < skip_epoch; skips evaluator if no code generated
+- **evaluator** — calls `_evaluate_epoch()`; stores accuracy and all predictor inputs in state
+- **finetuner** — calls `_finetune_epoch()`; increments epoch counter, returns to manager
+- **predictor** — optional; activates after epoch 1 and epoch 2 accuracies are both available
+
+Any future improvement to `nn_gen()`, `trans_gen()`, `_evaluate_epoch()`, or `_finetune_epoch()` automatically applies to both classic and agent modes.
+
+### Crash Recovery
+
+Agent mode uses LangGraph `MemorySaver` checkpointing. If the pipeline crashes mid-epoch (e.g. GPU OOM), re-running with the same `nn_name_prefix` resumes from the last completed node — no restart from epoch 0.
+
+### Usage
+
+The agent mode is enabled by default.
+
+To use the accuracy predictor agent:
+
+```bash
+python -m ab.gpt.act.tune.Tune --use_predictor
+```
+
+### Agent Files
+
+| File | Purpose |
+|---|---|
+| `ab/gpt/act/agents/run_agent.py` | Builds and runs the LangGraph StateGraph |
+| `ab/gpt/act/agents/manager.py` | Routing logic and epoch stop condition |
+| `ab/gpt/act/agents/predictor.py` | Optional accuracy prediction node |
+| `ab/gpt/act/agents/state.py` | Shared `AgentState` TypedDict — field names match LEMUR DB columns |
+| `ab/gpt/util/Tune.py` | Single source of truth: `nn_gen`, `trans_gen`, `_evaluate_epoch`, `_finetune_epoch`, `generate_step`, `evaluate_step`, `finetune_step` |
+| `ab/gpt/act/AccPredictor.py` | Accuracy predictor: data prep, fine-tuning, and evaluation |
+
 
 <a href='https://huggingface.co/ABrain'><strong>Fine-tuned LLMs</strong></a>
 
@@ -170,7 +172,7 @@ docker run --rm -u $(id -u):ab -v $(pwd):/a/mm abrainone/ai-linux:llm bash -c "[
 
 Running script
 ```bash
-docker run --rm -u $(id -u):ab --shm-size=16G -v $(pwd)/nn-gpt:/a/mm abrainone/ai-linux:llm bash -c "python -m ab.gpt.TuneNNGen_8B"
+docker run --rm -u $(id -u):ab --shm-size=16G -v $(pwd)/nn-gpt:/a/mm abrainone/ai-linux:llm bash -c "python -m ab.gpt.act.tune.8B"
 ```
 
 If recently added dependencies are missing in the <a href='https://hub.docker.com/r/abrainone/ai-linux' target='_blank'>AI Linux</a>, you can create a container from the Docker image ```abrainone/ai-linux:llm```, install the missing packages (preferably using ```pip install <package name>```), and then create a new image from the container using ```docker commit <container name> <new image name>```. You can use this new image locally or push it to the registry for deployment on the computer cluster.

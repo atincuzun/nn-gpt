@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import ab.gpt.util.DatasetSplit as DatasetSplit
-import ab.gpt.rl_pipeline.reward_payload as RewardPayload
+import ab.gpt.act.rl.reward_payload as RewardPayload
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, TensorDataset

@@ -80,7 +80,7 @@ class NNRLPrompt(Prompt):
                 # output = '\n'.join(prompt_dict[key]['output'])
                 # response = output.format(**para_dict)
                 response = para_dict  # Use the whole dictionary as response
-                text = self.tokenizer.apply_chat_template(
+                text = self._apply_chat_template(
                     [
                         {'role': 'user', 'content': inst},
                         {'role': 'assistant', 'content': json.dumps(para_dict, ensure_ascii=False, indent=2)}

@@ -71,12 +71,8 @@ def read_py_file_as_string(file_path):
         str: Content of the file.
     """
     try:
-        spec = importlib.util.spec_from_file_location("module_name", file_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        source_code = inspect.getsource(module)
-        return source_code
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
     except Exception as e:
         print(f"error when reading file: {e}")
         return None
@@ -108,13 +104,118 @@ def extract_by_pattern(name, res, options) -> str:
     return res
 
 
-def extract_code(txt):
+# ── Tolerant NN-code extraction (was: strict <nn> tags + fence only) ──────────
+# Real generations frequently drop the opening <nn>, wrap the model in a bare
+# markdown fence, or emit an untagged `class Net`. The strict path lost all of
+# those. The tolerant path below tries, in strict priority order, stopping at the
+# first that yields valid code, and applies a rejection guard so junk ('...'
+# echoes, sub-50-char fragments, anything lacking class/def) can never get in.
+_FIX_E_S = '\x00<<EXTRACT_REGION_START>>\x00'
+_FIX_E_E = '\x00<<EXTRACT_REGION_END>>\x00'
+_ANCHOR_B = re.compile(r'(?m)^(import|from|class |def |supported_hyperparameters)')
+_ANCHOR_D = re.compile(r'(?m)^(import|class |def )')
+
+
+def _is_real_code(cand) -> bool:
+    """True only for plausible NN code; False for the '...' echo, sub-50-char
+    fragments, and anything missing class/def."""
+    if not cand:
+        return False
+    nonws = re.sub(r'\s', '', cand)
+    if not nonws:
+        return False
+    if set(nonws) <= {'.'}:          # pure '...' (or '.'-only) placeholder
+        return False
+    if len(nonws) < 50:              # too short to be a real model
+        return False
+    if 'class' not in cand or 'def' not in cand:
+        return False
+    return True
+
+
+def _guarded(cand):
+    """Apply the rejection guard to an already-extracted candidate."""
+    if cand is None:
+        return None
+    if _is_real_code(cand):
+        return cand
+    n_nonws = len(re.sub(r'\s', '', cand))
+    print(f'[EXTRACT] ✗ rejected non-code candidate ({n_nonws} non-ws chars)')
+    return None
+
+
+def _extract_region(region):
+    """Run a raw candidate region through extract_by_pattern (sentinel-wrapped) so
+    improve_code runs and the canonical '✓ Found ... N chars' line prints."""
+    if not region or not region.strip():
+        print('[EXTRACT] ✗ No NN code found')
+        return None
+    return extract_by_pattern('NN code', f'{_FIX_E_S}{region}{_FIX_E_E}', ((_FIX_E_S, _FIX_E_E),))
+
+
+def _extract_code_strict(txt):
+    """Original strict behavior: <nn> tags then markdown fences."""
     return extract_by_pattern('NN code', txt, (('<nn>', '</nn>'), ('```python', '```'), ('```', '```')))
+
+
+def extract_code(txt):
+    """Tolerant, junk-rejecting NN-code extraction. Returns the extracted code
+    string, or None when nothing valid is found."""
+    if not isinstance(txt, str):
+        return _extract_code_strict(txt)
+
+    has_open = '<nn>' in txt
+    has_close = '</nn>' in txt
+
+    # (a) Both tags -> original behavior; guard only ever fires on the degenerate
+    #     '<nn>...</nn>' junk echo.
+    if has_open and has_close:
+        return _guarded(_extract_code_strict(txt))
+
+    # (b) Closing tag only, opening tag missing.
+    if has_close:
+        m = _ANCHOR_B.search(txt[:txt.rindex('</nn>')])
+        region = txt[m.start():txt.rindex('</nn>')] if m else None
+        return _guarded(_extract_region(region))
+
+    # Opening tag only (no close): no defined fallback -> mirror the original.
+    if has_open:
+        return _guarded(_extract_code_strict(txt))
+
+    # ── No tags at all ────────────────────────────────────────────────────────
+    # (c) Fenced block.
+    cand = _guarded(extract_by_pattern(
+        'NN code', txt, (('```python', '```'), ('```', '```'))))
+    if cand is not None:
+        return cand
+
+    # (d) No tags, no usable fence, but a recognizable Net+forward model.
+    if 'class Net' in txt and 'def forward' in txt:
+        m = _ANCHOR_D.search(txt)
+        region = txt[m.start():] if m else None
+        cand = _guarded(_extract_region(region))
+        if cand is not None:
+            return cand
+
+    print('[EXTRACT] ✗ No NN code found')
+    return None
 
 
 def extract_hyperparam(txt):
     return extract_by_pattern('hyper-parameters', txt.replace('< hp >', '<hp>').replace('<.hp>', '<hp>').replace('</ hp >', '</hp>'),
                               (('<hp>', '</hp>'), ('```json', '```')))
+
+
+_NN_MODULE_CLASS = re.compile(r'class\s+\w+\s*\([^)]*nn\.Module[^)]*\)')
+
+
+def is_nn_model_code(s) -> bool:
+    """True when a string looks like a full NN model rather than a transform:
+    it defines a `class Net` (or any nn.Module subclass) and has a `def forward`.
+    Used to detect NN code misrouted into the <tr> transform slot."""
+    if not isinstance(s, str) or 'def forward' not in s:
+        return False
+    return 'class Net' in s or bool(_NN_MODULE_CLASS.search(s))
 
 
 def extract_transform(txt):

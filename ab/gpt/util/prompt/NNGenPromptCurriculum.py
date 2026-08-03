@@ -152,7 +152,7 @@ class NNGenPrompt(Prompt):
                                 f"Add output entries to the config."
                             )
                         resp = output_template.format(**para)
-                        text = self.tokenizer.apply_chat_template(
+                        text = self._apply_chat_template(
                             [{"role": "user", "content": inst},
                              {"role": "assistant", "content": resp}],
                             tokenize=False,
@@ -241,7 +241,7 @@ class NNGenPrompt(Prompt):
                                         f"[{key}] is_generation=false but 'output' block is empty."
                                     )
                                 resp = output_template.format(**para)
-                                text = self.tokenizer.apply_chat_template(
+                                text = self._apply_chat_template(
                                     [
                                         {"role": "user", "content": inst},
                                         {"role": "assistant", "content": resp},

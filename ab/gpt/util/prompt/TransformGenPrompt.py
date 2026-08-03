@@ -182,7 +182,7 @@ class TransformGenPrompt(Prompt):
                     continue
               
 
-                text = self.tokenizer.apply_chat_template(
+                text = self._apply_chat_template(
                     [
                         {'role': 'user', 'content': inst},
                         {'role': 'assistant', 'content': response}

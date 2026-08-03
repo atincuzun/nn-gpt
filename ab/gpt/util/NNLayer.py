@@ -8,8 +8,8 @@ import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from util.Const import conf_test_dir, epoch_dir, new_nn_file, synth_dir, new_out_file
-from util.Util import extract_code
+from ab.gpt.util.Const import conf_test_dir, epoch_dir, new_nn_file, synth_dir, new_out_file
+from ab.gpt.util.Util import extract_code
 from ab.nn.util.Util import create_file
 
 def alter(epochs, test_conf, llm_name):

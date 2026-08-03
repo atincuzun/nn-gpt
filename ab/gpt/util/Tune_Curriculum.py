@@ -16,7 +16,7 @@ from ab.nn.util.Util import release_memory, create_file
 from peft import PeftModel
 from tqdm import tqdm
 from ab.gpt.util.Const import nngpt_dir
-import ab.gpt.NNEval as NNEval
+import ab.gpt.act.eval.Eval as NNEval
 from ab.gpt.util.Chatbot import ChatBot
 from ab.gpt.util.Const import *
 
@@ -34,7 +34,7 @@ from ab.gpt.util.DeltaUtil import apply_delta, validate_delta, repair_code
 from ab.gpt.util.Const import nngpt_upload
 from ab.gpt.brute.trans.TransformEval import run_eval
 from ab.gpt.util.prompt.TransformGenPrompt import TransformGenPrompt, load_data_from_folders
-from ab.gpt.agents.state import AgentState
+from ab.gpt.act.agents.state import AgentState
 
 from ab.gpt.util.prompt.NNGenPromptCurriculum import NNGenPrompt
 
@@ -304,7 +304,7 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
 
     shutil.rmtree(epoch_dir(), ignore_errors=True)
     if use_agents:
-        from ab.gpt.agents.run_agent import run_agent_controller
+        from ab.gpt.act.agents.run_agent import run_agent_controller
         return run_agent_controller(state)
     for epoch in range(llm_tune_epochs):
         print(f'[INFO]Start Epoch {epoch}')

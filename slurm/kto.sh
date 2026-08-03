@@ -136,7 +136,7 @@ echo "Sync complete."
 # ── Run the self-contained iterative KTO pipeline ─────────────────────────────
 
 PIPELINE_CMD=(
-    python -m ab.gpt.kto_pipeline.kto_selfcontained_finetune
+    python -m ab.gpt.act.kto.kto_selfcontained_finetune
     --llm_conf "${LLM_CONF}"
     --cycles "${CYCLES}"
     --models_per_cycle "${MODELS_PER_CYCLE}"

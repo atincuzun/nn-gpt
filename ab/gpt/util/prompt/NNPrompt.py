@@ -30,7 +30,7 @@ class NNPrompt(Prompt):
                 f"on the {lemur_row['dataset']} dataset. Name the main class 'Net'."
             )
             response = "```\n" + str(lemur_row['nn_code']) + "\n```"
-            text = self.tokenizer.apply_chat_template(
+            text = self._apply_chat_template(
                 self._build_messages(inst, response),
                 tokenize=False
             )

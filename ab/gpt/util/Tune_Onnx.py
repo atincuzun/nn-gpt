@@ -12,7 +12,7 @@ import ab.nn.api as lemur
 import deepspeed
 from ab.nn.util.Util import release_memory, create_file
 from tqdm import tqdm
-import ab.gpt.NNEval as NNEval
+import ab.gpt.act.eval.Eval as NNEval
 from ab.gpt.util.Chatbot import ChatBot
 from ab.gpt.util.Const import (
     out_dir,
@@ -572,7 +572,7 @@ def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, t
 
     if exists(models_dir):
         if classification_mode:
-            from ab.gpt.ClassificationEval import evaluate_epoch as cls_eval
+            from ab.gpt.act.classification.Eval import evaluate_epoch as cls_eval
 
             cls_eval(models_dir)
         else:

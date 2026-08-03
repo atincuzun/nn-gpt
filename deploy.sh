@@ -6,4 +6,4 @@ pip install -e .
 
 
 cd ../nn-gpt
-python -m ab.gpt.TuneNNGen_20B_oss
+python -m ab.gpt.act.tune.20B_oss

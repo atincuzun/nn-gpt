@@ -732,7 +732,7 @@ def main():
     total = generate_models(str(output_dir), prefix='lr')
     print(f"\nDone. Generated {total} models ready for NNEval.")
     print(f"\nTo evaluate, run:")
-    print(f"  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m ab.gpt.NNEval --only_epoch 0 --nn_train_epochs 5 --nn_name_prefix lr")
+    print(f"  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m ab.gpt.act.eval.Eval --only_epoch 0 --nn_train_epochs 5 --nn_name_prefix lr")
 
 
 if __name__ == '__main__':

@@ -566,7 +566,7 @@ def main():
     print("To evaluate on cifar-10 (metadata overrides dataset per model):")
     print(
         "  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-        "python -m ab.gpt.NNEval --only_epoch 0 --nn_train_epochs 5 "
+        "python -m ab.gpt.act.eval.Eval --only_epoch 0 --nn_train_epochs 5 "
         "--nn_name_prefix llr"
     )
     print()

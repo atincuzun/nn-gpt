@@ -8,6 +8,13 @@ hp_file = 'hp.txt'
 transformer_file = 'tr.py'
 new_out_file = 'full_output.txt'
 
+# Default LEMUR corpus filters — single source of truth for the iterative
+# pipeline. Used both for curation (building the SFT training corpus) and for
+# generation-seed selection (the in-context example models shown to the LLM),
+# so the two paths cannot silently drift apart.
+DEFAULT_DATASET = 'cifar-10'
+DEFAULT_NN_PREFIXES = ('ga-', 'GenFractalNet')
+
 gpt = 'gpt'
 gpt_dir = ab_root_path / base_module / gpt
 conf_dir = gpt_dir / 'conf'
@@ -24,7 +31,7 @@ nngpt_gate_dir = nngpt_dir / 'gates'
 # Setting NNGPT_DIR_OVERRIDE env var to redirect all nngpt output to a custom path.
 # Used by CurriculumGenerationPipeline.py to isolate per-dataset/level/k runs.
 import os as _os
-_nngpt_override = _os.environ.get("NNGPT_DIR_OVERRIDE")
+_nngpt_override = _os.environ.get("AB_GPT_NNGPT_DIR") or _os.environ.get("NNGPT_DIR_OVERRIDE")
 if _nngpt_override:
     nngpt_dir = Path(_nngpt_override)
     print(f"[Const] nngpt_dir overridden → {nngpt_dir}")
