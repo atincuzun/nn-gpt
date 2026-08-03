@@ -86,7 +86,8 @@ def _strip_reasoning_output(text: str) -> str:
 
 class ChatBot:
     def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, keep_memory=False,
-                 temperature=1.0, top_k=50, top_p=0.9, system_prompt: str = None):
+                 temperature=1.0, top_k=50, top_p=0.9, repetition_penalty=1.0,
+                 system_prompt: str = None):
         self.show_additional_info = False
         self.model = model
         self.tokenizer = tokenizer
@@ -94,6 +95,7 @@ class ChatBot:
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
         self.system_prompt = system_prompt
         self.disable_chat_template = _env_flag("NNGPT_DISABLE_CHAT_TEMPLATE")
         self.strip_think_output = _env_flag("NNGPT_STRIP_THINK_OUTPUT")
@@ -128,6 +130,10 @@ class ChatBot:
         
         if self.__keep_memory:
             self.__messages = []
+
+    @property
+    def generation_backend(self) -> str:
+        return "pipeline" if self.__pipeline is not None else "direct"
 
     def _build_messages(self, user_content: str) -> list:
         """Build a messages list with optional system role prepended."""
@@ -207,6 +213,7 @@ class ChatBot:
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
@@ -247,6 +254,7 @@ class ChatBot:
                     "temperature": self.temperature,
                     "top_k": self.top_k,
                     "top_p": self.top_p,
+                    "repetition_penalty": self.repetition_penalty,
                 }
                 try:
                     out_item = self.__pipeline(
@@ -374,6 +382,7 @@ class ChatBot:
                     temperature=self.temperature,
                     top_k=self.top_k,
                     top_p=self.top_p,
+                    repetition_penalty=self.repetition_penalty,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                 )

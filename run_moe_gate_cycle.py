@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import math
 import os
@@ -28,13 +29,29 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite-Chat")
+    parser.add_argument(
+        "--adapter",
+        type=Path,
+        help="Optional PEFT LoRA adapter to merge into the frozen teacher model",
+    )
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--epochs", type=int, default=2,
+    parser.add_argument("--epochs", type=int, default=5,
                         help="Number of pipeline generation/evaluation/training epochs")
-    parser.add_argument("--test-nn", type=int, default=2)
-    parser.add_argument("--nn-train-epochs", type=int, default=1)
-    parser.add_argument("--gate-train-steps", type=int, default=2)
+    parser.add_argument("--test-nn", type=int, default=10)
+    parser.add_argument("--nn-train-epochs", type=int, default=3)
+    parser.add_argument("--gate-train-steps", type=int, default=50)
     parser.add_argument("--gate-learning-rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--gate-implementation",
+        choices=(
+            "llm_generated",
+            "exact_residual_mlp",
+            "svd_signed_pair_gelu",
+            "svd_signed_pair_silu",
+        ),
+        default="llm_generated",
+        help="LLM-generated gate or a function-preserving replacement",
+    )
     parser.add_argument(
         "--gate-mode",
         choices=("teacher-student", "direct"),
@@ -62,23 +79,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--handoff-max-validation-loss-increase", type=float, default=0.05)
     parser.add_argument("--gate-generation-attempts", type=int, default=3)
     parser.add_argument("--gate-max-new-tokens", type=int, default=1024)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=4096)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=16384)
+    parser.add_argument(
+        "--generation-max-input-length",
+        type=int,
+        help="Optional input-only prompt limit; unset by default for non-Unsloth generation",
+    )
     parser.add_argument("--max-length", type=int, default=4096)
-    parser.add_argument("--max-prompts", type=int, default=8)
+    parser.add_argument("--max-prompts", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--validation-fraction", type=float, default=0.25)
-    parser.add_argument("--validation-steps", type=int, default=8)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--validation-steps", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--router-top-k", type=int)
     parser.add_argument("--layers", type=int, nargs="*")
+    parser.add_argument(
+        "--progressive-unfreeze-descending",
+        action="store_true",
+        help="Train the highest selected layer first, then add one earlier layer per epoch",
+    )
     parser.add_argument("--conf-keys", nargs="+", default=["improve_classification_only"])
     parser.add_argument("--nn-name-prefix", default="moe-gate-cycle")
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--generation-backend",
+        choices=("pipeline", "direct"),
+        default="pipeline",
+    )
+    parser.add_argument(
+        "--fixed-evaluation-prompts",
+        action="store_true",
+        help="Reuse identical references and decoding seed in every pipeline epoch",
+    )
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--verify-morphism-only",
+        action="store_true",
+        help="Verify replacement equivalence and exit before generation or database access",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
 
@@ -230,6 +273,150 @@ def _model_logits(model: Any, inputs: dict[str, Any]):
     return output.logits.detach().float().cpu()
 
 
+def _capture_native_gate_inputs(
+    model: Any,
+    sites: list[Any],
+    inputs: dict[str, Any],
+) -> tuple[Any, dict[int, Any]]:
+    captured: dict[int, Any] = {}
+    handles = []
+
+    def make_hook(gate_id: int):
+        def hook(_module: Any, args: tuple[Any, ...]) -> None:
+            if gate_id not in captured and args and hasattr(args[0], "detach"):
+                captured[gate_id] = args[0].detach().cpu()
+        return hook
+
+    for site in sites:
+        handles.append(site.gate.register_forward_pre_hook(make_hook(id(site.gate))))
+    try:
+        logits = _model_logits(model, inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return logits, captured
+
+
+def _verify_morphed_gate_projections(
+    installs: list[Any],
+    native_inputs: dict[int, Any],
+) -> list[dict[str, Any]]:
+    import torch
+    import torch.nn.functional as F
+    from moe_gate_only.universal import _resolve_top_k
+
+    metrics: list[dict[str, Any]] = []
+    for install in installs:
+        hidden_states = native_inputs.get(id(install.old_gate))
+        native_weight = getattr(install.old_gate, "weight", None)
+        if hidden_states is None or not isinstance(native_weight, torch.Tensor):
+            raise RuntimeError(
+                f"Could not verify native projection at layer {install.site.layer_index}"
+            )
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        native_input = hidden_states.to(device=native_weight.device)
+        with torch.no_grad():
+            native_route = install.old_gate(native_input)
+            replacement_route = install.new_gate(native_input)
+        if isinstance(native_route, torch.Tensor):
+            expected_native = native_route.reshape(-1, native_route.shape[-1]).detach()
+        else:
+            expected_native = F.linear(
+                flat.float(), native_weight.detach().float().cpu()
+            )
+        generated_gate = getattr(install.new_gate, "gate", install.new_gate)
+        parameter = next(generated_gate.parameters())
+        with torch.no_grad():
+            actual_native = generated_gate(
+                flat.to(device=parameter.device, dtype=parameter.dtype)
+            ).detach()
+        expected = expected_native.float().cpu()
+        actual = actual_native.float().cpu()
+        difference = (actual - expected).abs()
+        installed_top_k = getattr(install.new_gate, "top_k", None)
+        top_k = int(
+            installed_top_k
+            if installed_top_k is not None
+            else _resolve_top_k(
+                install.site.gate,
+                install.site.block,
+                install.site.num_experts,
+                None,
+            )
+        )
+        expected_indices = expected.topk(top_k, dim=-1, sorted=False).indices
+        actual_indices = actual.topk(top_k, dim=-1, sorted=False).indices
+        topk_equal = bool(torch.equal(actual_indices, expected_indices))
+        allclose = bool(torch.allclose(actual, expected, rtol=5e-5, atol=5e-5))
+        if isinstance(native_route, torch.Tensor) and isinstance(replacement_route, torch.Tensor):
+            route_tokens = getattr(install.site.block, "route_tokens_to_experts", None)
+            if callable(route_tokens):
+                native_indices, native_weights = route_tokens(native_route)
+                replacement_indices, replacement_weights = route_tokens(replacement_route)
+            else:
+                native_indices = native_route.topk(top_k, dim=-1, sorted=False).indices
+                replacement_indices = replacement_route.topk(
+                    top_k, dim=-1, sorted=False
+                ).indices
+                native_weights = native_route
+                replacement_weights = replacement_route
+        elif (
+            isinstance(native_route, (tuple, list))
+            and len(native_route) >= 2
+            and isinstance(replacement_route, (tuple, list))
+            and len(replacement_route) >= 2
+        ):
+            native_indices, native_weights = native_route[:2]
+            replacement_indices, replacement_weights = replacement_route[:2]
+        else:
+            raise RuntimeError("Native and replacement gates returned incompatible contracts")
+        routing_indices_equal = bool(torch.equal(native_indices, replacement_indices))
+        routing_weight_difference = (
+            native_weights.detach().float().cpu()
+            - replacement_weights.detach().float().cpu()
+        ).abs()
+        routing_weights_equal = bool(torch.equal(native_weights, replacement_weights))
+        routing_weights_allclose = bool(
+            torch.allclose(native_weights, replacement_weights, rtol=5e-5, atol=5e-5)
+        )
+        bit_exact_expected = bool(
+            getattr(generated_gate, "morphism_metrics", {}).get(
+                "bit_exact_projection_expected", False
+            )
+        )
+        layer_metrics = {
+            "captured_tokens": int(flat.shape[0]),
+            "projection_allclose": allclose,
+            "projection_max_abs_error": float(difference.max().item()),
+            "projection_mean_abs_error": float(difference.mean().item()),
+            "top_k": top_k,
+            "topk_indices_equal": topk_equal,
+            "routing_indices_equal": routing_indices_equal,
+            "routing_weights_equal": routing_weights_equal,
+            "routing_weights_allclose": routing_weights_allclose,
+            "routing_weights_max_abs_error": float(routing_weight_difference.max().item()),
+            "bit_exact_projection_expected": bit_exact_expected,
+        }
+        routing_failed = (
+            not routing_indices_equal
+            or not routing_weights_allclose
+            or (
+                bit_exact_expected
+                and (
+                    not torch.equal(actual, expected)
+                    or not routing_weights_equal
+                )
+            )
+        )
+        if not allclose or not topk_equal or routing_failed:
+            raise RuntimeError(
+                "Function-preserving gate failed per-layer routing equivalence at layer "
+                f"{install.site.layer_index}: {layer_metrics}"
+            )
+        metrics.append(layer_metrics)
+    return metrics
+
+
 def _perturb_gate_weights(installs: list[Any], noise_scale: float, seed: int) -> list[dict[str, Any]]:
     import torch
 
@@ -265,13 +452,33 @@ def _perturb_gate_weights(installs: list[Any], noise_scale: float, seed: int) ->
     return metrics
 
 
+def _morphism_initialization_metrics(installs: list[Any]) -> list[dict[str, Any]]:
+    metrics: list[dict[str, Any]] = []
+    for install in installs:
+        generated_gate = getattr(install.new_gate, "gate", install.new_gate)
+        gate_metrics = getattr(generated_gate, "morphism_metrics", None)
+        if not isinstance(gate_metrics, dict):
+            raise RuntimeError(
+                f"Replacement gate at layer {install.site.layer_index} has no morphism metrics"
+            )
+        metrics.append({
+            "layer_index": install.site.layer_index,
+            "path": install.site.path,
+            **gate_metrics,
+        })
+    return metrics
+
+
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_root = (args.output or Path("out") / f"moe_gate_cycle_{timestamp}").resolve()
-    os.environ["NNGPT_FORCE_DIRECT_GENERATE"] = "1"
+    if args.generation_backend == "direct":
+        os.environ["NNGPT_FORCE_DIRECT_GENERATE"] = "1"
+    else:
+        os.environ.pop("NNGPT_FORCE_DIRECT_GENERATE", None)
     os.environ["NNGPT_DIR_OVERRIDE"] = str(run_root / "nngpt")
 
     if args.gate_mode == "teacher-student" and args.gate_init_noise_scale != 0:
@@ -282,6 +489,13 @@ def main() -> None:
         raise ValueError("student-weight-start must be between 0 and 1")
     if not 0.0 <= args.student_weight_step <= 1.0:
         raise ValueError("student-weight-step must be between 0 and 1")
+    if args.gate_implementation != "llm_generated":
+        if args.gate_mode != "direct":
+            raise ValueError("SVD morphism gates require --gate-mode direct")
+        if args.gate_init_noise_scale != 0:
+            raise ValueError("SVD morphism gates require --gate-init-noise-scale 0")
+    if args.verify_morphism_only and args.gate_implementation == "llm_generated":
+        raise ValueError("--verify-morphism-only requires an SVD morphism gate")
 
     import torch
     import numpy as np
@@ -325,6 +539,24 @@ def main() -> None:
     tokenizer = session.tokenizer
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if args.adapter is not None:
+        if not args.adapter.is_dir():
+            raise FileNotFoundError(f"LoRA adapter directory does not exist: {args.adapter}")
+        from peft import PeftConfig, PeftModel
+
+        peft_config = PeftConfig.from_pretrained(
+            args.adapter,
+            local_files_only=args.local_files_only,
+        )
+        expected_base = str(peft_config.base_model_name_or_path)
+        print(f"Merging LoRA adapter {args.adapter} trained from {expected_base}")
+        adapted_model = PeftModel.from_pretrained(
+            session.model,
+            args.adapter,
+            is_trainable=False,
+            local_files_only=args.local_files_only,
+        )
+        session.model = adapted_model.merge_and_unload(safe_merge=True)
 
     # --------------- discover sites ---------------
 
@@ -338,12 +570,30 @@ def main() -> None:
     chat_bot = ChatBot(
         session.model, tokenizer,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
     )
-    gate_source = _generate_gate(
-        chat_bot, shapes, args.gate_generation_attempts,
-        args.gate_max_new_tokens, gate_dir,
-        random_student=args.gate_mode == "teacher-student",
-    )
+    if chat_bot.generation_backend != args.generation_backend:
+        raise RuntimeError(
+            f"Requested generation backend {args.generation_backend!r}, but ChatBot "
+            f"initialized {chat_bot.generation_backend!r}"
+        )
+    gate_dir.mkdir(parents=True, exist_ok=True)
+    gate_source = None
+    if args.gate_implementation == "llm_generated":
+        gate_source = _generate_gate(
+            chat_bot, shapes, args.gate_generation_attempts,
+            args.gate_max_new_tokens, gate_dir,
+            random_student=args.gate_mode == "teacher-student",
+        )
+    else:
+        (gate_dir / "gate_implementation.json").write_text(
+            json.dumps({
+                "gate_implementation": args.gate_implementation,
+                "initialization": "per_layer_native_router_function_preserving",
+                "shapes": shapes,
+            }, indent=2),
+            encoding="utf-8",
+        )
     # --------------- install gates & freeze ---------------
 
     sample_input = tokenizer(
@@ -352,31 +602,65 @@ def main() -> None:
     )
     prompt_dict = json.loads((conf_test_dir / "NN_gen.json").read_text(encoding="utf-8"))
     session.model.eval()
-    native_logits = _model_logits(session.model, sample_input)
+    native_logits, native_gate_inputs = _capture_native_gate_inputs(
+        session.model,
+        sites,
+        sample_input,
+    )
+    native_repeat_logits = _model_logits(session.model, sample_input)
+    native_repeat_difference = (native_logits - native_repeat_logits).abs()
+    native_repeatable = bool(torch.equal(native_logits, native_repeat_logits))
+    if not native_repeatable:
+        raise RuntimeError(
+            "Native model is not bit-repeatable before gate replacement: "
+            f"max_abs_difference={float(native_repeat_difference.max().item())}"
+        )
 
     with session:
         _seed_all(args.seed)
-        session.replace_source(
-            gate_source, class_name="LLMGeneratedGate",
-            layers=args.layers, sample_input=sample_input, verify=True,
-            top_k=args.router_top_k, allow_remote_code=True,
-            dynamic_discovery=False,
-            initialize_from_original=args.gate_mode == "direct",
-            teacher_student=args.gate_mode == "teacher-student",
-            student_weight=args.student_weight_start,
-            distillation_temperature=args.distillation_temperature,
-        )
-        initialization_metrics = (
-            _perturb_gate_weights(session.installs, args.gate_init_noise_scale, args.seed)
-            if args.gate_mode == "direct"
-            else [{
+        replace_kwargs = {
+            "layers": args.layers,
+            "sample_input": sample_input,
+            "verify": True,
+            "top_k": args.router_top_k,
+            "allow_remote_code": True,
+            "dynamic_discovery": False,
+            "initialize_from_original": args.gate_mode == "direct",
+            "teacher_student": args.gate_mode == "teacher-student",
+            "student_weight": args.student_weight_start,
+            "distillation_temperature": args.distillation_temperature,
+        }
+        if gate_source is not None:
+            session.replace_source(
+                gate_source,
+                class_name="LLMGeneratedGate",
+                **replace_kwargs,
+            )
+        else:
+            session.replace(args.gate_implementation, **replace_kwargs)
+        if args.gate_implementation != "llm_generated":
+            initialization_metrics = _morphism_initialization_metrics(session.installs)
+            projection_metrics = _verify_morphed_gate_projections(
+                session.installs,
+                native_gate_inputs,
+            )
+            for initialization, projection in zip(
+                initialization_metrics,
+                projection_metrics,
+            ):
+                initialization.update(projection)
+        elif args.gate_mode == "direct":
+            initialization_metrics = _perturb_gate_weights(
+                session.installs, args.gate_init_noise_scale, args.seed
+            )
+        else:
+            initialization_metrics = [{
                 "layer_index": install.site.layer_index,
                 "student_parameter_count": sum(
                     parameter.numel() for parameter in install.student_gate.parameters()
                 ),
                 "initialization": "random_shadow_student",
             } for install in session.installs]
-        )
         (gate_dir / "initialization_metrics.json").write_text(
             json.dumps(initialization_metrics, indent=2), encoding="utf-8",
         )
@@ -391,6 +675,10 @@ def main() -> None:
             "gate_init_noise_scale": args.gate_init_noise_scale,
             "mode": args.gate_mode,
             "student_weight": session.student_weight(),
+            "native_forward_bit_repeatable": native_repeatable,
+            "native_repeat_max_abs_logit_difference": float(
+                native_repeat_difference.max().item()
+            ),
         }
         (gate_dir / "step_zero_equivalence.json").write_text(
             json.dumps(equivalence, indent=2), encoding="utf-8",
@@ -406,16 +694,60 @@ def main() -> None:
                 f"max_abs_difference={max_abs_diff}"
             )
         session.freeze_except_gates()
+        if args.verify_morphism_only:
+            session_summary = session.summary()
+            verification = {
+                **equivalence,
+                "gate_implementation": args.gate_implementation,
+                "installed_gates": session_summary.installed_gates,
+                "trainable_parameters": session_summary.trainable_parameters,
+                "total_parameters": session_summary.total_parameters,
+                "trainable_names": session_summary.trainable_names,
+            }
+            (gate_dir / "morphism_verification.json").write_text(
+                json.dumps(verification, indent=2),
+                encoding="utf-8",
+            )
+            session.save(gate_dir / "gate_verified")
+            print(f"MoE gate morphism verification completed: {gate_dir}")
+            return
 
+        fixed_generation_prompts = None
         for epoch in range(args.epochs):
             print(f"\n{'='*60}\n  EPOCH {epoch} / {args.epochs}\n{'='*60}\n")
-            _seed_all(args.seed + epoch)
+            generation_seed = args.seed if args.fixed_evaluation_prompts else args.seed + epoch
+            _seed_all(generation_seed)
             epoch_path = epoch_dir(epoch)
             epoch_path.mkdir(parents=True, exist_ok=True)
+            if args.progressive_unfreeze_descending:
+                descending_layers = sorted(
+                    {install.site.layer_index for install in session.installs},
+                    reverse=True,
+                )
+                active_layers = set(descending_layers[:epoch + 1])
+                for install in session.installs:
+                    trainable = install.site.layer_index in active_layers
+                    for parameter in install.new_gate.parameters():
+                        parameter.requires_grad_(trainable)
+                if not active_layers:
+                    raise RuntimeError("Progressive gate training selected no active layers")
+            else:
+                active_layers = {
+                    install.site.layer_index for install in session.installs
+                }
+            (epoch_path / "active_gate_layers.json").write_text(
+                json.dumps({
+                    "epoch": epoch,
+                    "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
+                    "active_layers": sorted(active_layers),
+                }, indent=2),
+                encoding="utf-8",
+            )
             active_student_weight = session.student_weight()
             (epoch_path / "routing_mode.json").write_text(
                 json.dumps({
                     "gate_mode": args.gate_mode,
+                    "gate_implementation": args.gate_implementation,
                     "student_weight": active_student_weight,
                 }, indent=2),
                 encoding="utf-8",
@@ -429,7 +761,7 @@ def main() -> None:
             if args.gradient_checkpointing and hasattr(session.model, "gradient_checkpointing_disable"):
                 session.model.gradient_checkpointing_disable()
 
-            nn_gen(
+            used_prompts = nn_gen(
                 epoch,
                 epoch_path,
                 chat_bot,
@@ -440,9 +772,29 @@ def main() -> None:
                 args.generation_max_new_tokens,
                 True,
                 args.nn_name_prefix,
-                args.max_length,
+                args.generation_max_input_length,
                 1,
+                fixed_generation_prompts if args.fixed_evaluation_prompts else None,
             )
+            if args.fixed_evaluation_prompts and fixed_generation_prompts is None:
+                fixed_generation_prompts = used_prompts
+                prompt_audit = []
+                for index, (prompt_text, reference) in enumerate(used_prompts):
+                    prompt_audit.append({
+                        "index": index,
+                        "prompt_sha256": hashlib.sha256(
+                            prompt_text.encode("utf-8")
+                        ).hexdigest(),
+                        "reference_nn": str(reference.get("nn", "")),
+                        "dataset": str(reference.get("dataset", "")),
+                        "task": str(reference.get("task", "")),
+                        "metric": str(reference.get("metric", "")),
+                        "accuracy": str(reference.get("accuracy", "")),
+                    })
+                (nngpt_dir / "fixed_evaluation_prompts.json").write_text(
+                    json.dumps(prompt_audit, indent=2),
+                    encoding="utf-8",
+                )
 
             # Preserve cycle results (nn_gen calls NNEval.main internally)
             cycle_src = nngpt_dir / "cycle_results.json"
@@ -450,12 +802,14 @@ def main() -> None:
                 shutil.copy2(cycle_src, epoch_path / "cycle_results.json")
                 shutil.copy2(cycle_src, nngpt_dir / f"cycle_results_A{epoch}.json")
                 cycle_results = json.loads(cycle_src.read_text(encoding="utf-8"))
-                if not cycle_results.get("success") or int(
+                cycle_models_trained = int(
                     cycle_results.get("evaluation", {}).get("models_trained", 0)
-                ) < 1:
-                    raise RuntimeError(
-                        f"A{epoch} produced no successfully trained CV models; "
-                        "gate training was not started"
+                )
+                cycle_cv_success = bool(cycle_results.get("success")) and cycle_models_trained > 0
+                if not cycle_cv_success:
+                    print(
+                        f"[epoch={epoch}] No CV candidate trained successfully; "
+                        "continuing gate training from existing valid LEMUR examples."
                     )
             else:
                 raise RuntimeError(f"A{epoch} did not produce cycle_results.json")
@@ -474,16 +828,37 @@ def main() -> None:
 
             # ── 2. Build training data from real evaluated LEMUR results ──
 
-            train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
-                tokenizer,
-                conf_train_dir / "NN_gen.json",
-                context_length=args.max_length,
-                max_prompts=args.max_prompts,
-                max_new_tokens=args.generation_max_new_tokens,
-                batch_size=args.batch_size,
-                validation_fraction=args.validation_fraction,
-                seed=args.seed + epoch,
-            )
+            try:
+                train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
+                    tokenizer,
+                    conf_train_dir / "NN_gen.json",
+                    context_length=args.max_length,
+                    max_prompts=args.max_prompts,
+                    max_new_tokens=args.generation_max_new_tokens,
+                    batch_size=args.batch_size,
+                    validation_fraction=args.validation_fraction,
+                    seed=args.seed + epoch,
+                )
+            except ValueError as exc:
+                if "NNGenPrompt produced no usable examples" not in str(exc):
+                    raise
+                print(
+                    f"[epoch={epoch}] Gate training skipped: {exc}. "
+                    "Continuing to the next generation cycle."
+                )
+                session.save(epoch_path / "gate_post_train")
+                (epoch_path / "gate_training_metrics.json").write_text(
+                    json.dumps({
+                        "epoch": epoch,
+                        "active_gate_layers": sorted(active_layers),
+                        "training_skipped": True,
+                        "skip_reason": str(exc),
+                        "current_cycle_cv_success": cycle_cv_success,
+                        "current_cycle_models_trained": cycle_models_trained,
+                    }, indent=2),
+                    encoding="utf-8",
+                )
+                continue
 
             # ── 3. Train gates on formatted NN-generation examples ──
 
@@ -563,10 +938,13 @@ def main() -> None:
             session.save(epoch_path / "gate_post_train", optimizer=optimizer)
             training_metrics = {
                 "epoch": epoch,
+                "active_gate_layers": sorted(active_layers),
                 "examples": len(train_dataset),
                 "steps": result.steps,
                 "mean_train_loss": result.mean_train_loss,
                 "validation_loss": validation_loss,
+                "current_cycle_cv_success": cycle_cv_success,
+                "current_cycle_models_trained": cycle_models_trained,
             }
             if args.gate_mode == "teacher-student":
                 latest_student_stats = collect_teacher_student_metrics(session.installs)
@@ -671,8 +1049,13 @@ def main() -> None:
 
     summary = {
         "model": args.model,
+        "adapter": str(args.adapter) if args.adapter is not None else None,
         "gate_mode": args.gate_mode,
-        "gate_source": str(gate_dir / "gate.py"),
+        "gate_implementation": args.gate_implementation,
+        "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
+        "generation_backend": args.generation_backend,
+        "fixed_evaluation_prompts": args.fixed_evaluation_prompts,
+        "gate_source": str(gate_dir / "gate.py") if gate_source is not None else None,
         "gate_shapes": shapes,
         "replaced_gates": len(sites if args.layers is None else [s for s in sites if s.layer_index in args.layers]),
         "epochs": args.epochs,

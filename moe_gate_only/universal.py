@@ -1691,14 +1691,23 @@ def _new_gate_for_site(factory: GateFactory, site: GateSite) -> nn.Module:
 
 
 def _initialize_from_original_projection(new_gate: nn.Module, site: GateSite) -> None:
-    """Copy the native router projection into a generated gate's base path."""
+    """Initialize a replacement gate to reproduce the native router projection."""
     source = getattr(site.gate, "weight", None)
+    if not isinstance(source, torch.Tensor):
+        raise ValueError("Original-weight initialization requires a native weight tensor")
+
+    initializer = getattr(new_gate, "initialize_from_projection", None)
+    if callable(initializer):
+        bias = getattr(site.gate, "bias", None)
+        initializer(source, bias=bias if isinstance(bias, torch.Tensor) else None)
+        return
+
     base = getattr(new_gate, "base", None)
     target = getattr(base, "weight", None)
-    if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
+    if not isinstance(target, torch.Tensor):
         raise ValueError(
-            "Original-weight initialization requires generated gate attribute "
-            "base = nn.Linear(model_dim, num_experts, bias=False)"
+            "Original-weight initialization requires initialize_from_projection(weight) "
+            "or base = nn.Linear(model_dim, num_experts, bias=False)"
         )
     if source.shape != target.shape:
         raise ValueError(
@@ -1851,9 +1860,8 @@ def install_gates(
         Disable this to use structural discovery while still retaining the
         sample for transactional post-install forward verification.
     initialize_from_original:
-        Copy each native router projection into ``new_gate.base`` before
-        installation. This lets generated residual gates preserve pretrained
-        routing at step zero.
+        Initialize each replacement from the native router projection through
+        ``initialize_from_projection(weight)`` or ``new_gate.base``.
     teacher_student:
         Keep each native DeepSeek-V2 router frozen as a teacher and install the
         generated gate as a random trainable student.
@@ -2125,7 +2133,11 @@ def teacher_student_distillation_loss(installs: Iterable[GateInstall]) -> torch.
             install.new_gate._last_distillation_loss = None
     if not losses:
         raise RuntimeError("No teacher-student distillation losses were captured")
-    return torch.stack(losses).mean()
+    reduction_device = losses[0].device
+    return torch.stack([
+        loss if loss.device == reduction_device else loss.to(reduction_device)
+        for loss in losses
+    ]).mean()
 
 
 def set_teacher_student_weight(installs: Iterable[GateInstall], value: float) -> None:

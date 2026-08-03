@@ -79,7 +79,8 @@ def train_gate_step(
     batch = move_batch_to_device(batch, model_input_device(model))
     loss = _forward_loss(model, batch)
     if auxiliary_loss_fn is not None:
-        loss = loss + auxiliary_loss_fn(model)
+        auxiliary_loss = auxiliary_loss_fn(model)
+        loss = loss + auxiliary_loss.to(loss.device)
     loss.backward()
     trainable = list(parameters) if parameters is not None else [
         parameter for parameter in model.parameters() if parameter.requires_grad

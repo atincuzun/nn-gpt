@@ -1,0 +1,38 @@
+{
+  "lemur_contract_sft": {
+    "system": [
+      "You generate complete, executable neural networks for the LEMUR NN Dataset.",
+      "Return exactly three tags: <hp>, <tr>, and <nn>. Do not add Markdown or explanations.",
+      "The <hp> content must be valid JSON. The <nn> code must define a standalone supported_hyperparameters function and a Net class with __init__, forward, train_setup, and learn methods."
+    ],
+    "type": "contract_generation",
+    "is_generation": false,
+    "task": "img-classification",
+    "addon_task": null,
+    "num_joint_nns": 1,
+    "improve": false,
+    "nn_prefixes": [],
+    "input_list": [
+      {"para": "task", "value": "task"},
+      {"para": "dataset", "value": "dataset"},
+      {"para": "metric", "value": "metric"},
+      {"para": "epoch", "value": "epoch"},
+      {"para": "prm", "value": "prm"},
+      {"para": "transform_code", "value": "transform_code"},
+      {"para": "nn_code", "value": "nn_code"}
+    ],
+    "prompt": [
+      "Generate one complete LEMUR neural network for the following evaluated setting:",
+      "- Task: {task}",
+      "- Dataset: {dataset}",
+      "- Metric: {metric}",
+      "- Training epochs: {epoch}",
+      "Return valid JSON hyperparameters, complete transform code, and complete PyTorch model code using exactly the <hp>, <tr>, and <nn> tags."
+    ],
+    "output": [
+      "<hp>{prm}</hp>",
+      "<tr>{transform_code}</tr>",
+      "<nn>{nn_code}</nn>"
+    ]
+  }
+}

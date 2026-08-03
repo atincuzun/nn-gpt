@@ -8,7 +8,6 @@ import os
 import json
 import tempfile
 import shutil
-from copy import deepcopy
 import torch
 import torch.cuda
 from transformers import (
@@ -34,17 +33,10 @@ class LLM:
                  gguf_file=None,
                  training_args=None,
                  use_unsloth=False,
-                 load_in_4bit=True,
-                 moe_edit_config=None):
+                 load_in_4bit=True):
         self.model_path = model_path
         self.context_length = context_length
         self._use_unsloth = use_unsloth
-        self._moe_edit_config = deepcopy(moe_edit_config) if moe_edit_config is not None else None
-        self._moe_edit_runtime = {
-            "enabled": False,
-            "mode": "disabled",
-            "base_model_name": model_path,
-        }
         
         # ===== Unsloth Fast Path =====
         if use_unsloth:
@@ -175,42 +167,6 @@ class LLM:
         else:
             self.model.save_pretrained(raw_fl_nm, access_token=access_token)
             print("Model saved to: ", raw_fl_nm)
-
-    def apply_moe_edit_if_enabled(self, model=None, selected_model_id=None):
-        model = model or self.model
-        from ab.gpt.moe.config import build_edit_config, normalize_moe_edit_config, is_moe_edit_enabled
-        from ab.gpt.moe.hf_moe_editor import HFMoEEditor
-
-        runtime_cfg = normalize_moe_edit_config(self._moe_edit_config, base_model_name=self.model_path)
-        if not is_moe_edit_enabled(runtime_cfg):
-            self._moe_edit_runtime = runtime_cfg
-            self.model = model
-            return model, runtime_cfg
-
-        if getattr(model, "_moe_edit_result", None) is not None:
-            runtime_cfg["selected_model_id"] = selected_model_id or self.model_path
-            self._moe_edit_runtime = runtime_cfg
-            self.model = model
-            return model, runtime_cfg
-
-        editor = HFMoEEditor(build_edit_config(runtime_cfg))
-        edited_model, edit_result = editor.apply(model, selected_model_id=selected_model_id or self.model_path)
-        runtime_cfg.update(
-            {
-                "selected_model_id": edit_result.selected_model_id,
-                "routing_before": edit_result.routing_before,
-                "routing_after": edit_result.routing_after,
-                "routing_changes": edit_result.routing_changes,
-                "adapter_attached": edit_result.adapter_attached,
-                "adapter_summary": edit_result.adapter_summary,
-            }
-        )
-        self._moe_edit_runtime = runtime_cfg
-        self.model = edited_model
-        return edited_model, runtime_cfg
-
-    def get_moe_edit_runtime(self):
-        return deepcopy(self._moe_edit_runtime)
 
     def get_model(self) -> PreTrainedModel:
         return self.model

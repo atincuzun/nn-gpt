@@ -15,15 +15,9 @@ from peft import (PeftModel)
 from tqdm import tqdm
 
 import ab.gpt.NNEval as NNEval
-from ab.gpt.moe.experiment import (
-    load_tutel_adapter_checkpoint,
-    persist_moe_artifacts,
-    save_tutel_adapter_checkpoint,
-)
 from ab.gpt.util.Chatbot import ChatBot
 from ab.gpt.util.Const import *
 
-from ab.gpt.moe.config import normalize_moe_edit_config
 from ab.gpt.util.LLMUtil import quantization_config_4bit
 from ab.gpt.util.LoRA import LoRA
 from ab.gpt.util.Util import exists, extract_delta, extract_code, extract_hyperparam, extract_transform
@@ -106,7 +100,6 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
     use_unsloth = config.get('use_unsloth', False)
     unsloth_load_in_4bit = config.get('load_in_4bit', True)
     max_new_tokens = config.get('max_new_tokens', max_new_tokens)
-    moe_edit_config = normalize_moe_edit_config(config.get('moe_edit'), base_model_name=str(base_model_name))
     llm_quantization_config = quantization_config_4bit if unsloth_load_in_4bit else None
 
     access_token = None
@@ -135,7 +128,6 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         training_args=training_args,
         use_unsloth=use_unsloth,
         load_in_4bit=unsloth_load_in_4bit,
-        moe_edit_config=moe_edit_config,
     )
     model = model_loader.get_model()
     tokenizer = model_loader.get_tokenizer()
@@ -155,33 +147,11 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
             model = PeftModel.from_pretrained(model, llm_path, is_trainable=True)
             model = model.merge_and_unload()
         else:
-            print(f"[LoRA] No PEFT adapter checkpoint found in {llm_path}; skipping LoRA restore and checking MoE adapter state later")
-
-    model, moe_runtime = model_loader.apply_moe_edit_if_enabled(model=model, selected_model_id=str(base_model_name))
-    if moe_runtime.get('enabled', False):
-        print(f"[MoE] Enabled runtime edit mode={moe_runtime.get('mode')} selected_model={moe_runtime.get('selected_model_id')}")
-        print(f"[MoE] Adapter attached={moe_runtime.get('adapter_attached', False)} routing_changes={len(moe_runtime.get('routing_changes', []))}")
-        resume_moe_source = None
-        if llm_path:
-            resume_moe_source = Path(llm_path)
-        else:
-            base_model_path = Path(str(base_model_name))
-            if base_model_path.exists():
-                resume_moe_source = base_model_path
-
-        if resume_moe_source is not None and moe_runtime.get('adapter_attached', False):
-            adapter_filename = moe_runtime.get('adapter_state_filename', 'tutel_adapter.pt')
-            restored = load_tutel_adapter_checkpoint(model, resume_moe_source, filename=adapter_filename)
-            print(f"[MoE] Adapter checkpoint restored={restored} source={resume_moe_source}")
+            print(f"[LoRA] No PEFT adapter checkpoint found in {llm_path}; skipping restore")
 
     # initialize deepspeed before we do infer in ChatBot
     if use_deepspeed:
         deepspeed.initialize(model=model, config_params=ds_conf)
-
-    moe_trainable_prefixes = ('tutel_adapter',) if moe_runtime.get('adapter_trainable', False) else ()
-    lora_enabled = bool(moe_runtime.get('train_lora', True))
-    if moe_runtime.get('adapter_trainable', False) and not moe_runtime.get('joint_lora', True):
-        lora_enabled = False
 
     lora_tuner = LoRA(
         model,
@@ -190,8 +160,7 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         access_token=access_token,
         peft_config=peft_config,
         use_unsloth=use_unsloth,
-        enable_lora=lora_enabled,
-        external_trainable_prefixes=moe_trainable_prefixes)
+        enable_lora=True)
 
     print('Using Max Length:', model_loader.get_max_length())
 
@@ -202,16 +171,6 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
     for epoch in range(llm_tune_epochs):
         print(f'[INFO]Start Epoch {epoch}')
         out_path = epoch_dir(epoch)
-        if moe_runtime.get('enabled', False):
-            persist_moe_artifacts(
-                out_path,
-                {**moe_runtime, 'epoch': epoch},
-                extra={
-                    'stage': 'pre_generation',
-                    'llm_conf': llm_conf,
-                    'prompt_conf': llm_tune_conf,
-                },
-            )
         if epoch < skip_epoch:
             print(f'Skipped generation at epoch {epoch}')
         else:
@@ -243,41 +202,11 @@ def tune(test_nn, nn_train_epochs, skip_epoch, llm_path, llm_tune_conf, nn_gen_c
         model.train()
         checkpoint_dir = out_path / Path(str(base_model_name))
         model = lora_tuner.train(dataset, tokenizer, checkpoint_dir)
-        if moe_runtime.get('enabled', False):
-            runtime_payload = {**moe_runtime, 'epoch': epoch}
-            persist_moe_artifacts(
-                out_path,
-                runtime_payload,
-                extra={
-                    'stage': 'post_train',
-                    'dataset_length': len(dataset),
-                    'train_lora': lora_enabled,
-                    'adapter_trainable': bool(moe_trainable_prefixes),
-                },
-            )
-            persist_moe_artifacts(
-                checkpoint_dir,
-                runtime_payload,
-                extra={
-                    'stage': 'checkpoint_export',
-                    'dataset_length': len(dataset),
-                    'train_lora': lora_enabled,
-                    'adapter_trainable': bool(moe_trainable_prefixes),
-                },
-            )
-            if moe_runtime.get('persist_adapter', True):
-                adapter_filename = moe_runtime.get('adapter_state_filename', 'tutel_adapter.pt')
-                adapter_path = out_path / 'moe' / adapter_filename
-                saved = save_tutel_adapter_checkpoint(model, adapter_path)
-                print(f"[MoE] Adapter checkpoint saved={saved} path={adapter_path}")
-                checkpoint_adapter_path = checkpoint_dir / adapter_filename
-                checkpoint_saved = save_tutel_adapter_checkpoint(model, checkpoint_adapter_path)
-                print(f"[MoE] Self-contained checkpoint saved={checkpoint_saved} path={checkpoint_adapter_path}")
         del dataset
         release_memory()
 
 
-def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, test_nn, max_new_tokens, save_llm_output, nn_name_prefix, unsloth_max_input_length, prompt_batch):
+def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, test_nn, max_new_tokens, save_llm_output, nn_name_prefix, unsloth_max_input_length, prompt_batch, prompts_override=None):
     print('Preparing prompts for generation, this might take a while...')
 
     # Detect delta mode from nn_name_prefix or config key
@@ -288,28 +217,32 @@ def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, t
         if isinstance(key_config, dict):
             use_delta = key_config.get('use_delta', False) or 'delta' in str(first_key).lower()
 
-    prompts = []
-    for key in conf_keys:
-        prompt = ''
-        key_config = prompt_dict[key]
-        prompt_dict_key = key_config
-        for pr in prompt_dict_key['prompt']:
-            prompt += pr + '\n'
-        data = lemur.data(only_best_accuracy=True, task=prompt_dict_key['task']).groupby(by='nn').sample(n=1)[:test_nn]
-        addon_task = prompt_dict_key.get('addon_task')
-        addon_data = lemur.data(only_best_accuracy=True, task=addon_task) if addon_task else None
-        for _, row in data.iterrows():
-            para_dict = dict()
-            for it in prompt_dict_key['input_list']:
-                para_dict[it['para']] = row[it['value']]
-            if addon_data is not None and not addon_data.empty:
-                available_addon = addon_data.loc[addon_data.nn != row['nn']]
-                if not available_addon.empty:
-                    addon_row = available_addon.sample(n=1).iloc[0]
-                    if prompt_dict_key.get('addon_list'):
-                        for it in prompt_dict_key['addon_list']:
-                            para_dict[it['para']] = addon_row[it['value']]
-            prompts.append((prompt.format(**para_dict), row))
+    if prompts_override is not None:
+        prompts = list(prompts_override)
+        print(f'[INFO] Reusing {len(prompts)} fixed generation prompts')
+    else:
+        prompts = []
+        for key in conf_keys:
+            prompt = ''
+            key_config = prompt_dict[key]
+            prompt_dict_key = key_config
+            for pr in prompt_dict_key['prompt']:
+                prompt += pr + '\n'
+            data = lemur.data(only_best_accuracy=True, task=prompt_dict_key['task']).groupby(by='nn').sample(n=1)[:test_nn]
+            addon_task = prompt_dict_key.get('addon_task')
+            addon_data = lemur.data(only_best_accuracy=True, task=addon_task) if addon_task else None
+            for _, row in data.iterrows():
+                para_dict = dict()
+                for it in prompt_dict_key['input_list']:
+                    para_dict[it['para']] = row[it['value']]
+                if addon_data is not None and not addon_data.empty:
+                    available_addon = addon_data.loc[addon_data.nn != row['nn']]
+                    if not available_addon.empty:
+                        addon_row = available_addon.sample(n=1).iloc[0]
+                        if prompt_dict_key.get('addon_list'):
+                            for it in prompt_dict_key['addon_list']:
+                                para_dict[it['para']] = addon_row[it['value']]
+                prompts.append((prompt.format(**para_dict), row))
 
     models_dir = synth_dir(out_path)
 
@@ -506,6 +439,7 @@ def nn_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict, t
     print('Clear LEMUR query cache.')
     lemur.data.cache_clear()
     print('The cache has been cleared.')
+    return prompts
 
 
 def trans_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict_global, test_nn, max_new_tokens, save_llm_output, nn_name_prefix):

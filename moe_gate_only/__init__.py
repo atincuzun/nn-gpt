@@ -21,6 +21,7 @@ Usage
 """
 
 from .gates import GATE_FACTORIES, build_gate, compile_gate_from_string
+from .morphism import ExactResidualMlpGate, SvdSignedPairGate
 from .universal import (
     GateCandidateReport,
     GateInstall,
@@ -64,6 +65,8 @@ __all__ = [
     "GateTrainingResult",
     "MoEGateSession",
     "SessionState",
+    "ExactResidualMlpGate",
+    "SvdSignedPairGate",
     "assert_hf_native_model",
     "build_gate",
     "build_nngenprompt_dataloaders",

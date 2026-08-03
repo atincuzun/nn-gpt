@@ -6,6 +6,8 @@ from typing import Callable, Dict
 import torch
 import torch.nn as nn
 
+from .morphism import ExactResidualMlpGate, SvdSignedPairGate
+
 
 class LinearGate(nn.Module):
     """Single trainable linear expert scorer."""
@@ -97,11 +99,20 @@ GateFactory = Callable[[int, int], nn.Module]
 
 
 GATE_FACTORIES: Dict[str, GateFactory] = {
+    "exact_residual_mlp": lambda model_dim, num_experts: ExactResidualMlpGate(
+        model_dim, num_experts
+    ),
     "linear": lambda model_dim, num_experts: LinearGate(model_dim, num_experts),
     "low_rank": lambda model_dim, num_experts: LowRankGate(model_dim, num_experts),
     "mlp": lambda model_dim, num_experts: MlpGate(model_dim, num_experts),
     "residual_mlp": lambda model_dim, num_experts: ResidualMlpGate(model_dim, num_experts),
     "fourier": lambda model_dim, num_experts: FourierFeatureGate(model_dim, num_experts),
+    "svd_signed_pair_gelu": lambda model_dim, num_experts: SvdSignedPairGate(
+        model_dim, num_experts, activation="gelu"
+    ),
+    "svd_signed_pair_silu": lambda model_dim, num_experts: SvdSignedPairGate(
+        model_dim, num_experts, activation="silu"
+    ),
 }
 
 

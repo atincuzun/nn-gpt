@@ -43,10 +43,11 @@ echo "=========================================="
 if [ ! -x "${VENV_DIR}/bin/python" ]; then
     python3 -m venv "${VENV_DIR}"
 fi
+export PATH="${VENV_DIR}/bin:${PATH}"
 "${VENV_DIR}/bin/python" -m pip install --no-cache-dir --upgrade pip setuptools wheel
 "${VENV_DIR}/bin/python" -m pip install --no-cache-dir \
     transformers==4.46.3 accelerate datasets pandas overrides nn-dataset \
-    peft==0.14.0 trl==0.12.2 deepspeed==0.18.3 tqdm \
+    peft==0.14.0 trl==0.12.2 deepspeed==0.18.3 pytest tqdm \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
 export PYTHONPATH="${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -71,30 +72,43 @@ if [ "${STAGE_MODEL_TO_TMP:-1}" = "1" ] && [[ "${MODEL_ID}" != /* ]]; then
 fi
 
 cd "${PROJECT_DIR}"
+if [ "${VERIFY_MORPHISM_ONLY:-0}" = "1" ]; then
+    "${VENV_DIR}/bin/python" -m pytest test/test_gate_morphism.py -q
+fi
 CYCLE_CMD=(
     "${VENV_DIR}/bin/python" run_moe_gate_cycle.py
     --model "${MODEL_PATH}"
     --output "${OUTPUT_DIR}"
-    --test-nn "${TEST_NN:-1}"
-    --nn-train-epochs "${NN_TRAIN_EPOCHS:-1}"
-    --gate-train-steps "${GATE_TRAIN_STEPS:-2}"
-    --gate-mode "${GATE_MODE:-teacher-student}"
+    --test-nn "${TEST_NN:-10}"
+    --nn-train-epochs "${NN_TRAIN_EPOCHS:-3}"
+    --gate-train-steps "${GATE_TRAIN_STEPS:-50}"
+    --gate-learning-rate "${GATE_LR:-1e-4}"
+    --gate-mode "${GATE_MODE:-direct}"
+    --gate-implementation "${GATE_IMPLEMENTATION:-svd_signed_pair_silu}"
     --gate-init-noise-scale "${GATE_INIT_NOISE_SCALE:-0}"
     --distillation-weight "${DISTILLATION_WEIGHT:-1.0}"
     --student-weight-step "${STUDENT_WEIGHT_STEP:-0.1}"
     --handoff-mode "${HANDOFF_MODE:-guarded}"
-    --max-prompts "${MAX_PROMPTS:-8}"
+    --max-prompts "${MAX_PROMPTS:-4096}"
     --max-length "${MAX_LENGTH:-4096}"
-    --generation-max-new-tokens "${MAX_NEW_TOKENS:-4096}"
-    --epochs "${EPOCHS:-2}"
-    --batch-size 1
+    --generation-max-new-tokens "${MAX_NEW_TOKENS:-16384}"
+    --epochs "${EPOCHS:-5}"
+    --batch-size "${BATCH_SIZE:-1}"
+    --validation-fraction "${VAL_FRACTION:-0.1}"
+    --validation-steps "${VAL_STEPS:-16}"
     --dtype bfloat16
     --device-map auto
     --gradient-checkpointing
 )
+if [ -n "${ADAPTER_PATH:-}" ]; then
+    CYCLE_CMD+=(--adapter "${ADAPTER_PATH}")
+fi
 if [ -n "${GATE_LAYERS:-}" ]; then
     read -r -a LAYER_ARGS <<< "${GATE_LAYERS}"
     CYCLE_CMD+=(--layers "${LAYER_ARGS[@]}")
+fi
+if [ "${VERIFY_MORPHISM_ONLY:-0}" = "1" ]; then
+    CYCLE_CMD+=(--verify-morphism-only)
 fi
 "${CYCLE_CMD[@]}"
 

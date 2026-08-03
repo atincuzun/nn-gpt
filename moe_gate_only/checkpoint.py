@@ -50,6 +50,7 @@ def save_gate_checkpoint(
         "format_version": FORMAT_VERSION,
         "model_name_or_path": getattr(config, "_name_or_path", None),
         "gate_class_name": session.gate_class_name,
+        "gate_factory_name": session.gate_factory_name,
         "mode": "teacher_student" if teacher_student else "direct",
         "student_weight": session.student_weight() if teacher_student else None,
         "distillation_temperature": (
@@ -93,6 +94,12 @@ def load_gate_checkpoint(
     if saved_mode != current_mode:
         raise ValueError(
             f"Checkpoint mode {saved_mode!r} does not match installed mode {current_mode!r}"
+        )
+    saved_factory = metadata.get("gate_factory_name")
+    if saved_factory is not None and saved_factory != session.gate_factory_name:
+        raise ValueError(
+            f"Checkpoint gate factory {saved_factory!r} does not match installed "
+            f"factory {session.gate_factory_name!r}"
         )
     if current_mode == "teacher_student":
         expected_temperature = float(session.installs[0].new_gate.distillation_temperature)

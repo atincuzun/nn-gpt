@@ -57,6 +57,7 @@ class MoEGateSession:
         self._committed = False
         self.gate_source: str | None = None
         self.gate_class_name: str | None = None
+        self.gate_factory_name: str | None = None
 
     @classmethod
     def from_pretrained(
@@ -130,6 +131,7 @@ class MoEGateSession:
             self._restore_trainability()
             raise
         self.sites = [install.site for install in self.installs]
+        self.gate_factory_name = gate if isinstance(gate, str) else None
         self.state = SessionState.REPLACED
         return list(self.installs)
 
@@ -146,6 +148,7 @@ class MoEGateSession:
         installs = self.replace(gate_class, **replace_kwargs)
         self.gate_source = source
         self.gate_class_name = class_name
+        self.gate_factory_name = None
         return installs
 
     def freeze_except_gates(self) -> None:

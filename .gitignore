@@ -35,3 +35,9 @@ slurm_nngpt_kto_*.sh
 nngpt.def
 .claude/
 Experiment_Metrics/
+
+# Slurm run artifacts (do not commit)
+*.out
+logs/
+out_nneval_tmp_*/
+.kilo/

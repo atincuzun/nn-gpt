@@ -8,7 +8,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:1,tmp:100G
 #SBATCH --mem=192G
 #SBATCH --time=24:00:00
 #SBATCH --partition=standard
@@ -22,8 +22,9 @@ mkdir -p logs
 PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-$PROJECT_DIR/nngpt.sif}"
 
-HF_HOME="${HF_HOME:-$PROJECT_DIR/.cache/huggingface}"
-HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$PROJECT_DIR/.cache/hf_datasets}"
+DATA_ROOT="${DATA_ROOT:-/data/42-julia-hpc-ai-cv-students/s497179/nn-gpt-moe-gate-experiment}"
+HF_HOME="${HF_HOME:-$DATA_ROOT/huggingface}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 
 # Experiment knobs (this ablation's requested values).
 LLM_CONF="${LLM_CONF:-nngpt_unique_arch_rag.json}"   # → ABrain/NNGPT-UniqueArch-Rag
@@ -65,7 +66,7 @@ TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
 RESUME_FROM_CYCLE="${RESUME_FROM_CYCLE:-}"
 
 # Per-run output paths.
-HOST_RUN_ROOT="${PROJECT_DIR}/${RUN_OUTPUT_REL}"
+HOST_RUN_ROOT="${DATA_ROOT}/outputs/${RUN_OUTPUT_REL}"
 CONTAINER_NNGPT_DIR="/project/${RUN_OUTPUT_REL}/nngpt"
 HOST_OUTPUT_DIR="${HOST_RUN_ROOT}/nngpt/${OUTPUT_SUBDIR}"
 
@@ -168,6 +169,7 @@ apptainer exec \
     --writable-tmpfs \
     --pwd /project \
     --bind "${PROJECT_DIR}:/project" \
+    --bind "${HOST_RUN_ROOT}:/project/${RUN_OUTPUT_REL}" \
     --bind "${LOCAL_HF_HOME}:${LOCAL_HF_HOME}" \
     ${EXTRA_BIND} \
     --env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
