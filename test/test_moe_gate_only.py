@@ -10,7 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from moe_gate_only import (  # noqa: E402
-    GATE_FACTORIES,
     GateInstall,
     assert_hf_native_model,
     count_parameters,
@@ -29,8 +28,8 @@ from moe_gate_only.universal import (  # noqa: E402
     _DeepSeekV2Gate,
     _DeepSeekV2TeacherStudentGate,
     _extract_logits_from_gate_output,
-    _initialize_from_original_projection,
     _new_gate_for_site,
+    initialize_gate_from_projection,
 )
 
 
@@ -332,7 +331,7 @@ def test_deepseek_replacement_preserves_float32_native_routing():
     site = GateSite(0, block, native, "gate", 8, 4, "parameter_gate")
     generated = _new_gate_for_site(GeneratedGate, site)
     assert generated.base.weight.dtype == torch.float32
-    _initialize_from_original_projection(generated, site)
+    initialize_gate_from_projection(generated, native.weight)
     replacement = _DeepSeekV2Gate(generated, top_k=2)
     for name in (
         "topk_method", "scoring_func", "seq_aux", "norm_topk_prob",

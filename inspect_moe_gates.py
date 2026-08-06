@@ -45,12 +45,22 @@ def _print_routing(label: str, topk_idx, topk_weight, num_experts: int) -> None:
     print(f"    expert fractions: {[f'{f:.4f}' for f in fractions.tolist()]}")
 
 
+def _linear_gate_factory(model_dim: int, num_experts: int) -> nn.Module:
+    """Script-local replacement gate: the library ships no gate implementations."""
+    gate = nn.Linear(model_dim, num_experts, bias=False)
+    nn.init.normal_(gate.weight, std=0.02)
+    return gate
+
+
+_GATE_REGISTRY = {"linear": _linear_gate_factory}
+
+
 def main() -> None:
     from moe_gate_only import MoEGateSession, collect_gate_metrics
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite-Chat")
-    parser.add_argument("--gate", default="linear", help="Replacement gate factory name")
+    parser.add_argument("--model", default="LiquidAI/LFM2.5-8B-A1B")
+    parser.add_argument("--gate", default="linear", help="Replacement gate name from the script-local registry")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--initialize-from-original", action="store_true",
@@ -127,7 +137,7 @@ def main() -> None:
     # ---- Replace gates ----
     _print_section(f"REPLACING GATES WITH: {args.gate}")
     installs = session.replace(
-        args.gate,
+        _GATE_REGISTRY[args.gate],
         initialize_from_original=args.initialize_from_original,
         teacher_student=args.teacher_student,
     )

@@ -61,14 +61,18 @@ class CausalTextCollator:
         return encoded
 
 
+def _default_gate_factory(model_dim: int, num_experts: int) -> torch.nn.Module:
+    """Standalone fallback: a plain trainable linear scorer.
+
+    The library ships no gate implementations; external gates are supplied via
+    ``--gate-source`` or by editing this factory.
+    """
+    return torch.nn.Linear(model_dim, num_experts, bias=False)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite")
-    parser.add_argument(
-        "--gate",
-        choices=("linear", "low_rank", "mlp", "residual_mlp", "fourier"),
-        default="low_rank",
-    )
+    parser.add_argument("--model", default="LiquidAI/LFM2.5-8B-A1B")
     parser.add_argument("--gate-source", type=Path, help="Python file defining LLMGeneratedGate")
     parser.add_argument("--gate-class", default="LLMGeneratedGate")
     parser.add_argument("--checkpoint", type=Path, help="Existing gate checkpoint to resume")
@@ -81,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-config",
         type=Path,
-        default=Path("ab/gpt/conf/prompt/train/NN_gen.json"),
+        default=Path("ab/gpt/conf/prompt/train/NN_gate.json"),
     )
     parser.add_argument("--train-text", type=Path, help="UTF-8 file with one example per non-empty line")
     parser.add_argument("--output", type=Path, default=Path("out/moe_gate_standalone"))
@@ -208,7 +212,7 @@ def main() -> None:
             source = gate_source.read_text(encoding="utf-8")
             session.replace_source(source, class_name=args.gate_class, **replace_kwargs)
         else:
-            session.replace(args.gate, **replace_kwargs)
+            session.replace(_default_gate_factory, **replace_kwargs)
 
         session.freeze_except_gates()
         if args.gradient_checkpointing:

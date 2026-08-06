@@ -7,7 +7,7 @@ from typing import Any, Iterable, Optional
 
 import torch.nn as nn
 
-from .gates import compile_gate_from_string
+from .contract import compile_gate_from_string
 from .universal import (
     GateInstall,
     GateSite,

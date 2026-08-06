@@ -1,4 +1,4 @@
-"""Fine-tune a supported causal language model on NNGenPrompt with LoRA."""
+"""Fine-tune a supported causal language model on the gate NAS prompt with LoRA."""
 
 from __future__ import annotations
 
@@ -36,7 +36,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite-Chat")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--prompt-config", type=Path, default=Path("ab/gpt/conf/prompt/train/NN_gen.json"))
+    parser.add_argument(
+        "--prompt-config",
+        type=Path,
+        default=Path("ab/gpt/conf/prompt/train/NN_gate.json"),
+        help="Train prompt config (default: the MoE-gate NAS prompt)",
+    )
+    parser.add_argument(
+        "--gate-summary",
+        default=(
+            "No measured NAS cycle feedback is available yet. "
+            "Prioritize complete, executable LEMUR candidates that follow the "
+            "NN interface exactly."
+        ),
+        help="Text injected into the {gate_summary} placeholder during pre-finetune",
+    )
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -125,6 +139,7 @@ def main() -> None:
         batch_size=args.batch_size,
         validation_fraction=args.validation_fraction,
         seed=args.seed,
+        gate_summary=args.gate_summary,
     )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(

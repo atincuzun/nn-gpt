@@ -1,0 +1,65 @@
+{
+  "improve_classification_gate_feedback": {
+    "system": [
+      "You are an expert in feedback-driven neural architecture search (NAS) and PyTorch model design.",
+      "Your MoE (Mixture-of-Experts) router gate dynamically activates specialized expert layers based on each generation context. The current gate code is provided below; use the cycle feedback to improve your routing decisions so that generated architectures achieve higher measured accuracy.",
+      "Your task: transform a lower-performing reference LEMUR architecture into the higher-performing target architecture under the same task, dataset, metric, and epoch.",
+      "Learn from the cycle feedback: reinforce patterns that produced successful candidates and avoid those that caused training or validity failures.",
+      "Output only <hp>, <tr>, and <nn> XML tags in that order. No markdown, no explanations, no placeholders."
+    ],
+    "type": "change_parameters",
+    "is_generation": false,
+    "output_type": "classification",
+    "task": "img-classification",
+    "dataset": "cifar-10",
+    "nn_prefixes": [
+      "ga-",
+      "GenFractalNet",
+      "moe-gate-cycle"
+    ],
+    "addon_task": null,
+    "input_list": [
+      {"para": "nn_code", "value": "nn_code"},
+      {"para": "accuracy", "value": "accuracy"},
+      {"para": "epoch", "value": "epoch"},
+      {"para": "dataset", "value": "dataset"},
+      {"para": "task", "value": "task"},
+      {"para": "metric", "value": "metric"},
+      {"para": "metric_code", "value": "metric_code"},
+      {"para": "transform_code", "value": "transform_code"},
+      {"para": "prm", "value": "prm"},
+      {"para": "addon_accuracy", "value": "accuracy_2"},
+      {"para": "addon_nn_code", "value": "nn_code_2"},
+      {"para": "addon_transform_code", "value": "transform_code_2"},
+      {"para": "addon_prm", "value": "prm_2"}
+    ],
+    "static_values": {
+      "gate_summary": "No previous NAS cycle feedback is available. Learn from the paired LEMUR improvement example below."
+    },
+    "no_repeat": ["nn"],
+    "keep_same": ["epoch", "metric", "dataset", "task"],
+    "num_joint_nns": 2,
+    "improve": true,
+    "prompt": [
+      "Supervised fine-tuning update for feedback-driven NAS with MoE routing.",
+      "The current MoE router gate was used to generate candidate architectures in the previous cycle. Measured outcomes:",
+      "<nas_feedback>",
+      "{gate_summary}",
+      "</nas_feedback>",
+      "Use this feedback to learn which architectural transformations improve accuracy and which patterns cause failures.",
+      "Below is a lower-performing reference architecture. The measured higher-performing target achieved accuracy {addon_accuracy} under identical conditions (reference: {accuracy}, task: {task}, dataset: {dataset}, epoch: {epoch}, metric: {metric}).",
+      "Produce the improved architecture by applying the successful transformation patterns while avoiding the documented failure modes.",
+      "Reference:",
+      "<hp>{prm}</hp>",
+      "<tr>{transform_code}</tr>",
+      "<metric>{metric_code}</metric>",
+      "<nn>{nn_code}</nn>",
+      "Return exactly the improved <hp>, <tr>, and <nn> artifacts."
+    ],
+    "output": [
+      "<hp>{addon_prm}</hp>",
+      "<tr>{addon_transform_code}</tr>",
+      "<nn>{addon_nn_code}</nn>"
+    ]
+  }
+}

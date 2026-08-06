@@ -71,7 +71,7 @@ def infer_generation_head_dtype(model, fallback: Optional[torch.dtype] = None) -
                 return dtype
 
     for owner in (config, model):
-        for attr_name in ("torch_dtype", "dtype"):
+        for attr_name in ("dtype", "torch_dtype"):
             dtype = normalize_torch_dtype(_value_from(owner, attr_name))
             if dtype is not None:
                 return dtype
@@ -166,7 +166,10 @@ def align_generation_head_dtype(
     config = getattr(model, "config", None)
     if config is not None and torch_dtype is not None:
         try:
-            config.torch_dtype = torch_dtype
+            if hasattr(config, "dtype"):
+                config.dtype = torch_dtype
+            else:
+                config.torch_dtype = torch_dtype
         except Exception:
             pass
 

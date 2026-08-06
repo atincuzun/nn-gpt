@@ -1,0 +1,54 @@
+{
+  "improve_classification_gate_feedback": {
+    "system": [
+      "You are an expert in feedback-driven neural architecture search and PyTorch model design.",
+      "Generate one complete LEMUR-compatible image-classification candidate that improves on the reference architecture and the measured outcomes from the previous NAS cycle.",
+      "Treat measured CV accuracy and failures as evidence: preserve successful design choices, avoid repeated failure modes, and make a concrete architectural or optimization improvement.",
+      "Output only <hp>, <tr>, and <nn> in that order. Do not output analysis, markdown, or placeholders."
+    ],
+    "task": "img-classification",
+    "dataset": "cifar-10",
+    "nn_prefixes": [
+      "ga-",
+      "GenFractalNet",
+      "moe-gate-cycle"
+    ],
+    "addon_task": null,
+    "input_list": [
+      {"para": "nn_code", "value": "nn_code"},
+      {"para": "accuracy", "value": "accuracy"},
+      {"para": "epoch", "value": "epoch"},
+      {"para": "dataset", "value": "dataset"},
+      {"para": "task", "value": "task"},
+      {"para": "metric", "value": "metric"},
+      {"para": "metric_code", "value": "metric_code"},
+      {"para": "transform_code", "value": "transform_code"},
+      {"para": "prm", "value": "prm"}
+    ],
+    "static_values": {
+      "gate_summary": "No previous NAS cycle feedback is available. Establish a valid baseline candidate."
+    },
+    "no_repeat": [],
+    "keep_same": [],
+    "prompt": [
+      "Perform the next iteration of feedback-driven neural architecture search.",
+      "Measured feedback from the previous generation cycle:",
+      "<nas_feedback>",
+      "{gate_summary}",
+      "</nas_feedback>",
+      "Use this feedback to improve validity and the '{metric}' metric. Do not merely reproduce a failed candidate or the reference model.",
+      "The reference model achieved {accuracy} at epoch {epoch} on '{dataset}' for task '{task}'.",
+      "Reference training configuration:",
+      "<hp>{prm}</hp>",
+      "<tr>{transform_code}</tr>",
+      "<metric>{metric_code}</metric>",
+      "<nn>{nn_code}</nn>",
+      "Return a single complete candidate:",
+      "1. <hp> must contain valid JSON with batch, transform, and every hyperparameter used by the model.",
+      "2. <tr> must contain complete executable transform code.",
+      "3. <nn> must contain complete executable PyTorch code following the LEMUR interface: module-level supported_hyperparameters(), class Net, and methods __init__, forward, train_setup, and learn.",
+      "The candidate must be structurally different from the reference and must not contain ellipses, omitted bodies, markdown fences, or explanations.",
+      "Output exactly <hp>...</hp><tr>...</tr><nn>...</nn>."
+    ]
+  }
+}
