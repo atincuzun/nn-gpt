@@ -22,6 +22,7 @@ from typing import Any
 from .cli import parse_args
 from .feedback import _build_gate_feedback_summary
 from .gate_source import _generate_gate, _validate_gate_source
+from .gate_store import structural_hash
 from .morphism import (
     _capture_native_gate_inputs,
     _dtype,
@@ -54,7 +55,9 @@ class RunContext:
     used_prompts: list = field(default_factory=list)
     candidate_index: int = 0
     candidate_root: Path | None = None
-    gate_benchmark: dict | None = None
+    gate_root: Path | None = None
+    gate_epoch_metrics: list = field(default_factory=list)
+    reference_gate_id: int | None = None
     outer_summary: dict | None = None
 
 
@@ -133,9 +136,17 @@ def _initial_feedback_summary(gate_source: str | None) -> str:
 
 def _validate_args(args: Namespace) -> None:
     """Reject unsupported or contradictory CLI combinations early."""
-    from .outer_loop import validate_outer_args
-
-    validate_outer_args(args)
+    if args.gate_outer_search and args.gate_source is not None:
+        raise ValueError(
+            "--gate-outer-search generates gates itself; do not pass --gate-source"
+        )
+    if getattr(args, "gate_phase_b", False):
+        raise NotImplementedError(
+            "Phase B (training the LLM on gate pairs) is not implemented yet. "
+            "Run Phase A with --gate-outer-search to accumulate comparable gate "
+            "records first; use moe_cycle.gate_pairs.build_gate_pairs to inspect "
+            "the pairs that are ready."
+        )
     if args.repetition_penalty != 1.0:
         print("[WARN] --repetition-penalty is ignored by the upstream ChatBot")
     if args.generation_backend != "pipeline":
@@ -166,7 +177,7 @@ def _setup_run(args: Namespace) -> RunContext:
     import torch
 
     from ab.gpt.util.Chatbot import ChatBot
-    from ab.gpt.util.Const import conf_test_dir, epoch_dir, nngpt_dir
+    from ab.gpt.util.Const import conf_test_dir, epoch_dir, nngpt_dir, nngpt_gate_dir
     from moe_gate_only import MoEGateSession
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -176,7 +187,8 @@ def _setup_run(args: Namespace) -> RunContext:
     _seed_all(args.seed)
     nngpt_dir.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(epoch_dir(), ignore_errors=True)
-    gate_dir = nngpt_dir / "gate_candidates" / "candidate_000" / "gate_source"
+    gate_root = nngpt_gate_dir
+    gate_root.mkdir(parents=True, exist_ok=True)
 
     if args.load_in_8bit and args.load_in_4bit:
         raise ValueError("--load-in-8bit and --load-in-4bit are mutually exclusive")
@@ -306,7 +318,7 @@ def _setup_run(args: Namespace) -> RunContext:
         chat_bot=chat_bot,
         sites=sites,
         shapes=shapes,
-        gate_dir=gate_dir,
+        gate_dir=gate_root / "gate_000" / "gate_source",
         gate_source=None,
         sample_input=sample_input,
         prompt_dict=prompt_dict,
@@ -315,19 +327,25 @@ def _setup_run(args: Namespace) -> RunContext:
         native_repeatable=native_repeatable,
         native_repeat_max_abs_difference=native_repeat_max_abs_difference,
         previous_feedback_summary="",
+        gate_root=gate_root,
     )
 
 
 def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
-                            outer_feedback: str, proposal_chat: Any = None) -> None:
-    """Generate/load one independent gate architecture while routers are native."""
-    from ab.gpt.util.Const import nngpt_dir
+                            outer_feedback: str, proposal_chat: Any = None,
+                            reference_source: str = "",
+                            seen_hashes: set[str] | None = None) -> None:
+    """Generate/load one gate architecture while the native router is active.
+
+    The prompt carries the current best gate plus measured feedback from earlier
+    candidates.  Round 0 has no prior gate, so it bootstraps from the baseline
+    contract.
+    """
+    from .gate_store import gate_dir
 
     args = ctx.args
     ctx.candidate_index = candidate_index
-    ctx.candidate_root = nngpt_dir / "gate_candidates" / f"candidate_{candidate_index:03d}"
-    if args.gate_outer_sft and ctx.candidate_root.exists():
-        raise FileExistsError("Outer SFT requires a fresh output directory; reuse only the DB/benchmark/checkpoint")
+    ctx.candidate_root = gate_dir(ctx.gate_root, candidate_index)
     ctx.gate_dir = ctx.candidate_root / "gate_source"
     ctx.gate_dir.mkdir(parents=True, exist_ok=True)
     if args.gate_source is not None:
@@ -339,8 +357,9 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
         source = _generate_gate(
             proposal_chat or ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
             args.gate_max_new_tokens, ctx.gate_dir, outer_feedback,
+            reference_source=reference_source, seen_hashes=seen_hashes,
         )
-    (ctx.gate_dir / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
+    (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
     ctx.previous_feedback_summary = (
         _initial_feedback_summary(source) if not args.no_gate_feedback else ""
@@ -431,11 +450,15 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         train_gates,
     )
 
+    from .gate_store import epoch_dir, write_json
+
     args = ctx.args
+    outer_mode = args.gate_outer_search
     session = ctx.session
     chat_bot = ctx.chat_bot
     tokenizer = ctx.tokenizer
     epoch_paths: list[Path] = []
+    ctx.gate_epoch_metrics = []
     training_prefixes = _nas_prefixes(args)
     generation_prefixes = _generation_prefixes(args)
     train_prompt_path = conf_train_dir / args.train_prompt_config
@@ -499,13 +522,10 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         if args.gradient_checkpointing and hasattr(session.model, "gradient_checkpointing_disable"):
             session.model.gradient_checkpointing_disable()
 
-        # Outer mode compares gate architectures, so every candidate must see the
-        # same generation context; a candidate's own gate code/score must not leak
-        # into the prompt it is being scored on.
-        gen_feedback = (
-            ctx.previous_feedback_summary
-            if not args.no_gate_feedback and ctx.gate_benchmark is None
-            else ""
+        # Candidates are compared on CV accuracy, so a candidate's own gate
+        # code/score must never leak into the prompt it is being scored on.
+        gen_feedback = "" if outer_mode else (
+            ctx.previous_feedback_summary if not args.no_gate_feedback else ""
         )
         generation_prompt_dict = _prompt_dict_with_feedback(
             ctx.prompt_dict,
@@ -585,26 +605,23 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         # ── 2. Build training data from real evaluated LEMUR results ──
 
         try:
-            if ctx.gate_benchmark is not None:
-                from .gate_benchmark import frozen_loaders
-                train_loader, val_loader, train_dataset = frozen_loaders(
-                    ctx.gate_benchmark, tokenizer, args.batch_size, args.seed + epoch,
-                )
-            else:
-                train_gate_summary = gate_feedback["summary"] if not args.no_gate_feedback else ""
-                train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
-                    tokenizer,
-                    train_prompt_path,
-                    context_length=args.max_length,
-                    max_prompts=args.max_prompts,
-                    max_new_tokens=args.generation_max_new_tokens,
-                    batch_size=args.batch_size,
-                    validation_fraction=args.validation_fraction,
-                    seed=args.seed + epoch,
-                    gate_summary=train_gate_summary,
-                    dataset_name=args.dataset,
-                    nn_prefixes=training_prefixes,
-                )
+            train_gate_summary = (
+                "" if outer_mode
+                else gate_feedback["summary"] if not args.no_gate_feedback else ""
+            )
+            train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
+                tokenizer,
+                train_prompt_path,
+                context_length=args.max_length,
+                max_prompts=args.max_prompts,
+                max_new_tokens=args.generation_max_new_tokens,
+                batch_size=args.batch_size,
+                validation_fraction=args.validation_fraction,
+                seed=args.seed + epoch,
+                gate_summary=train_gate_summary,
+                dataset_name=args.dataset,
+                nn_prefixes=training_prefixes,
+            )
         except ValueError as exc:
             if "NNGenPrompt produced no usable examples" not in str(exc):
                 raise
@@ -659,8 +676,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
 
         # ── 3. Train gates on formatted NN-generation examples ──
 
-        if ctx.gate_benchmark is not None:
-            # CV evaluation/generation consumes RNG; reset before matched gate training.
+        if outer_mode:
+            # CV generation/evaluation consumes RNG; reset before gate training so
+            # each candidate's gate update starts from the same sampling state.
             _seed_all(args.seed + epoch)
         session.model.train()
         session.model.config.use_cache = False
@@ -734,8 +752,8 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             "current_cycle_cv_success": cycle_cv_success,
             "current_cycle_models_trained": cycle_models_trained,
             "gate_feedback_enabled": not args.no_gate_feedback,
-            "prompt_feedback_injected": not args.no_gate_feedback and ctx.gate_benchmark is None,
-            "frozen_outer_training_corpus": ctx.gate_benchmark is not None,
+            "prompt_feedback_injected": not args.no_gate_feedback and not outer_mode,
+            "outer_gate_search": outer_mode,
             "train_prompt_config": args.train_prompt_config,
             "test_prompt_config": args.test_prompt_config,
             "training_nn_prefixes": list(training_prefixes),
@@ -761,12 +779,83 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             encoding="utf-8",
         )
 
+        # ── Record this inner epoch for the outer gate score ──
+        # Placed after training so the gate's own training loss is included.
+        if outer_mode:
+            epoch_metrics = _harvest_epoch_metrics(
+                epoch, epoch_path, gate_feedback, cycle_results,
+                cycle_models_trained, result.mean_train_loss, validation_loss,
+                active_layers,
+            )
+            ctx.gate_epoch_metrics.append(epoch_metrics)
+            write_json(
+                epoch_dir(ctx.gate_root, ctx.candidate_index, epoch) / "metrics.json",
+                epoch_metrics,
+            )
+
         print(
             f"[epoch={epoch}] train_loss={result.mean_train_loss:.6f} "
             f"val_loss={validation_loss}"
         )
 
     return epoch_paths
+
+
+def _harvest_epoch_metrics(
+    epoch: int,
+    epoch_path: Path,
+    gate_feedback: dict,
+    cycle_results: dict,
+    models_trained: int,
+    train_loss: float | None,
+    validation_loss: float | None,
+    active_layers: set[int],
+) -> dict:
+    """Collect one inner epoch's measurements for the outer gate score.
+
+    ``cv_accuracy_mean`` averages the successfully measured CV candidates, which
+    is robust to a single lucky model.  ``cv_accuracy_best`` is retained for
+    reference.  Failures are counted, never scored as zero.
+    """
+    accuracies = [
+        outcome["accuracy"]
+        for outcome in gate_feedback.get("candidate_outcomes", [])
+        if outcome.get("status") == "measured" and outcome.get("accuracy") is not None
+    ]
+    n_generated = int(gate_feedback.get("n_generated", 0))
+    mean = sum(accuracies) / len(accuracies) if accuracies else None
+    return {
+        "epoch": epoch,
+        "cv_accuracy_mean": mean,
+        "cv_accuracy_best": max(accuracies) if accuracies else None,
+        "n_measured": len(accuracies),
+        "n_attempted": n_generated,
+        "n_trained": int(models_trained),
+        "n_generated": n_generated,
+        "mean_accuracy_delta": gate_feedback.get("mean_accuracy_delta"),
+        "train_loss": train_loss,
+        "validation_loss": validation_loss,
+        "active_gate_layers": sorted(active_layers),
+        "cycle_success": bool(cycle_results.get("success")),
+        "epoch_path": str(epoch_path),
+    }
+
+
+def _write_gate_record(ctx: RunContext) -> dict:
+    """Finalize one gate candidate: summarize, persist, and return the record."""
+    from .gate_store import summarize_epoch_metrics, write_gate_summary
+
+    score = summarize_epoch_metrics(ctx.gate_epoch_metrics)
+    record = {
+        "gate_id": ctx.candidate_index,
+        "gate_code": ctx.gate_source,
+        "structural_hash": structural_hash(ctx.gate_source),
+        "reference_gate_id": ctx.reference_gate_id,
+        "score": score,
+        "epochs": ctx.gate_epoch_metrics,
+    }
+    write_gate_summary(ctx.gate_root, ctx.candidate_index, record)
+    return record
 
 
 def _candidate_feedback(epoch_paths: list[Path], candidate_index: int) -> str:
@@ -812,7 +901,7 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         ),
         "epochs": args.epochs,
         "gate_candidates": args.gate_candidates,
-        "gate_outer_sft": ctx.outer_summary,
+        "gate_outer_search": ctx.outer_summary,
         "run_root": str(ctx.run_root),
     }
     for candidate_index, epoch_paths in enumerate(candidate_epochs):
@@ -838,6 +927,101 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
     print(f"MoE gate cycle completed: {ctx.run_root}")
 
 
+def _outer_feedback_block(root: Path, reference: dict | None) -> str:
+    """Measured outcomes of earlier gates for the next proposal prompt."""
+    from .gate_store import load_gate_summaries, summarize_gate
+
+    lines = []
+    if reference is not None:
+        lines.append(f"- current best prior gate: {summarize_gate(reference)[2:]}")
+    for summary in load_gate_summaries(root):
+        if reference is not None and summary.get("gate_id") == reference.get("gate_id"):
+            continue
+        lines.append(summarize_gate(summary))
+    return "\n".join(lines)
+
+
+def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
+    """Propose the next gate while the native router is active.
+
+    Round 0 bootstraps from the baseline contract.  Later rounds condition on the
+    best prior gate (code plus measured mean accuracy) and a compact summary of
+    earlier candidates, so the search improves in context.
+    """
+    from .gate_prompt import BASELINE_GATE_CODE
+    from .gate_store import best_gate
+
+    reference = best_gate(ctx.gate_root)
+    reference_source = ""
+    ctx.reference_gate_id = None
+    if reference is not None:
+        reference_source = reference.get("gate_code") or ""
+        ctx.reference_gate_id = reference.get("gate_id")
+    elif gate_id > 0:
+        # No eligible prior gate yet: fall back to the baseline contract so the
+        # model still has an explicit reference to diverge from.
+        reference_source = BASELINE_GATE_CODE
+
+    _prepare_gate_candidate(
+        ctx,
+        gate_id,
+        _outer_feedback_block(ctx.gate_root, reference),
+        reference_source=reference_source,
+        seen_hashes=seen_hashes,
+    )
+    print(
+        f"[GATE SEARCH] proposed gate {gate_id:03d} "
+        f"(reference={ctx.reference_gate_id if ctx.reference_gate_id is not None else 'baseline'}, "
+        f"distinct architectures so far={len(seen_hashes)})"
+    )
+
+
+def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
+    """Self-improving gate search: propose, replace, train inner loop, measure, repeat."""
+    from .gate_store import best_gate, summarize_gate
+
+    candidate_epochs: list[list[Path]] = []
+    seen_hashes: set[str] = set()
+    # The proposed baselines themselves count as seen, so the first proposal
+    # cannot simply echo the baseline contract.
+    from .gate_prompt import BASELINE_GATE_CODE
+    seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
+
+    for gate_id in range(args.gate_candidates):
+        _propose_gate(ctx, gate_id, seen_hashes)
+        # The session context restores the native router after every candidate,
+        # so no candidate inherits another candidate's trained gate weights.
+        with ctx.session:
+            _install_and_verify(ctx)
+            epoch_paths = _run_epochs(ctx)
+        candidate_epochs.append(epoch_paths)
+
+        record = _write_gate_record(ctx)
+        score = record["score"]
+        accuracy = score.get("accuracy")
+        print(
+            f"[GATE SEARCH] gate {gate_id:03d} finished: "
+            f"mean CV accuracy "
+            f"{f'{accuracy:.4f}' if isinstance(accuracy, float) else 'unavailable'} "
+            f"({score.get('n_measured', 0)}/{score.get('n_attempted', 0)} measured)"
+        )
+        ctx.outer_summary = {
+            "gate_root": str(ctx.gate_root),
+            "gate_candidates": args.gate_candidates,
+            "objective": score.get("objective"),
+            "best": (summarize_gate(best_gate(ctx.gate_root)) if best_gate(ctx.gate_root) else None),
+            "phase_b_ready": _phase_b_status(ctx.gate_root),
+        }
+    return candidate_epochs
+
+
+def _phase_b_status(gate_root: Path) -> str:
+    """How close Phase A is to having usable Phase B training pairs."""
+    from .gate_pairs import build_gate_pairs, describe_pairs
+
+    return describe_pairs(build_gate_pairs(gate_root))
+
+
 def main() -> None:
     from .generation_dtype import ensure_generation_dtype_policy
     from .eval_safety import ensure_moe_eval_safety
@@ -849,27 +1033,18 @@ def main() -> None:
     args = parse_args()
     _validate_args(args)
     ctx = _setup_run(args)
-    outer = None
-    if args.gate_outer_sft:
-        from .outer_loop import GateOuterLoop
-        outer = GateOuterLoop(ctx)
-    candidate_epochs: list[list[Path]] = []
-    outer_feedback = ""
-    for candidate_index in range(args.gate_candidates):
-        if outer is None:
+    if args.gate_outer_search:
+        candidate_epochs = _run_outer_search(ctx, args)
+    else:
+        candidate_epochs = []
+        outer_feedback = ""
+        for candidate_index in range(args.gate_candidates):
             _prepare_gate_candidate(ctx, candidate_index, outer_feedback)
-        else:
-            with outer.proposer.for_round(ctx, outer.store, candidate_index) as proposal_chat:
-                _prepare_gate_candidate(ctx, candidate_index, "", proposal_chat=proposal_chat)
-        # The context restores native routers after every candidate, so no
-        # candidate inherits another candidate's trained gate parameters.
-        with ctx.session:
-            _install_and_verify(ctx)
-            epoch_paths = _run_epochs(ctx)
-            if outer is not None:
-                outer.record(ctx, epoch_paths)
-        candidate_epochs.append(epoch_paths)
-        outer_feedback += "\n" + _candidate_feedback(epoch_paths, candidate_index)
-    if outer is not None:
-        ctx.outer_summary = outer.summary()
+            # The context restores native routers after every candidate, so no
+            # candidate inherits another candidate's trained gate parameters.
+            with ctx.session:
+                _install_and_verify(ctx)
+                epoch_paths = _run_epochs(ctx)
+            candidate_epochs.append(epoch_paths)
+            outer_feedback += "\n" + _candidate_feedback(epoch_paths, candidate_index)
     _write_final_summary(ctx, candidate_epochs)

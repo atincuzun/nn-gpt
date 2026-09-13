@@ -9,7 +9,12 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
-from .gate_prompt import gate_prompt_scope, gate_proposal_prompt
+from .gate_prompt import (
+    gate_prompt_scope,
+    gate_proposal_prompt,
+    is_duplicate_gate,
+)
+from .gate_store import structural_hash
 
 
 def _gate_candidates(raw: str):
@@ -83,14 +88,26 @@ def _validate_gate_source(
 def _generate_gate(
     chat_bot: Any, shapes: list[tuple[int, int]], attempts: int,
     max_new_tokens: int, artifact_dir: Path, feedback_summary: str = "",
+    reference_source: str = "",
+    seen_hashes: set[str] | None = None,
+    max_attempts_per_duplicate: int = 3,
 ) -> str:
-    """Ask the LLM for a replacement gate source; its base weight is copied
-    from the native router so the replaced model stays bit-identical at
-    step zero before training begins."""
-    prompt = gate_proposal_prompt(shapes, feedback_summary)
+    """Ask the LLM for a replacement gate source.
+
+    Its base weight is copied from the native router, so the replaced model stays
+    bit-identical at step zero before training begins.  The prompt carries the
+    current best gate as a reference plus measured feedback from earlier
+    candidates, mirroring how the CV pipeline conditions generation on one
+    reference artefact.
+    """
+    prompt = gate_proposal_prompt(
+        shapes, reference_source=reference_source, feedback=feedback_summary,
+    )
+    seen = seen_hashes if seen_hashes is not None else set()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "proposal_prompt.txt").write_text(prompt, encoding="utf-8")
     previous_error = ""
+    duplicate_attempts = 0
     for attempt in range(1, attempts + 1):
         current_prompt = prompt
         if previous_error:
@@ -101,12 +118,30 @@ def _generate_gate(
             )
         (artifact_dir / f"generation_attempt_{attempt}.txt").write_text(raw, encoding="utf-8")
         errors: list[str] = []
+        # A single generation can yield several parseable strings.  Duplicate
+        # attempts are counted per generation, not per string, otherwise one
+        # templated response would exhaust the retry budget immediately.
+        saw_valid_candidate = False
         for candidate in _gate_candidates(raw):
             try:
                 _validate_gate_source(candidate, shapes)
-                (artifact_dir / "gate.py").write_text(candidate.rstrip() + "\n", encoding="utf-8")
-                return candidate
             except Exception as exc:
                 errors.append(str(exc))
+                continue
+            saw_valid_candidate = True
+            if is_duplicate_gate(candidate, seen):
+                errors.append("structurally identical to an earlier gate candidate")
+                continue
+            seen.add(structural_hash(candidate))
+            (artifact_dir / "gate.py").write_text(candidate.rstrip() + "\n", encoding="utf-8")
+            return candidate
+        if saw_valid_candidate:
+            # Every structurally valid proposal this round was already seen.
+            duplicate_attempts += 1
+            if duplicate_attempts >= max_attempts_per_duplicate:
+                raise RuntimeError(
+                    "LLM kept re-emitting a duplicate gate architecture; "
+                    "cannot build a distinct candidate"
+                )
         previous_error = "; ".join(errors) or "No usable <gate> source was found"
     raise RuntimeError(f"LLM did not generate a valid gate after {attempts} attempts: {previous_error}")

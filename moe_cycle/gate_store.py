@@ -1,4 +1,18 @@
-"""Gate-only experiment storage; never writes to LEMUR's CV-model tables."""
+"""On-disk gate experiment store.
+
+One directory per gate candidate under ``nngpt_gate_dir`` (``out/nngpt/gates``):
+
+    gate_000/
+      gate.py                 proposed source (reference for the next proposal)
+      summary.json            per-gate aggregate + selection score
+      epoch_00/
+        metrics.json          per inner-epoch measurements
+        gate_weights.pt       trained gate weights (optional)
+      epoch_01/ ...
+
+Scoring stores everything and ranks on the mean of per-epoch means.  A single
+lucky CV model in one epoch must not outrank a consistently better gate.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +20,11 @@ import ast
 import hashlib
 import json
 import math
-import random
-import sqlite3
 from pathlib import Path
 from typing import Any
+
+# LEMUR-style vocabulary keeps records recognisable and exportable.
+SCORE_OBJECTIVE = "mean_of_epoch_means_v1"
 
 
 def canonical_json(value: Any) -> str:
@@ -20,109 +35,99 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
-def source_hash(source: str) -> str:
-    """Ignore formatting/comments when deduplicating architecture targets."""
+def structural_hash(source: str) -> str:
+    """AST-based hash so formatting/comments do not defeat deduplication."""
     return fingerprint(ast.dump(ast.parse(source), include_attributes=False))
 
 
-def summarize_scores(outcomes: list[dict], *, min_success_rate: float,
-                     min_measured: int) -> dict:
-    """Mean of finite measured accuracies, with a separate eligibility floor.
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
-    Missing/failed measurements are NOT zero accuracies. Unknown/infrastructure
-    failures make a trial incomplete rather than poisoning proposer supervision.
+
+def gate_dir(root: Path, gate_id: int) -> Path:
+    return Path(root) / f"gate_{gate_id:03d}"
+
+
+def epoch_dir(root: Path, gate_id: int, epoch: int) -> Path:
+    return gate_dir(root, gate_id) / f"epoch_{epoch:02d}"
+
+
+def summarize_epoch_metrics(metrics: list[dict]) -> dict:
+    """Reduce per-epoch measurements to the stored gate score.
+
+    ``accuracy`` is the mean of per-epoch means over epochs that produced at
+    least one measurement.  Bests and counts are kept for later re-analysis.
     """
-    if not 0 <= min_success_rate <= 1 or min_measured < 1:
-        raise ValueError("Invalid gate score eligibility thresholds")
-    measured = []
-    for outcome in outcomes:
-        if outcome.get("status") == "measured":
-            value = outcome.get("accuracy")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError("Measured accuracy must be numeric")
-            if not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError("Measured accuracy must be finite and in [0, 1]")
-            measured.append(float(value))
-    incomplete = any(o.get("status") not in {"measured", "invalid"} for o in outcomes)
-    rate = len(measured) / len(outcomes) if outcomes else 0.0
-    mean = sum(measured) / len(measured) if measured else None
-    variance = sum((v - mean) ** 2 for v in measured) / len(measured) if measured else None
+    means = [m["cv_accuracy_mean"] for m in metrics if m.get("cv_accuracy_mean") is not None]
+    bests = [m["cv_accuracy_best"] for m in metrics if m.get("cv_accuracy_best") is not None]
+    n_measured = sum(int(m.get("n_measured", 0)) for m in metrics)
+    n_attempted = sum(int(m.get("n_attempted", 0)) for m in metrics)
+    mean_of_means = sum(means) / len(means) if means else None
+    mean_of_bests = sum(bests) / len(bests) if bests else None
+    variance = (
+        sum((value - mean_of_means) ** 2 for value in means) / len(means)
+        if means else None
+    )
     return {
-        "n_attempted": len(outcomes), "n_measured": len(measured),
-        "success_rate": rate, "mean_accuracy": mean,
-        "std_accuracy": math.sqrt(variance) if variance is not None else None,
-        "incomplete": incomplete,
-        "eligible": not incomplete and len(measured) >= min_measured and rate >= min_success_rate,
-        "min_success_rate": min_success_rate, "min_measured": min_measured,
-        "objective": "mean_measured_accuracy_with_success_floor_v1",
+        "objective": SCORE_OBJECTIVE,
+        "accuracy": mean_of_means,
+        "mean_of_epoch_means": mean_of_means,
+        "mean_of_epoch_bests": mean_of_bests,
+        "best_epoch_mean": max(means) if means else None,
+        "std_epoch_mean": math.sqrt(variance) if variance is not None else None,
+        "n_inner_epochs_scored": len(means),
+        "n_measured": n_measured,
+        "n_attempted": n_attempted,
+        "success_rate": (n_measured / n_attempted) if n_attempted else None,
+        "eligible": bool(means) and n_measured > 0,
     }
 
 
-class GateStore:
-    """Append trials to a namespaced SQLite table (including unsuccessful trials)."""
+def summarize_gate(summary: dict) -> str:
+    """Compact feedback line for the next gate proposal prompt."""
+    score = summary.get("score") or {}
+    accuracy = score.get("accuracy")
+    accuracy_text = f"{accuracy:.4f}" if isinstance(accuracy, float) else "unavailable"
+    return (
+        f"- gate {summary.get('gate_id'):03d}: mean CV accuracy {accuracy_text} "
+        f"over {score.get('n_inner_epochs_scored', 0)} epochs, "
+        f"{score.get('n_measured', 0)}/{score.get('n_attempted', 0)} candidates measured"
+    )
 
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS moe_gate_trials_v1 (
-                trial_id TEXT PRIMARY KEY,
-                protocol_id TEXT NOT NULL,
-                architecture_id TEXT NOT NULL,
-                record_json TEXT NOT NULL
-            )""")
-            db.execute("CREATE INDEX IF NOT EXISTS moe_gate_protocol_v1 ON moe_gate_trials_v1(protocol_id)")
 
-    def connect(self):
-        return sqlite3.connect(self.path, timeout=30)
+def write_gate_summary(root: Path, gate_id: int, record: dict) -> Path:
+    path = gate_dir(root, gate_id) / "summary.json"
+    write_json(path, record)
+    return path
 
-    def add(self, record: dict) -> dict:
-        record = dict(record)
-        record["architecture_id"] = source_hash(record["source"])
-        if record["protocol_id"] != fingerprint(record["protocol"]):
-            raise ValueError("Gate protocol fingerprint does not match its payload")
-        expected = summarize_scores(
-            record["outcomes"], min_success_rate=record["score"]["min_success_rate"],
-            min_measured=record["score"]["min_measured"],
-        )
-        if expected != record["score"]:
-            raise ValueError("Gate score does not match measured outcomes")
-        with self.connect() as db:
-            db.execute("INSERT INTO moe_gate_trials_v1 VALUES (?, ?, ?, ?)", (
-                record["trial_id"], record["protocol_id"], record["architecture_id"],
-                canonical_json(record),
-            ))
-        return record
 
-    def records(self, protocol_id: str) -> list[dict]:
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT record_json FROM moe_gate_trials_v1 WHERE protocol_id=? ORDER BY trial_id",
-                (protocol_id,),
-            ).fetchall()
-        return [json.loads(row[0]) for row in rows]
+def load_gate_summaries(root: Path) -> list[dict]:
+    """All gate summaries for a run, oldest first, ignoring incomplete gates."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    summaries = []
+    for directory in sorted(root.glob("gate_*")):
+        path = directory / "summary.json"
+        if not path.is_file():
+            continue
+        try:
+            summaries.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+    return summaries
 
-    def training_subset(self, protocol_id: str, *, max_examples: int,
-                        top_fraction: float, seed: int) -> list[dict]:
-        """Sample top-performing *architectures*, averaging repeated valid trials.
 
-        Do not cherry-pick the best random trial of a frequently sampled gate.
-        An ineligible repeat disqualifies that architecture from SFT this round.
-        """
-        if max_examples < 1 or not 0 < top_fraction <= 1:
-            raise ValueError("Invalid gate SFT subset settings")
-        groups: dict[str, list[dict]] = {}
-        for record in self.records(protocol_id):
-            groups.setdefault(record["architecture_id"], []).append(record)
-        ranked = []
-        for trials in groups.values():
-            if not all(t["score"]["eligible"] for t in trials):
-                continue
-            record = dict(trials[-1])
-            record["selection_accuracy"] = sum(t["score"]["mean_accuracy"] for t in trials) / len(trials)
-            record["selection_trials"] = [t["trial_id"] for t in trials]
-            ranked.append(record)
-        ranked.sort(key=lambda r: (-r["selection_accuracy"], r["architecture_id"]))
-        pool = ranked[:max(1, math.ceil(len(ranked) * top_fraction))]
-        rng = random.Random(seed)
-        return rng.sample(pool, min(max_examples, len(pool)))
+def best_gate(root: Path) -> dict | None:
+    """Highest-scoring eligible gate seen so far, or None during bootstrap."""
+    eligible = [
+        summary for summary in load_gate_summaries(root)
+        if (summary.get("score") or {}).get("eligible")
+        and isinstance((summary.get("score") or {}).get("accuracy"), float)
+    ]
+    if not eligible:
+        return None
+    return max(eligible, key=lambda summary: summary["score"]["accuracy"])

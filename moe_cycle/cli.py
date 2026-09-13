@@ -198,29 +198,19 @@ def parse_args() -> argparse.Namespace:
         "(feedback is still built and saved to disk). Useful for isolating "
         "the effect of explicit text feedback vs implicit LEMUR DB feedback.",
     )
-    outer = parser.add_argument_group("Gate-architecture outer SFT (opt-in)")
-    outer.add_argument("--gate-outer-sft", action="store_true",
-                       help="Learn gate-code proposals with an isolated persistent LoRA adapter")
-    outer.add_argument("--gate-db", type=Path,
-                       help="SQLite gate archive; defaults to OUTPUT/gate_archive.sqlite3")
-    outer.add_argument("--gate-benchmark", type=Path,
-                       help="Create/reuse a frozen training/comparison manifest across compatible runs")
-    outer.add_argument("--gate-benchmark-size", type=int, default=10,
-                       help="Fixed source prompts per configuration key for post-training scoring")
-    outer.add_argument("--gate-benchmark-seeds", type=int, nargs="+", default=[1042, 2042])
-    outer.add_argument("--gate-min-success-rate", type=float, default=0.5,
-                       help="Minimum measured/attempted rate for mean-accuracy-based SFT eligibility")
-    outer.add_argument("--gate-min-measured", type=int, default=2)
-    outer.add_argument("--gate-proposer-checkpoint", type=Path,
-                       help="Resume an outer proposer adapter from the same benchmark protocol")
-    outer.add_argument("--gate-proposer-steps", type=int, default=20)
-    outer.add_argument("--gate-proposer-learning-rate", type=float, default=1e-4)
-    outer.add_argument("--gate-proposer-rank", type=int, default=8)
-    outer.add_argument("--gate-proposer-targets", nargs="+", default=["q_proj", "v_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"])
-    outer.add_argument("--gate-proposer-max-length", type=int, default=4096)
-    outer.add_argument("--gate-proposer-batch-size", type=int, default=1)
-    outer.add_argument("--gate-proposer-max-examples", type=int, default=64)
-    outer.add_argument("--gate-proposer-min-examples", type=int, default=2,
-                       help="Bootstrap with the native proposer until this many eligible architectures exist")
-    outer.add_argument("--gate-proposer-top-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--gate-outer-search",
+        action="store_true",
+        help="Self-improving gate search: propose a gate, replace the routers, run "
+        "the full inner loop, measure CV accuracy, then propose the next gate from "
+        "the best prior gate plus measured feedback. Gates are compared on the mean "
+        "of per-epoch mean CV accuracies.",
+    )
+    parser.add_argument(
+        "--gate-phase-b",
+        action="store_true",
+        help="Reserved Phase B switch: train the LLM on accumulated (lower -> higher) "
+        "gate pairs so it authors better gate code directly. The training mechanism "
+        "is undecided, so this currently fails fast instead of silently doing nothing.",
+    )
     return parser.parse_args()

@@ -73,9 +73,6 @@
     "nn_prefixes": [],
     "num_joint_nns": 2,
     "improve": true,
-    "static_values": {
-      "gate_summary": ""
-    },
     "prompt": [
       "You are a machine learning model designer.",
       "Your task is to generate a LEMUR Dataset neural network model that increases the '{metric}' metric value to at least {addon_accuracy} at training epoch {epoch} on the '{dataset}' dataset for an '{task}' task.",
@@ -91,9 +88,7 @@
       "<hp>{prm}</hp>",
       "<tr>{transform_code}</tr>",
       "<nn>{nn_code}</nn>",
-      "<metric>{metric_code}</metric>",
-      "Feedback from the previous generation cycle:",
-      "{gate_summary}"
+      "<metric>{metric_code}</metric>"
     ],
     "output": [
       "<hp>{addon_prm}</hp>",
