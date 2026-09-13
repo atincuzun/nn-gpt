@@ -9,6 +9,8 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from .gate_prompt import gate_prompt_scope, gate_proposal_prompt
+
 
 def _gate_candidates(raw: str):
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw or "", flags=re.IGNORECASE).strip()
@@ -85,57 +87,18 @@ def _generate_gate(
     """Ask the LLM for a replacement gate source; its base weight is copied
     from the native router so the replaced model stays bit-identical at
     step zero before training begins."""
-    initialization = "Its base weight will be copied from the native router."
-    residual_requirement = (
-        "Initialize any residual branch's final projection to zero "
-        "for native step-zero routing."
-    )
-    feedback_requirement = (
-        "- Results from earlier independent gate candidates:\n" + feedback_summary
-        if feedback_summary else ""
-    )
-    prompt = f"""
-You are writing a tiny MoE router scorer, NOT a full neural network. Do NOT emit <nn>, <hp>, or <tr> blocks, datasets, training loops, or markdown.
-Write one complete Python module defining exactly one class named LLMGeneratedGate.
-Requirements:
-- Import only torch and torch.nn.
-- Inherit torch.nn.Module.
-- Constructor: __init__(self, model_dim: int, num_experts: int).
-- Forward: forward(self, x), accepting (..., model_dim) and returning finite raw logits (..., num_experts).
-- Define self.base = nn.Linear(model_dim, num_experts, bias=False). {initialization}
-- Return self.base(x), optionally with a small trainable residual branch.
-- {residual_requirement}
-- Do not apply softmax, top-k, expert dispatch, or auxiliary losses.
-- Forward must be deterministic: do not sample random values or use dropout/batch normalization.
-- Do not hard-code dimensions, move devices inside forward, or return tuples.
-- Keep the gate small, differentiable, and numerically stable.
-- The class must be COMPLETE and syntactically valid: close every string literal and parenthesis, and finish the class body before the closing tag. Never stop after the class header.
- - Router shapes: {shapes!r}.
-{feedback_requirement}
-Expected format (example):
-<gate>
-import torch
-import torch.nn as nn
-
-class LLMGeneratedGate(nn.Module):
-    def __init__(self, model_dim: int, num_experts: int):
-        super().__init__()
-        self.base = nn.Linear(model_dim, num_experts, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x)
-</gate>
-Output only the complete source between <gate> and </gate>, without markdown or explanation.
-""".strip()
+    prompt = gate_proposal_prompt(shapes, feedback_summary)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "proposal_prompt.txt").write_text(prompt, encoding="utf-8")
     previous_error = ""
     for attempt in range(1, attempts + 1):
         current_prompt = prompt
         if previous_error:
             current_prompt += f"\nThe previous proposal failed validation: {previous_error}\nReturn a corrected implementation."
-        _, _, _, raw = chat_bot.chat(
-            current_prompt, engineer_prompt=False, max_new_tokens=max_new_tokens,
-        )
+        with gate_prompt_scope(chat_bot):
+            _, _, _, raw = chat_bot.chat(
+                current_prompt, engineer_prompt=False, max_new_tokens=max_new_tokens,
+            )
         (artifact_dir / f"generation_attempt_{attempt}.txt").write_text(raw, encoding="utf-8")
         errors: list[str] = []
         for candidate in _gate_candidates(raw):
