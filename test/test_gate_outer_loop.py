@@ -240,13 +240,40 @@ def test_sft_example_does_not_leak_score_into_input():
 
 
 def test_prompt_teaches_the_zero_init_contract():
-    """The prompt must show a complete example and forbid `logits + x`."""
+    """The prompt must state the rule, the shape rule, and the branch requirement."""
     prompt = gate_proposal_prompt([(2048, 64)])
-    assert "import torch.nn as nn" in prompt          # imports are included
-    assert "nn.init.zeros_(self.up.weight)" in prompt  # zero-at-init shown
-    assert "Do NOT add the raw input" in prompt        # forbidden pattern named
-    assert "SAFE WAYS TO BE DIVERSE" in prompt         # guided diversity
-    assert "Do NOT copy it" in prompt                  # example not to be echoed
+    assert "nn.init.zeros_(" in prompt                  # zero-at-init mechanism
+    assert "EVERY added branch must be identically zero" in prompt
+    assert "return self.base(x) + x" in prompt          # forbidden pattern named
+    assert "INVALID" in prompt
+    assert "num_experts" in prompt
+    # A bare baseline is explicitly rejected.
+    assert "`return self.base(x)` alone is INVALID" in prompt
+    # Structural novelty is required, with concrete axes of change.
+    assert "STRUCTURAL NOVELTY IS REQUIRED" in prompt
+    assert "TWO meaningful architectural properties" in prompt
+
+
+def test_prompt_warns_against_the_dead_branch_pattern():
+    """`scale * zero_init_projection` has zero gradient for both; must be banned."""
+    prompt = gate_proposal_prompt([(2048, 64)])
+    assert "learnable scalar" in prompt
+    assert "gradients" in prompt
+    assert "never start learning" in prompt
+
+
+def test_prompt_gives_a_skeleton_not_a_copyable_example():
+    """A complete example gets copied verbatim; the prompt must not provide one."""
+    prompt = gate_proposal_prompt([(2048, 64)])
+    assert "REQUIRED SKELETON" in prompt
+    # The skeleton must be incomplete, so it cannot be echoed as an answer.
+    assert "# define YOUR branch here" in prompt
+    assert "this is not a complete answer" in prompt
+    # It must still demonstrate the zero-init mechanism.
+    assert "nn.init.zeros_(YOUR_LAST.weight)" in prompt
+    # Crucially, no ready-to-use branch implementation is shipped.
+    assert "self.up = nn.Linear" not in prompt
+    assert "self.down = nn.Linear" not in prompt
 
 
 def test_baseline_gate_satisfies_the_contract():
