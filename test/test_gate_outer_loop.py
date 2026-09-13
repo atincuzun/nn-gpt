@@ -239,6 +239,16 @@ def test_sft_example_does_not_leak_score_into_input():
     assert assistant == "<gate>\n" + DISTINCT_GATE.strip() + "\n</gate>"
 
 
+def test_prompt_teaches_the_zero_init_contract():
+    """The prompt must show a complete example and forbid `logits + x`."""
+    prompt = gate_proposal_prompt([(2048, 64)])
+    assert "import torch.nn as nn" in prompt          # imports are included
+    assert "nn.init.zeros_(self.up.weight)" in prompt  # zero-at-init shown
+    assert "Do NOT add the raw input" in prompt        # forbidden pattern named
+    assert "SAFE WAYS TO BE DIVERSE" in prompt         # guided diversity
+    assert "Do NOT copy it" in prompt                  # example not to be echoed
+
+
 def test_baseline_gate_satisfies_the_contract():
     import torch
     import torch.nn as nn

@@ -177,7 +177,7 @@ def _setup_run(args: Namespace) -> RunContext:
     import torch
 
     from ab.gpt.util.Chatbot import ChatBot
-    from ab.gpt.util.Const import conf_test_dir, epoch_dir, nngpt_dir, nngpt_gate_dir
+    from ab.gpt.util.Const import conf_test_dir, epoch_dir, nngpt_dir
     from moe_gate_only import MoEGateSession
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -187,8 +187,13 @@ def _setup_run(args: Namespace) -> RunContext:
     _seed_all(args.seed)
     nngpt_dir.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(epoch_dir(), ignore_errors=True)
-    gate_root = nngpt_gate_dir
+    # Derive the gates root from the RUNTIME nngpt_dir.  The module-level
+    # nngpt_gate_dir in ab.gpt.util.Const is computed before the --output
+    # override is applied, so using it would place gate records outside the
+    # selected run directory.
+    gate_root = nngpt_dir / "gates"
     gate_root.mkdir(parents=True, exist_ok=True)
+    print(f"[GATE SEARCH] gate root: {gate_root}")
 
     if args.load_in_8bit and args.load_in_4bit:
         raise ValueError("--load-in-8bit and --load-in-4bit are mutually exclusive")

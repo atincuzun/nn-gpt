@@ -47,23 +47,80 @@ def gate_proposal_prompt(shapes, *, reference_source: str = "", feedback: str = 
         "Measured results of earlier gate candidates in this run:\n"
         f"{feedback.strip()}\n" if feedback.strip() else ""
     )
-    return f"""Write exactly one torch.nn.Module class named LLMGeneratedGate.
-Requirements:
-- Import only torch and torch.nn.
+    return f"""Write exactly one complete Python module defining the class LLMGeneratedGate.
+
+THE ONE RULE THAT MUST NEVER BE BROKEN:
+    The base projection is the identity path. Any extra branch you add must
+    produce EXACTLY ZERO at initialization, so the gate still reproduces native
+    routing bit-for-bit before training starts. Every additive branch must end
+    in a projection whose weight AND bias are zero-initialized.
+
+FORBIDDEN (this is the most common mistake):
+    Do NOT add the raw input to the logits. `return self.base(x) + x` is wrong:
+    x has width model_dim, logits have width num_experts, so it crashes, and it
+    would also break the zero-at-init rule. A branch must first project into
+    num_experts, and that projection must start at zero.
+
+HARD REQUIREMENTS:
+- Start the file with the imports (they are part of the answer):
+      import torch
+      import torch.nn as nn
+- Define exactly one class named LLMGeneratedGate inheriting nn.Module.
 - Constructor: __init__(self, model_dim: int, num_experts: int).
 - Define self.base = nn.Linear(model_dim, num_experts, bias=False).
-- Native router weights will be copied into self.base before training.
-- forward(self, x) accepts (..., model_dim) and returns finite raw logits (..., num_experts).
-- Return self.base(x), optionally plus a small differentiable residual branch.
-- Zero-initialize ONLY the residual's final projection for native step-zero routing.
-- Do not use softmax, top-k, random sampling in forward, dropout, or batch normalization.
-- Do not hard-code dimensions, change devices in forward, or return tuples.
-- Preserve the native projection at initialization; improve adaptation after gate-only training.
-- Keep parameter and runtime overhead small. Finish the entire class; no ellipses or placeholders.
-- Propose a structurally DIFFERENT gate from the reference below; do not re-emit it verbatim.
+  Native router weights are copied into self.base, so never change its shape.
+- forward(self, x) accepts (..., model_dim) and returns finite raw logits
+  (..., num_experts). The output width is ALWAYS num_experts.
+- Never hard-code 2048, 64, or any concrete size; use model_dim / num_experts.
+- Do not use softmax, top-k, random sampling, dropout, or batch normalization.
+- Do not move devices inside forward and do not return tuples.
+
+SHAPE SELF-CHECK before you answer:
+    For every tensor you add to the logits, confirm its last dimension is
+    num_experts. `self.base(x)` is (..., num_experts). A branch output is
+    (..., num_experts). Never add anything whose last dimension is model_dim.
+
+SAFE WAYS TO BE DIVERSE (all keep zero-at-init; pick one, or combine):
+- Low-rank residual: down-project to rank r, activate, then up-project to
+  num_experts with BOTH weight and bias zero-initialized.
+- Activation/classification pair: LayerNorm then Linear to num_experts,
+  zero-initialized, added to self.base(x).
+- Two (or more) parallel zero-initialized heads with different widths or
+  activations, all projected to num_experts.
+- A scaled branch: multiply a zero-initialized projection's output by a small
+  learnable scalar (initialize the scalar to 0).
+Any nonlinearity (GELU, SiLU, tanh) is fine INSIDE a branch, because the branch
+still exits through a zero-initialized projection.
+
+COMPLETE WORKED EXAMPLE (a valid zero-at-init residual; note the imports):
+<gate>
+import torch
+import torch.nn as nn
+
+class LLMGeneratedGate(nn.Module):
+    def __init__(self, model_dim: int, num_experts: int):
+        super().__init__()
+        self.base = nn.Linear(model_dim, num_experts, bias=False)
+        rank = max(4, model_dim // 64)
+        self.down = nn.Linear(model_dim, rank, bias=False)
+        self.act = nn.GELU()
+        self.up = nn.Linear(rank, num_experts, bias=True)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.up(self.act(self.down(x)))
+</gate>
+At initialization self.up is zero, so forward(x) equals self.base(x) exactly.
+The example exists ONLY to show the required zero-init pattern. Do NOT copy it
+verbatim, and do not merely rename its layers. Invent your own variant.
+
+The class must be COMPLETE and syntactically valid: every import present, every
+block properly indented, no ellipses, no placeholders, no truncation.
+Propose a structurally DIFFERENT gate from the reference below; do not re-emit it.
 Router shapes: {shapes!r}.
 {reference_block}{feedback_block}
-Return only <gate> followed by the complete source and </gate>."""
+Return only <gate>, the complete source, and </gate>."""
 
 
 @contextmanager
