@@ -4,14 +4,13 @@ Each epoch:
   1. Generate NN architectures (nn_gen) using the gate-replaced LLM
   2. Evaluate generated NNs through Tune._evaluate_epoch
   3. Build NNGenPrompt data from real evaluated LEMUR results
-  4. Train only generated MoE gates on language-model and router-distillation loss
+  4. Train only the generated MoE gates on language-model loss
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import math
 import os
 import shutil
 from argparse import Namespace
@@ -53,6 +52,34 @@ class RunContext:
     native_repeat_max_abs_difference: float
     previous_feedback_summary: str
     used_prompts: list = field(default_factory=list)
+    candidate_index: int = 0
+    candidate_root: Path | None = None
+
+
+def _log_cuda_memory(label: str) -> dict[str, float] | None:
+    """Print current-process CUDA memory so weight and activation use are visible."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    device = torch.cuda.current_device()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    gib = 1024 ** 3
+    status = {
+        "allocated_gib": torch.cuda.memory_allocated(device) / gib,
+        "reserved_gib": torch.cuda.memory_reserved(device) / gib,
+        "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
+        "device_free_gib": free_bytes / gib,
+        "device_total_gib": total_bytes / gib,
+    }
+    print(
+        f"[VRAM] {label}: allocated={status['allocated_gib']:.2f} GiB, "
+        f"reserved={status['reserved_gib']:.2f} GiB, "
+        f"peak={status['peak_allocated_gib']:.2f} GiB, "
+        f"device_free={status['device_free_gib']:.2f}/"
+        f"{status['device_total_gib']:.2f} GiB"
+    )
+    return status
 
 
 def _nas_prefixes(args: Namespace) -> tuple[str, ...]:
@@ -110,19 +137,22 @@ def _validate_args(args: Namespace) -> None:
         print("[WARN] --generation-backend is ignored; upstream ChatBot selects its backend")
     if args.fixed_evaluation_prompts:
         print("[WARN] --fixed-evaluation-prompts is ignored; fixed prompt reuse is disabled")
-
-    if args.gate_mode == "teacher-student" and args.gate_init_noise_scale != 0:
-        raise ValueError("Teacher-student mode keeps the teacher unchanged; use gate-init-noise-scale=0")
-    if args.gate_mode == "teacher-student" and args.student_weight_start != 0:
-        raise ValueError("Teacher-student startup must use student-weight-start=0")
-    if not 0.0 <= args.student_weight_start <= 1.0:
-        raise ValueError("student-weight-start must be between 0 and 1")
-    if not 0.0 <= args.student_weight_step <= 1.0:
-        raise ValueError("student-weight-step must be between 0 and 1")
-    if args.gate_mode == "teacher-student" and args.load_in_8bit:
-        raise ValueError(
-            "Teacher-student mode is unsupported with --load-in-8bit: the teacher "
-            "router stores int8 weights, so distillation logits would be garbage"
+    if args.gate_candidates < 1:
+        raise ValueError("--gate-candidates must be at least 1")
+    if args.max_length < 1:
+        raise ValueError("--max-length must be at least 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if (
+        not args.gradient_checkpointing
+        and args.max_length > 1024
+        and args.batch_size == 1
+    ):
+        print(
+            "[WARN] Gate training has gradient checkpointing disabled with "
+            f"--max-length={args.max_length}. Activation memory, not 4-bit "
+            "weights, may exceed a 24-GiB GPU; use the default checkpointing "
+            "or lower --max-length to 1024."
         )
 
 
@@ -141,26 +171,61 @@ def _setup_run(args: Namespace) -> RunContext:
     _seed_all(args.seed)
     nngpt_dir.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(epoch_dir(), ignore_errors=True)
-    gate_dir = nngpt_dir / "gates" / "candidate_000"
+    gate_dir = nngpt_dir / "gate_candidates" / "candidate_000" / "gate_source"
 
-    # --------------- load model ---------------
-
-    model_kwargs: dict[str, Any] = {
-        "dtype": _dtype(args.dtype),
-        "local_files_only": args.local_files_only,
-    }
-    if args.load_in_8bit:
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("--load-in-8bit and --load-in-4bit are mutually exclusive")
+    if args.load_in_8bit or args.load_in_4bit:
         try:
             import bitsandbytes  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
-                "--load-in-8bit requires the bitsandbytes package "
+                "--load-in-8bit/--load-in-4bit require the bitsandbytes package "
                 "(pip install bitsandbytes)"
             ) from exc
         from transformers import BitsAndBytesConfig
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
+        # Routers must stay unquantized: exact weight-copy seeding of the
+        # replacement gates (and step-zero bit-exact equivalence) depends on
+        # reading the native router's true float weights.
+        # NOTE: once any explicit skip list is supplied, transformers drops its
+        # automatic output-head protection, so lm_head must be listed here too.
+        keep_unquantized = ["gate", "lm_head"]
+
+    model_kwargs: dict[str, Any] = {
+        # ``torch_dtype`` is the Transformers ``from_pretrained`` API name.
+        # In particular, DeepSeek-V2's remote-code constructor does not accept
+        # the newer/internal ``dtype`` spelling and forwards unknown kwargs to
+        # ``DeepseekV2ForCausalLM.__init__``.
+        "torch_dtype": _dtype(args.dtype),
+        "local_files_only": args.local_files_only,
+    }
+    if args.load_in_8bit:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_skip_modules=list(keep_unquantized),
+        )
+    if args.load_in_4bit:
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=_dtype(args.dtype),
+            llm_int8_skip_modules=list(keep_unquantized),
+        )
     if args.device_map.lower() != "none":
-        model_kwargs["device_map"] = args.device_map
+        device_map = args.device_map
+        if (
+            device_map == "auto"
+            and (args.load_in_8bit or args.load_in_4bit)
+            and torch.cuda.device_count() == 1
+        ):
+            # Accelerate's automatic mapper reserves enough headroom to push
+            # the final DeepSeek layers to CPU on a 24-GiB card.  The complete
+            # quantized model fits on this GPU, and gate replacement/training
+            # requires real (non-meta) router tensors on every layer.
+            device_map = "cuda:0"
+        model_kwargs["device_map"] = device_map
 
     session = MoEGateSession.from_pretrained(
         args.model,
@@ -168,6 +233,7 @@ def _setup_run(args: Namespace) -> RunContext:
         model_kwargs=model_kwargs,
         tokenizer_kwargs={"local_files_only": args.local_files_only},
     )
+    _log_cuda_memory("model loaded")
     tokenizer = session.tokenizer
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -197,28 +263,10 @@ def _setup_run(args: Namespace) -> RunContext:
         raise RuntimeError("No MoE gate sites discovered")
     shapes = sorted({(site.model_dim, site.num_experts) for site in sites})
 
-    # --------------- obtain gate source (LLM-generated or external file) ---------------
-
     chat_bot = ChatBot(
         session.model, tokenizer,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
     )
-    gate_dir.mkdir(parents=True, exist_ok=True)
-    if args.gate_source is not None:
-        if not args.gate_source.is_file():
-            raise FileNotFoundError(f"Gate source file does not exist: {args.gate_source}")
-        gate_source = args.gate_source.read_text(encoding="utf-8")
-        _validate_gate_source(gate_source, shapes, class_name=args.gate_class)
-        (gate_dir / "gate.py").write_text(gate_source.rstrip() + "\n", encoding="utf-8")
-        print(f"Using externally supplied gate from {args.gate_source} "
-              f"(class {args.gate_class}, {len(gate_source)} chars)")
-    else:
-        gate_source = _generate_gate(
-            chat_bot, shapes, args.gate_generation_attempts,
-            args.gate_max_new_tokens, gate_dir,
-            random_student=args.gate_mode == "teacher-student" or args.load_in_8bit,
-        )
-
     # --------------- capture native behavior ---------------
 
     sample_input = tokenizer(
@@ -254,15 +302,43 @@ def _setup_run(args: Namespace) -> RunContext:
         sites=sites,
         shapes=shapes,
         gate_dir=gate_dir,
-        gate_source=gate_source,
+        gate_source=None,
         sample_input=sample_input,
         prompt_dict=prompt_dict,
         native_logits=native_logits,
         native_gate_inputs=native_gate_inputs,
         native_repeatable=native_repeatable,
         native_repeat_max_abs_difference=native_repeat_max_abs_difference,
-        previous_feedback_summary=_initial_feedback_summary(gate_source) if not args.no_gate_feedback else "",
+        previous_feedback_summary="",
     )
+
+
+def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
+                            outer_feedback: str) -> None:
+    """Generate/load one independent gate architecture while routers are native."""
+    from ab.gpt.util.Const import nngpt_dir
+
+    args = ctx.args
+    ctx.candidate_index = candidate_index
+    ctx.candidate_root = nngpt_dir / "gate_candidates" / f"candidate_{candidate_index:03d}"
+    ctx.gate_dir = ctx.candidate_root / "gate_source"
+    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    if args.gate_source is not None:
+        if not args.gate_source.is_file():
+            raise FileNotFoundError(f"Gate source file does not exist: {args.gate_source}")
+        source = args.gate_source.read_text(encoding="utf-8")
+        _validate_gate_source(source, ctx.shapes, class_name=args.gate_class)
+    else:
+        source = _generate_gate(
+            ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
+            args.gate_max_new_tokens, ctx.gate_dir, outer_feedback,
+        )
+    (ctx.gate_dir / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
+    ctx.gate_source = source
+    ctx.previous_feedback_summary = (
+        _initial_feedback_summary(source) if not args.no_gate_feedback else ""
+    )
+    ctx.used_prompts.clear()
 
 
 def _install_and_verify(ctx: RunContext) -> None:
@@ -285,13 +361,10 @@ def _install_and_verify(ctx: RunContext) -> None:
         "verify": True,
         "top_k": args.router_top_k,
         "allow_remote_code": True,
-            "dynamic_discovery": False,
-            "initialize_from_original": (
-                args.gate_mode == "direct" and not args.load_in_8bit
-            ),
-        "teacher_student": args.gate_mode == "teacher-student",
-        "student_weight": args.student_weight_start,
-        "distillation_temperature": args.distillation_temperature,
+        "dynamic_discovery": False,
+        # Exact copy of the native router weights: replacement must behave
+        # bit-identically at step zero before training starts.
+        "initialize_from_original": True,
     }
     session.replace_source(
         ctx.gate_source,
@@ -302,18 +375,9 @@ def _install_and_verify(ctx: RunContext) -> None:
         ),
         **replace_kwargs,
     )
-    if args.gate_mode == "direct":
-        initialization_metrics = _perturb_gate_weights(
-            session.installs, args.gate_init_noise_scale, args.seed
-        )
-    else:
-        initialization_metrics = [{
-            "layer_index": install.site.layer_index,
-            "student_parameter_count": sum(
-                parameter.numel() for parameter in install.student_gate.parameters()
-            ),
-            "initialization": "random_shadow_student",
-        } for install in session.installs]
+    initialization_metrics = _perturb_gate_weights(
+        session.installs, args.gate_init_noise_scale, args.seed
+    )
     (gate_dir / "initialization_metrics.json").write_text(
         json.dumps(initialization_metrics, indent=2), encoding="utf-8",
     )
@@ -328,28 +392,16 @@ def _install_and_verify(ctx: RunContext) -> None:
         "rtol": 1e-5,
         "atol": 1e-5,
         "gate_init_noise_scale": args.gate_init_noise_scale,
-        "mode": args.gate_mode,
+        "initialize_from_original": True,
         "load_in_8bit": args.load_in_8bit,
-        "student_weight": session.student_weight(),
         "native_forward_bit_repeatable": ctx.native_repeatable,
         "native_repeat_max_abs_logit_difference": ctx.native_repeat_max_abs_difference,
     }
     (gate_dir / "step_zero_equivalence.json").write_text(
         json.dumps(equivalence, indent=2), encoding="utf-8",
     )
-    if args.load_in_8bit:
-        print(
-            "[WARN] 8-bit quantized base: step-zero equivalence is not enforced "
-            f"(measured equivalent={equivalent}, max_abs_diff={max_abs_diff:.6g})"
-        )
-    elif args.gate_mode == "teacher-student" and not equivalent:
-        raise RuntimeError(
-            "Teacher-routed shadow mode changed native model logits: "
-            f"max_abs_difference={max_abs_diff}"
-        )
     if (
-        args.gate_mode == "direct"
-        and args.gate_init_noise_scale == 0
+        args.gate_init_noise_scale == 0
         and not equivalent
     ):
         raise RuntimeError(
@@ -363,15 +415,12 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
     """Run the generation/evaluation/gate-training cycle for each epoch."""
     import torch
 
-    from ab.gpt.util.Const import conf_train_dir, epoch_dir, nngpt_dir, synth_dir
+    from ab.gpt.util.Const import conf_train_dir, nngpt_dir, synth_dir
     from ab.gpt.util.Tune import _evaluate_epoch, nn_gen
     from moe_gate_only import (
         build_nngenprompt_dataloaders,
         collect_gate_metrics,
-        collect_teacher_student_metrics,
         evaluate_language_model_loss,
-        reset_teacher_student_metrics,
-        teacher_student_distillation_loss,
         train_gates,
     )
 
@@ -391,7 +440,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         if args.no_gate_feedback:
             print("[FEEDBACK] Gate feedback text omitted from prompts (--no-gate-feedback)")
         _seed_all(args.seed + epoch)
-        epoch_path = epoch_dir(epoch)
+        if ctx.candidate_root is None:
+            raise RuntimeError("Gate candidate was not prepared")
+        epoch_path = ctx.candidate_root / "epochs" / f"A{epoch}"
         epoch_path.mkdir(parents=True, exist_ok=True)
         epoch_paths.append(epoch_path)
         if args.progressive_unfreeze_descending:
@@ -418,12 +469,17 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             }, indent=2),
             encoding="utf-8",
         )
-        active_student_weight = session.student_weight()
         (epoch_path / "routing_mode.json").write_text(
             json.dumps({
-                "gate_mode": args.gate_mode,
                 "gate_implementation": args.gate_implementation,
-                "student_weight": active_student_weight,
+                "initialize_from_original": True,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        (epoch_path / "evaluation_config.json").write_text(
+            json.dumps({
+                "fixed_hyperparameter_overrides": args.fixed_eval_hyperparameters,
+                "nn_train_epochs": args.nn_train_epochs,
             }, indent=2),
             encoding="utf-8",
         )
@@ -469,6 +525,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             args.nn_train_epochs,
             False,
             custom_synth_dir=synth_dir(epoch_path),
+            prm_json=args.fixed_eval_hyperparameters,
         )
 
         # Preserve cycle results written by NNEval.
@@ -510,11 +567,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             json.dumps(collect_gate_metrics(session.installs), indent=2),
             encoding="utf-8",
         )
-        if args.gate_mode == "teacher-student":
-            (epoch_path / "teacher_student_stats.json").write_text(
-                json.dumps(collect_teacher_student_metrics(session.installs), indent=2),
-                encoding="utf-8",
-            )
 
         # ── 2. Build training data from real evaluated LEMUR results ──
 
@@ -572,64 +624,64 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             )
             continue
 
+        train_lengths = [len(input_ids) for input_ids in train_dataset["input_ids"]]
+        train_length_stats = {
+            "minimum": min(train_lengths),
+            "maximum": max(train_lengths),
+            "mean": sum(train_lengths) / len(train_lengths),
+        }
+        print(
+            f"[epoch={epoch}] Gate-training sequences: examples={len(train_dataset)} "
+            f"min={train_length_stats['minimum']} max={train_length_stats['maximum']} "
+            f"mean={train_length_stats['mean']:.1f}; "
+            f"gradient_checkpointing={args.gradient_checkpointing}"
+        )
+
         # ── 3. Train gates on formatted NN-generation examples ──
 
         session.model.train()
         session.model.config.use_cache = False
         if args.gradient_checkpointing:
             if hasattr(session.model, "gradient_checkpointing_enable"):
-                if args.gate_mode == "teacher-student":
-                    try:
-                        session.model.gradient_checkpointing_enable(
-                            gradient_checkpointing_kwargs={"use_reentrant": False}
-                        )
-                    except TypeError as exc:
-                        raise RuntimeError(
-                            "Teacher-student training requires non-reentrant "
-                            "gradient checkpointing"
-                        ) from exc
-                else:
-                    session.model.gradient_checkpointing_enable()
-            if (
-                args.gate_mode == "direct"
-                and hasattr(session.model, "enable_input_require_grads")
-            ):
+                session.model.gradient_checkpointing_enable()
+            if hasattr(session.model, "enable_input_require_grads"):
                 session.model.enable_input_require_grads()
 
-        def distillation_loss(_model: Any):
-            return args.distillation_weight * teacher_student_distillation_loss(
-                session.installs
-            )
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        pre_training_vram = _log_cuda_memory(
+            f"epoch={epoch} before gate training"
+        )
 
         def log_step(step: int, loss: float) -> None:
-            message = f"epoch={epoch} gate_step={step:04d} total_loss={loss:.6f}"
-            if args.gate_mode == "teacher-student":
-                metrics = collect_teacher_student_metrics(session.installs)["aggregate"]
-                message += (
-                    f" distill_kl={metrics['mean_distillation_kl']}"
-                    f" topk_overlap={metrics['mean_topk_overlap']}"
-                )
-            print(message)
+            print(f"epoch={epoch} gate_step={step:04d} total_loss={loss:.6f}")
 
-        if args.gate_mode == "teacher-student":
-            reset_teacher_student_metrics(session.installs)
-        result, optimizer = train_gates(
-            session.model,
-            session.installs,
-            train_loader,
-            steps=args.gate_train_steps,
-            learning_rate=args.gate_learning_rate,
-            validation_loader=None,
-            validation_steps=None,
-            auxiliary_loss_fn=(
-                distillation_loss if args.gate_mode == "teacher-student" else None
-            ),
-            on_step=log_step,
+        try:
+            result, optimizer = train_gates(
+                session.model,
+                session.installs,
+                train_loader,
+                steps=args.gate_train_steps,
+                learning_rate=args.gate_learning_rate,
+                validation_loader=None,
+                validation_steps=None,
+                auxiliary_loss_fn=None,
+                on_step=log_step,
+            )
+        except torch.cuda.OutOfMemoryError:
+            _log_cuda_memory(f"epoch={epoch} gate-training OOM")
+            print(
+                "[VRAM] Gate-training OOM: 4-bit quantization reduces frozen "
+                "weights but not attention/MLP activations. Keep gradient "
+                "checkpointing enabled (the default), reduce --max-length, "
+                "or reduce --batch-size."
+            )
+            raise
+        post_training_vram = _log_cuda_memory(
+            f"epoch={epoch} after gate training"
         )
 
         validation_loss = None
-        if args.gate_mode == "teacher-student":
-            reset_teacher_student_metrics(session.installs)
         if val_loader is not None:
             validation_loss = evaluate_language_model_loss(
                 session.model,
@@ -638,10 +690,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             )
 
         if args.gradient_checkpointing:
-            if (
-                args.gate_mode == "direct"
-                and hasattr(session.model, "disable_input_require_grads")
-            ):
+            if hasattr(session.model, "disable_input_require_grads"):
                 session.model.disable_input_require_grads()
             if hasattr(session.model, "gradient_checkpointing_disable"):
                 session.model.gradient_checkpointing_disable()
@@ -652,6 +701,10 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             "epoch": epoch,
             "active_gate_layers": sorted(active_layers),
             "examples": len(train_dataset),
+            "sequence_lengths": train_length_stats,
+            "gradient_checkpointing": args.gradient_checkpointing,
+            "vram_before_training": pre_training_vram,
+            "vram_after_training": post_training_vram,
             "steps": result.steps,
             "mean_train_loss": result.mean_train_loss,
             "validation_loss": validation_loss,
@@ -676,19 +729,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 "tasks": gate_feedback["tasks"],
             },
         }
-        if args.gate_mode == "teacher-student":
-            latest_student_stats = collect_teacher_student_metrics(session.installs)
-            training_metrics.update({
-                "mean_distillation_kl": latest_student_stats["aggregate"][
-                    "mean_distillation_kl"
-                ],
-                "mean_topk_overlap": latest_student_stats["aggregate"][
-                    "mean_topk_overlap"
-                ],
-                "minimum_topk_overlap": latest_student_stats["aggregate"][
-                    "minimum_topk_overlap"
-                ],
-            })
         (epoch_path / "gate_training_metrics.json").write_text(
             json.dumps(training_metrics, indent=2), encoding="utf-8",
         )
@@ -696,79 +736,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             json.dumps(collect_gate_metrics(session.installs), indent=2),
             encoding="utf-8",
         )
-
-        if args.gate_mode == "teacher-student":
-            student_stats = collect_teacher_student_metrics(session.installs)
-            (epoch_path / "teacher_student_stats_post_train.json").write_text(
-                json.dumps(student_stats, indent=2), encoding="utf-8",
-            )
-            aggregate = student_stats["aggregate"]
-            minimum_overlap = aggregate["minimum_topk_overlap"]
-            maximum_kl = aggregate["maximum_distillation_kl"]
-            approved = args.handoff_mode == "fixed" or (
-                args.handoff_mode == "guarded"
-                and validation_loss is not None
-                and math.isfinite(validation_loss)
-                and minimum_overlap is not None
-                and maximum_kl is not None
-                and minimum_overlap >= args.handoff_min_topk_overlap
-                and maximum_kl <= args.handoff_max_kl
-            )
-            previous_weight = float(session.student_weight() or 0.0)
-            next_weight = previous_weight
-            candidate_validation_loss = None
-            rejection_reason = None
-            if approved:
-                next_weight = min(1.0, previous_weight + args.student_weight_step)
-                session.set_student_weight(next_weight)
-                try:
-                    handoff_logits = _model_logits(session.model.eval(), ctx.sample_input)
-                    if not torch.isfinite(handoff_logits).all():
-                        raise RuntimeError("handoff produced non-finite model logits")
-                    if val_loader is not None:
-                        candidate_validation_loss = evaluate_language_model_loss(
-                            session.model,
-                            val_loader,
-                            max_steps=args.validation_steps,
-                        )
-                        if (
-                            validation_loss is not None
-                            and (
-                                not math.isfinite(candidate_validation_loss)
-                                or candidate_validation_loss
-                                > validation_loss
-                                + args.handoff_max_validation_loss_increase
-                            )
-                        ):
-                            rejection_reason = "validation_loss_increase"
-                            approved = False
-                except Exception:
-                    session.set_student_weight(previous_weight)
-                    next_weight = previous_weight
-                    raise
-                if not approved:
-                    session.set_student_weight(previous_weight)
-                    next_weight = previous_weight
-            decision = {
-                "mode": args.handoff_mode,
-                "approved": approved,
-                "minimum_topk_overlap": minimum_overlap,
-                "required_minimum_topk_overlap": args.handoff_min_topk_overlap,
-                "maximum_distillation_kl": maximum_kl,
-                "required_maximum_distillation_kl": args.handoff_max_kl,
-                "previous_student_weight": previous_weight,
-                "next_student_weight": next_weight,
-                "teacher_validation_loss": validation_loss,
-                "candidate_validation_loss": candidate_validation_loss,
-                "maximum_validation_loss_increase": (
-                    args.handoff_max_validation_loss_increase
-                ),
-                "rejection_reason": rejection_reason,
-            }
-            (epoch_path / "handoff_decision.json").write_text(
-                json.dumps(decision, indent=2), encoding="utf-8",
-            )
-            session.save(epoch_path / "gate_post_handoff", optimizer=optimizer)
 
         print(
             f"[epoch={epoch}] train_loss={result.mean_train_loss:.6f} "
@@ -778,7 +745,21 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
     return epoch_paths
 
 
-def _write_final_summary(ctx: RunContext, epoch_paths: list[Path]) -> None:
+def _candidate_feedback(epoch_paths: list[Path], candidate_index: int) -> str:
+    """Summarize one completed candidate for the next outer-loop proposal."""
+    entries = []
+    for epoch_path in epoch_paths:
+        path = epoch_path / "nas_feedback.json"
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            entries.append({key: data.get(key) for key in (
+                "n_generated", "n_trained", "best_accuracy", "mean_accuracy_delta",
+                "improved_candidates",
+            )})
+    return f"Independent gate candidate {candidate_index} results: {json.dumps(entries)}"
+
+
+def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) -> None:
     """Write the aggregated per-epoch summary next to the run artifacts."""
     from ab.gpt.util.Const import nngpt_dir
 
@@ -786,15 +767,16 @@ def _write_final_summary(ctx: RunContext, epoch_paths: list[Path]) -> None:
     summary = {
         "model": args.model,
         "adapter": str(args.adapter) if args.adapter is not None else None,
-        "gate_mode": args.gate_mode,
         "gate_implementation": args.gate_implementation,
         "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
         "generation_backend": "upstream_default",
         "fixed_evaluation_prompts": False,
-        "gate_outcome_prompt_feedback": True,
+        "gate_outcome_prompt_feedback": not args.no_gate_feedback,
         "train_prompt_config": args.train_prompt_config,
         "test_prompt_config": args.test_prompt_config,
         "dataset": args.dataset,
+        "fixed_evaluation_hyperparameters": args.fixed_eval_hyperparameters,
+        "nn_train_epochs": args.nn_train_epochs,
         "training_nn_prefixes": list(_nas_prefixes(args)),
         "generation_nn_prefixes": list(_generation_prefixes(args)),
         "gate_source": str(ctx.gate_dir / "gate.py") if ctx.gate_source is not None else None,
@@ -805,17 +787,25 @@ def _write_final_summary(ctx: RunContext, epoch_paths: list[Path]) -> None:
             else [s for s in ctx.sites if s.layer_index in args.layers]
         ),
         "epochs": args.epochs,
+        "gate_candidates": args.gate_candidates,
         "run_root": str(ctx.run_root),
     }
-    for epoch, epoch_path in enumerate(epoch_paths):
-        training_path = epoch_path / "gate_training_metrics.json"
-        cycle_path = epoch_path / "cycle_results.json"
-        entry: dict[str, Any] = {"epoch": epoch}
-        if training_path.is_file():
-            entry["gate_training"] = json.loads(training_path.read_text(encoding="utf-8"))
-        if cycle_path.is_file():
-            entry["cv_results"] = json.loads(cycle_path.read_text(encoding="utf-8"))
-        summary[f"A{epoch}"] = entry
+    for candidate_index, epoch_paths in enumerate(candidate_epochs):
+        candidate_root = nngpt_dir / "gate_candidates" / f"candidate_{candidate_index:03d}"
+        candidate: dict[str, Any] = {
+            "gate_source": str(candidate_root / "gate_source" / "gate.py"),
+            "independent_native_initialization": True,
+        }
+        for epoch, epoch_path in enumerate(epoch_paths):
+            training_path = epoch_path / "gate_training_metrics.json"
+            cycle_path = epoch_path / "cycle_results.json"
+            entry: dict[str, Any] = {"epoch": epoch}
+            if training_path.is_file():
+                entry["gate_training"] = json.loads(training_path.read_text(encoding="utf-8"))
+            if cycle_path.is_file():
+                entry["cv_results"] = json.loads(cycle_path.read_text(encoding="utf-8"))
+            candidate[f"A{epoch}"] = entry
+        summary[f"candidate_{candidate_index:03d}"] = candidate
 
     (nngpt_dir / "one_cycle_results.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8",
@@ -824,10 +814,25 @@ def _write_final_summary(ctx: RunContext, epoch_paths: list[Path]) -> None:
 
 
 def main() -> None:
+    from .generation_dtype import ensure_generation_dtype_policy
+    from .eval_safety import ensure_moe_eval_safety
+
+    ensure_generation_dtype_policy()
+    # Keep malformed LLM-generated hp payloads from aborting the shared
+    # evaluator without changing Tune.py or Eval.py themselves.
+    ensure_moe_eval_safety()
     args = parse_args()
     _validate_args(args)
     ctx = _setup_run(args)
-    with ctx.session:
-        _install_and_verify(ctx)
-        epoch_paths = _run_epochs(ctx)
-    _write_final_summary(ctx, epoch_paths)
+    candidate_epochs: list[list[Path]] = []
+    outer_feedback = ""
+    for candidate_index in range(args.gate_candidates):
+        _prepare_gate_candidate(ctx, candidate_index, outer_feedback)
+        # The context restores native routers after every candidate, so no
+        # candidate inherits another candidate's trained gate parameters.
+        with ctx.session:
+            _install_and_verify(ctx)
+            epoch_paths = _run_epochs(ctx)
+        candidate_epochs.append(epoch_paths)
+        outer_feedback += "\n" + _candidate_feedback(epoch_paths, candidate_index)
+    _write_final_summary(ctx, candidate_epochs)

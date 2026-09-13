@@ -60,7 +60,7 @@ CYCLE_CMD=(
     --device-map none
     --dtype "${DTYPE:-bfloat16}"
     --gate-mode "${GATE_MODE:-direct}"
-    --gate-implementation "${GATE_IMPLEMENTATION:-svd_signed_pair_silu}"
+    --gate-implementation "${GATE_IMPLEMENTATION:-llm_generated}"
     --epochs "${EPOCHS:-1}"
     --test-nn "${TEST_NN:-1}"
     --nn-train-epochs "${NN_TRAIN_EPOCHS:-1}"
@@ -88,7 +88,7 @@ if [ "${LOCAL_FILES_ONLY:-0}" = "1" ]; then
     CYCLE_CMD+=(--local-files-only)
 fi
 if [ "${VERIFY_MORPHISM_ONLY:-0}" = "1" ]; then
-    CYCLE_CMD+=(--verify-morphism-only)
+    echo "VERIFY_MORPHISM_ONLY is no longer supported by run_moe_gate_cycle.py; ignoring it"
 fi
 if [ "${PROGRESSIVE_UNFREEZE_DESCENDING:-0}" = "1" ]; then
     CYCLE_CMD+=(--progressive-unfreeze-descending)

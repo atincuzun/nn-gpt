@@ -688,6 +688,7 @@ def _evaluate_epoch(
     trans_mode,
     classification_mode=False,
     custom_synth_dir=None,
+    prm_json=None,
 ):
     """
     Single source of truth for one evaluation epoch.
@@ -741,6 +742,11 @@ def _evaluate_epoch(
                     cmd.extend(["--custom_synth_dir", str(custom_synth_dir)])
                 if nn_name_prefix:
                     cmd.extend(["--nn_name_prefix", str(nn_name_prefix)])
+                if prm_json is not None:
+                    cmd.extend([
+                        "--prm_json",
+                        json.dumps(prm_json, separators=(",", ":")),
+                    ])
                 print(
                     f"[TUNE] Running NNEval subprocess with "
                     f"CUDA_VISIBLE_DEVICES={eval_cuda_visible_devices} "
@@ -754,6 +760,7 @@ def _evaluate_epoch(
                     nn_train_epochs=nn_train_epochs,
                     only_epoch=epoch,
                     custom_synth_dir=custom_synth_dir,
+                    prm_json=prm_json,
                 )
             print('[DEBUG] Release_memory.')
             release_memory()

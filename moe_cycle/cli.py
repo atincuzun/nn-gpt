@@ -3,7 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+
+from ab.gpt.util.Const import DEFAULT_NN_PREFIXES
+
+
+def _json_object(value: str) -> dict[str, object]:
+    """Parse one command-line JSON object with an argparse-friendly error."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError(
+            f"expected a JSON object, got {type(parsed).__name__}"
+        )
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -12,13 +28,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapter",
         type=Path,
-        help="Optional PEFT LoRA adapter to merge into the frozen teacher model",
+        help="Optional PEFT LoRA adapter to merge into the frozen model",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--epochs", type=int, default=5,
                         help="Number of pipeline generation/evaluation/training epochs")
     parser.add_argument("--test-nn", type=int, default=10)
     parser.add_argument("--nn-train-epochs", type=int, default=3)
+    parser.add_argument(
+        "--fixed-eval-hyperparameters",
+        "--eval-prm-json",
+        dest="fixed_eval_hyperparameters",
+        type=_json_object,
+        metavar="JSON",
+        help="JSON object applied last to every generated NN evaluation, overriding "
+        "values from generated hp.txt and the source dataframe. Evaluation epoch is "
+        "controlled separately by --nn-train-epochs.",
+    )
     parser.add_argument("--gate-train-steps", type=int, default=50)
     parser.add_argument("--gate-learning-rate", type=float, default=1e-4)
     parser.add_argument(
@@ -41,10 +67,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gate-mode",
-        choices=("teacher-student", "direct"),
+        choices=("direct",),
         default="direct",
-        help="Train a random shadow student (DeepSeek-V2 routers only) or the direct "
-        "replacement initialized from the native router",
+        help="Deprecated compatibility option; the current cycle always trains the direct replacement gate",
     )
     parser.add_argument(
         "--gate-init-noise-scale",
@@ -52,20 +77,13 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Gaussian initialization noise as a fraction of each native gate weight std",
     )
-    parser.add_argument("--distillation-weight", type=float, default=1.0)
-    parser.add_argument("--distillation-temperature", type=float, default=1.0)
-    parser.add_argument("--student-weight-start", type=float, default=0.0)
-    parser.add_argument("--student-weight-step", type=float, default=0.1)
-    parser.add_argument(
-        "--handoff-mode",
-        choices=("guarded", "never", "fixed"),
-        default="guarded",
-        help="Increase student routing control only after imitation succeeds, never, or every epoch",
-    )
-    parser.add_argument("--handoff-min-topk-overlap", type=float, default=0.95)
-    parser.add_argument("--handoff-max-kl", type=float, default=0.1)
-    parser.add_argument("--handoff-max-validation-loss-increase", type=float, default=0.05)
     parser.add_argument("--gate-generation-attempts", type=int, default=3)
+    parser.add_argument(
+        "--gate-candidates",
+        type=int,
+        default=1,
+        help="Independent outer-loop gate architectures to generate and evaluate",
+    )
     parser.add_argument("--gate-max-new-tokens", type=int, default=1024)
     parser.add_argument("--generation-max-new-tokens", type=int, default=16384)
     parser.add_argument(
@@ -89,16 +107,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sft-nn-prefixes",
         nargs="+",
-        default=["ga-", "GenFractalNet"],
+        default=list(DEFAULT_NN_PREFIXES),
         help="LEMUR model prefixes used for paired gate-training examples. "
+        "Defaults to the full LEMUR family census (see ab.gpt.util.Const). "
         "The current --nn-name-prefix is added automatically.",
     )
     parser.add_argument(
         "--generation-nn-prefixes",
         nargs="+",
-        default=["GenFractalNet"],
-        help="One-record-per-model LEMUR prefixes used as comparable CV generation seeds. "
-        "The current --nn-name-prefix is added automatically.",
+        default=list(DEFAULT_NN_PREFIXES),
+        help="LEMUR prefixes used as CV generation seeds (nn_gen samples one "
+        "record per model). Defaults to the full LEMUR family census "
+        "(see ab.gpt.util.Const). The current --nn-name-prefix is added "
+        "automatically.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
@@ -129,10 +150,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-in-8bit",
         action="store_true",
-        help="Quantize the frozen base model with bitsandbytes (saves ~50%% VRAM). "
-        "The gate starts randomly (int8 router weights cannot seed the copy), "
-        "step-zero equivalence is recorded but not enforced, and teacher-student "
-        "mode is unavailable",
+        help="Quantize the frozen backbone weights (plain nn.Linear modules) "
+        "with bitsandbytes int8 (~50%% VRAM saving). Router parameters are not "
+        "quantized, so the replacement gates are still seeded by an exact "
+        "copy of the native router.",
+    )
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="Quantize the frozen backbone with bitsandbytes NF4/QLoRA-style "
+        "4-bit (~75%% VRAM saving vs bf16). Same caveats as --load-in-8bit; "
+        "the two options are mutually exclusive",
     )
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -147,7 +175,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Deprecated compatibility option; fixed prompt reuse is disabled",
     )
-    parser.add_argument("--gradient-checkpointing", action="store_true")
+    checkpointing = parser.add_mutually_exclusive_group()
+    checkpointing.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint decoder layers while training gates to reduce activation VRAM. "
+        "Enabled by default; this flag is retained for command compatibility.",
+    )
+    checkpointing.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable activation checkpointing. This can OOM on long gate-training sequences.",
+    )
+    parser.set_defaults(gradient_checkpointing=True)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--no-gate-feedback",

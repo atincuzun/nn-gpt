@@ -87,10 +87,18 @@ def _verify_morphed_gate_projections(
             )
         generated_gate = getattr(install.new_gate, "gate", install.new_gate)
         parameter = next(generated_gate.parameters())
-        with torch.no_grad():
-            actual_native = generated_gate(
-                flat.to(device=parameter.device)
-            ).detach()
+        recorded_logits = getattr(install.new_gate, "_last_gate_logits", None)
+        if isinstance(recorded_logits, torch.Tensor):
+            # Contract wrappers such as DeepSeek-V2 perform their own input
+            # promotion before invoking the generated gate.  Reuse the logits
+            # captured by the replacement-route call above instead of
+            # bypassing that model-specific dtype contract.
+            actual_native = recorded_logits.detach()
+        else:
+            with torch.no_grad():
+                actual_native = generated_gate(
+                    flat.to(device=parameter.device)
+                ).detach()
         expected = expected_native.float().cpu()
         actual = actual_native.float().cpu()
         projection_finite = bool(torch.isfinite(actual).all())

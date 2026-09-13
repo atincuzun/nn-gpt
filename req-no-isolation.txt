@@ -1,3 +1,8 @@
-flash_attn==2.8.3.post1
+# Do not install the CUDA-12 FlashAttention wheel unconditionally.  The
+# project CUDA-13/PyTorch-cu130 environment cannot load it (it requires
+# libcudart.so.12), and DeepSeek-V2's remote module imports it eagerly when it
+# is merely present.  DeepSeek-V2 uses Transformers' eager attention fallback
+# in this environment.  Install a CUDA-compatible FlashAttention build only
+# when the host/toolkit explicitly provides one.
 # Required for Unsloth with OSS
 triton_kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels

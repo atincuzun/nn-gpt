@@ -15,6 +15,24 @@ def _module_device_dtype(module: nn.Module) -> Tuple[Optional[torch.device], Opt
     return None, None
 
 
+def _prepare_gate_input(gate: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Cast a router input to the replacement gate's parameter dtype.
+
+    bf16 activations can reach an fp32 replacement gate (DeepSeek-style fp32
+    promotion contract skips the install-time dtype cast); computing there
+    would raise "expected mat1 and mat2 to have the same dtype". ``.to()`` is
+    differentiable, so gradients still flow back into the activation stream.
+    """
+    _, gate_dtype = _module_device_dtype(gate)
+    if (
+        gate_dtype is not None
+        and x.is_floating_point()
+        and x.dtype != gate_dtype
+    ):
+        return x.to(dtype=gate_dtype)
+    return x
+
+
 def _copy_gate_attrs(old_gate: nn.Module, wrapper: nn.Module) -> None:
     """Copy ALL scalar/array attributes and buffers from *old_gate* to *wrapper*.
 
@@ -63,7 +81,7 @@ class _LogitsOnlyGate(nn.Module):
         self.gate = new_gate
 
     def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.gate(x)
+        return self.gate(_prepare_gate_input(self.gate, x))
 
 
 class _SoftmaxTopKGate(nn.Module):
@@ -83,7 +101,7 @@ class _SoftmaxTopKGate(nn.Module):
         self.order = order
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
-        logits = self.gate(x)
+        logits = self.gate(_prepare_gate_input(self.gate, x))
         scores = F.softmax(logits, dim=-1, dtype=torch.float)
         weights, indices = torch.topk(scores, self.top_k, dim=-1)
         if self.normalize:
@@ -104,7 +122,7 @@ class _TopKWeightsIndicesGate(nn.Module):
         self._last_gate_logits: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
-        logits = self.gate(x)
+        logits = self.gate(_prepare_gate_input(self.gate, x))
         self._last_gate_logits = logits
         scores = F.softmax(logits, dim=-1, dtype=torch.float)
         choice_scores = scores

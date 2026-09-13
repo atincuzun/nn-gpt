@@ -52,7 +52,7 @@ def _validate_gate_source(
                 "bernoulli", "dropout", "multinomial", "normal",
                 "rand", "rand_like", "randn", "randn_like",
             }:
-                raise ValueError("Generated student gate forward must be deterministic")
+                raise ValueError("Generated gate forward must be deterministic")
     namespace: dict[str, Any] = {"__name__": "_generated_gate"}
     exec(compile(tree, "<generated-gate>", "exec"), namespace)
     gate_cls = namespace.get(class_name)
@@ -61,7 +61,7 @@ def _validate_gate_source(
     for model_dim, num_experts in shapes:
         gate = gate_cls(model_dim, num_experts).float().eval()
         if any(isinstance(module, (nn.Dropout, nn.modules.batchnorm._BatchNorm)) for module in gate.modules()):
-            raise ValueError("Generated student gates must be deterministic; dropout/batchnorm are unsupported")
+            raise ValueError("Generated gates must be deterministic; dropout/batchnorm are unsupported")
         base = getattr(gate, "base", None)
         if not isinstance(base, nn.Linear) or tuple(base.weight.shape) != (num_experts, model_dim):
             raise ValueError(
@@ -80,18 +80,19 @@ def _validate_gate_source(
 
 def _generate_gate(
     chat_bot: Any, shapes: list[tuple[int, int]], attempts: int,
-    max_new_tokens: int, artifact_dir: Path, *, random_student: bool,
+    max_new_tokens: int, artifact_dir: Path, feedback_summary: str = "",
 ) -> str:
-    initialization = (
-        "The gate is a randomly initialized student trained beside a frozen native router. "
-        "Do not assume its base weight is copied from the native router."
-        if random_student
-        else "Its base weight will be copied from the native router."
-    )
+    """Ask the LLM for a replacement gate source; its base weight is copied
+    from the native router so the replaced model stays bit-identical at
+    step zero before training begins."""
+    initialization = "Its base weight will be copied from the native router."
     residual_requirement = (
-        "Any residual branch may use normal random initialization."
-        if random_student
-        else "Initialize any residual branch's final projection to zero for native step-zero routing."
+        "Initialize any residual branch's final projection to zero "
+        "for native step-zero routing."
+    )
+    feedback_requirement = (
+        "- Results from earlier independent gate candidates:\n" + feedback_summary
+        if feedback_summary else ""
     )
     prompt = f"""
 You are writing a tiny MoE router scorer, NOT a full neural network. Do NOT emit <nn>, <hp>, or <tr> blocks, datasets, training loops, or markdown.
@@ -109,7 +110,8 @@ Requirements:
 - Do not hard-code dimensions, move devices inside forward, or return tuples.
 - Keep the gate small, differentiable, and numerically stable.
 - The class must be COMPLETE and syntactically valid: close every string literal and parenthesis, and finish the class body before the closing tag. Never stop after the class header.
-- Router shapes: {shapes!r}.
+ - Router shapes: {shapes!r}.
+{feedback_requirement}
 Expected format (example):
 <gate>
 import torch

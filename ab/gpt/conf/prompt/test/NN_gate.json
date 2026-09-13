@@ -1,29 +1,51 @@
 {
   "improve_classification_gate_feedback": {
     "system": [
-      "You are an expert in feedback-driven neural architecture search and PyTorch model design.",
-      "Generate one complete LEMUR-compatible image-classification candidate that improves on the reference architecture and the measured outcomes from the previous NAS cycle.",
-      "Treat measured CV accuracy and failures as evidence: preserve successful design choices, avoid repeated failure modes, and make a concrete architectural or optimization improvement.",
-      "Output only <hp>, <tr>, and <nn> in that order. Do not output analysis, markdown, or placeholders."
+      "You are an expert PyTorch neural network architect.",
+      "Your task is to generate improved neural network architectures, training hyperparameters, and data transforms that maximise performance on image classification, generate a complete and novel architecture, and you must strictly follow LEMUR NN Dataset conventions: include a standalone function 'supported_hyperparameters' (outside the class) returning a set of hyperparameter key names, class name 'Net', and methods __init__, forward, train_setup, and learn with exact signatures.",
+      "Novelty requirement: design a structurally different architecture from the reference - different block composition, connectivity, width/depth, normalization, pooling, or attention patterns. Do not reproduce the reference model, do not copy or rename its blocks, and do not re-emit a known family skeleton verbatim. Complete executable code is mandatory: the evaluator parses, trains, and measures your model directly.",
+      "Output only the requested XML tags (<hp>, <tr>, <nn>) in the correct order - no explanation, no markdown, no extra text. Provide complete, executable code without truncations or ellipses."
     ],
     "task": "img-classification",
     "dataset": "cifar-10",
-    "nn_prefixes": [
-      "ga-",
-      "GenFractalNet",
-      "moe-gate-cycle"
-    ],
     "addon_task": null,
     "input_list": [
-      {"para": "nn_code", "value": "nn_code"},
-      {"para": "accuracy", "value": "accuracy"},
-      {"para": "epoch", "value": "epoch"},
-      {"para": "dataset", "value": "dataset"},
-      {"para": "task", "value": "task"},
-      {"para": "metric", "value": "metric"},
-      {"para": "metric_code", "value": "metric_code"},
-      {"para": "transform_code", "value": "transform_code"},
-      {"para": "prm", "value": "prm"}
+      {
+        "para": "nn_code",
+        "value": "nn_code"
+      },
+      {
+        "para": "accuracy",
+        "value": "accuracy"
+      },
+      {
+        "para": "epoch",
+        "value": "epoch"
+      },
+      {
+        "para": "dataset",
+        "value": "dataset"
+      },
+      {
+        "para": "task",
+        "value": "task"
+      },
+      {
+        "para": "metric",
+        "value": "metric"
+      },
+      {
+        "para": "metric_code",
+        "value": "metric_code"
+      },
+      {
+        "para": "transform_code",
+        "value": "transform_code"
+      },
+      {
+        "para": "prm",
+        "value": "prm"
+      }
     ],
     "static_values": {
       "gate_summary": "No previous NAS cycle feedback is available. Establish a valid baseline candidate."
@@ -36,18 +58,34 @@
       "<nas_feedback>",
       "{gate_summary}",
       "</nas_feedback>",
-      "Use this feedback to improve validity and the '{metric}' metric. Do not merely reproduce a failed candidate or the reference model.",
+      "Use this feedback to improve validity and the '{metric}' metric. Aim strictly higher than the reference accuracy {accuracy} at the same {epoch}-epoch budget. Do not merely reproduce a failed candidate, the reference model, or a known family skeleton: design a structurally different architecture with a realistic chance of outperforming {accuracy}.",
       "The reference model achieved {accuracy} at epoch {epoch} on '{dataset}' for task '{task}'.",
+      "The neural network code inside <nn>...</nn> MUST follow this exact LEMUR interface (flexible architecture, strict interface):",
+      "  1. A module-level function (before the class): def supported_hyperparameters(): return {{'lr', 'momentum'}}",
+      "     Return a Python set of ONLY the keys you access via prm['key'] or prm.get('key') inside the class body.",
+      "     SAFE DEFAULT: return {{'lr', 'momentum'}} - do not add 'weight_decay', 'dropout', 'eps', 'batch_size', 'epochs', 'patience', 'transform', or any other key unless you ACTUALLY call prm['that_key'] in the code. Undeclared-but-used keys cause failure; declared-but-unused keys also cause failure.",
+      "  2. The main model class MUST be named exactly 'Net' and inherit from nn.Module.",
+      "     The evaluator calls `module.Net(in_shape, out_shape, prm, device)` by name. A class named ResNet, LeNet, VGGNet, ConvNet, MyModel, or ANYTHING other than 'Net' will cause a NoneType crash. Helper/block classes (e.g. ResidualBlock, SEBlock) may have any name - but the top-level model class is always 'Net'.",
+      "     NEVER inherit from torchvision.models classes (ResNet, VGG, AlexNet, etc.) - they have incompatible __init__ signatures. Always inherit directly from nn.Module.",
+      "  3. Net.__init__ must accept exactly: (self, in_shape: tuple, out_shape: tuple, prm: dict, device: torch.device) - store self.device = device.",
+      "     in_shape is a 4-tuple: (batch_size, channels, height, width). Use in_shape[1] for input channels. NEVER unpack with 3 variables: `c, h, w = in_shape` will crash with ValueError because there are 4 values, not 3.",
+      "     Use out_shape[0] for the number of output classes.",
+      "  4. Methods train_setup(self, prm) and learn(self, train_data) inside Net.",
+      "     train_setup must set self.optimizer and self.criteria as instance attributes (not return them).",
+      "     learn receives a DataLoader yielding (inputs, labels) batches - iterate as `for inputs, labels in train_data:`.",
+      "     Correct pattern: inputs, labels = inputs.to(self.device), labels.to(self.device); self.optimizer.zero_grad(); loss = self.criteria[0](self(inputs), labels); loss.backward(); self.optimizer.step()",
+      "  5. Required imports: always include `import torch` and `import torch.nn as nn` at the top.",
+      "     If you use F.relu, F.gelu, F.dropout, etc., also add `import torch.nn.functional as F`.",
+      "  6. Avoid hardcoded spatial dimensions in Linear layers. Use nn.AdaptiveAvgPool2d((1, 1)) before flattening to make the network input-size agnostic.",
+      "  7. Every attribute accessed in forward() (e.g. self.features, self.avgpool, self.fc) MUST be defined in __init__(). Missing self.X definitions cause AttributeError at runtime.",
+      "  8. <hp> MUST be valid JSON with double quotes, containing keys \"batch\", \"transform\", and every key returned by supported_hyperparameters. If unsure use \"batch\": 64, \"transform\": \"norm_32\".",
+      "Completeness: every tensor shape must be consistent for {dataset} inputs, the code must parse, and the file must not be truncated with ellipses or placeholder comments. The architecture must differ structurally from the reference.",
       "Reference training configuration:",
       "<hp>{prm}</hp>",
       "<tr>{transform_code}</tr>",
       "<metric>{metric_code}</metric>",
       "<nn>{nn_code}</nn>",
-      "Return a single complete candidate:",
-      "1. <hp> must contain valid JSON with batch, transform, and every hyperparameter used by the model.",
-      "2. <tr> must contain complete executable transform code.",
-      "3. <nn> must contain complete executable PyTorch code following the LEMUR interface: module-level supported_hyperparameters(), class Net, and methods __init__, forward, train_setup, and learn.",
-      "The candidate must be structurally different from the reference and must not contain ellipses, omitted bodies, markdown fences, or explanations.",
+      "Return a single complete candidate. Architecture must be a new design aiming to beat {accuracy}, and the interface must be exact.",
       "Output exactly <hp>...</hp><tr>...</tr><nn>...</nn>."
     ]
   }

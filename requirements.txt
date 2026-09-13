@@ -7,17 +7,17 @@ nn-rag>=2.2.4
 nn-dup>=2.2.4
 bitsandbytes>=0.45.0
 peft>=0.14.0
-transformers==5.5.0
+transformers==4.46.1
 gguf>=0.10.0
-trl
+trl==0.12.2
 sentence-transformers>=3.3.1
 faiss-cpu
 overrides>=7.7.0
 datasketch # to check code novelty
 langgraph>=1.0.4
 
-unsloth==2026.8.2
-unsloth-zoo==2026.8.2
+unsloth==2024.11.11
+unsloth-zoo==2024.11.8
 triton>=3.4.0
 
 matplotlib

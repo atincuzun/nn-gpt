@@ -84,11 +84,8 @@ CYCLE_CMD=(
     --gate-train-steps "${GATE_TRAIN_STEPS:-50}"
     --gate-learning-rate "${GATE_LR:-1e-4}"
     --gate-mode "${GATE_MODE:-direct}"
-    --gate-implementation "${GATE_IMPLEMENTATION:-svd_signed_pair_silu}"
+    --gate-implementation "${GATE_IMPLEMENTATION:-llm_generated}"
     --gate-init-noise-scale "${GATE_INIT_NOISE_SCALE:-0}"
-    --distillation-weight "${DISTILLATION_WEIGHT:-1.0}"
-    --student-weight-step "${STUDENT_WEIGHT_STEP:-0.1}"
-    --handoff-mode "${HANDOFF_MODE:-guarded}"
     --max-prompts "${MAX_PROMPTS:-4096}"
     --max-length "${MAX_LENGTH:-4096}"
     --generation-max-new-tokens "${MAX_NEW_TOKENS:-16384}"
@@ -108,7 +105,7 @@ if [ -n "${GATE_LAYERS:-}" ]; then
     CYCLE_CMD+=(--layers "${LAYER_ARGS[@]}")
 fi
 if [ "${VERIFY_MORPHISM_ONLY:-0}" = "1" ]; then
-    CYCLE_CMD+=(--verify-morphism-only)
+    echo "VERIFY_MORPHISM_ONLY is no longer supported by run_moe_gate_cycle.py; ignoring it"
 fi
 "${CYCLE_CMD[@]}"
 

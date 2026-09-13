@@ -66,6 +66,13 @@ _Util.extract_code = _extract_code
 _Util.extract_hyperparam = _extract_hyperparam
 _Util.extract_transform = _extract_transform
 
+# Scope-bounded fix: generation-head dtype inference must honor the ACTIVE
+# bnb quantization mode (8-bit configs carry a float32 4-bit default that
+# otherwise poisons lm_head/config dtype and crashes MoE conv blocks).
+from moe_cycle.generation_dtype import ensure_generation_dtype_policy
+
+ensure_generation_dtype_policy()
+
 from moe_cycle.cycle import main
 from moe_cycle.morphism import _verify_morphed_gate_projections
 
