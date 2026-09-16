@@ -171,7 +171,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf-keys",
         nargs="+",
-        default=["improvement_classification_codeonly"],
+        default=["improve_classification_only"],
+        help="Keys selected from the TEST prompt config for CV generation; the "
+        "train config is consumed whole by the gate-training data builder",
     )
     parser.add_argument("--nn-name-prefix", default="moe-gate-cycle")
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")

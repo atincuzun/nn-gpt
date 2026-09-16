@@ -459,7 +459,14 @@ def test_validate_args_gate_author_modes_require_outer_search():
 
 def test_cli_gate_author_defaults_to_native(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py"])
-    assert parse_args().gate_author == "native"
+    args = parse_args()
+    assert args.gate_author == "native"
+    # The default conf keys must exist in the default test prompt config.
+    config = json.loads(
+        (Path(__file__).resolve().parents[1] / "ab/gpt/conf/prompt/test/NN_gen.json")
+        .read_text(encoding="utf-8")
+    )
+    assert set(args.conf_keys) <= set(config), args.conf_keys
 
 
 def test_cli_gate_author_accepts_last_and_best(monkeypatch):
