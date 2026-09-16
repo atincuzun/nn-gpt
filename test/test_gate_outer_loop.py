@@ -239,41 +239,31 @@ def test_sft_example_does_not_leak_score_into_input():
     assert assistant == "<gate>\n" + DISTINCT_GATE.strip() + "\n</gate>"
 
 
-def test_prompt_teaches_the_zero_init_contract():
-    """The prompt must state the rule, the shape rule, and the branch requirement."""
+def test_prompt_stays_short_and_states_only_the_contract():
+    """The prompt states the seam only; the network stays undefined on purpose."""
     prompt = gate_proposal_prompt([(2048, 64)])
-    assert "nn.init.zeros_(" in prompt                  # zero-at-init mechanism
-    assert "EVERY added branch must be identically zero" in prompt
-    assert "return self.base(x) + x" in prompt          # forbidden pattern named
-    assert "INVALID" in prompt
-    assert "num_experts" in prompt
-    # A bare baseline is explicitly rejected.
-    assert "`return self.base(x)` alone is INVALID" in prompt
-    # Structural novelty is required, with concrete axes of change.
-    assert "STRUCTURAL NOVELTY IS REQUIRED" in prompt
-    assert "TWO meaningful architectural properties" in prompt
-
-
-def test_prompt_warns_against_the_dead_branch_pattern():
-    """`scale * zero_init_projection` has zero gradient for both; must be banned."""
-    prompt = gate_proposal_prompt([(2048, 64)])
-    assert "learnable scalar" in prompt
-    assert "gradients" in prompt
-    assert "never start learning" in prompt
-
-
-def test_prompt_gives_a_skeleton_not_a_copyable_example():
-    """A complete example gets copied verbatim; the prompt must not provide one."""
-    prompt = gate_proposal_prompt([(2048, 64)])
-    assert "REQUIRED SKELETON" in prompt
-    # The skeleton must be incomplete, so it cannot be echoed as an answer.
-    assert "# define YOUR branch here" in prompt
-    assert "this is not a complete answer" in prompt
-    # It must still demonstrate the zero-init mechanism.
-    assert "nn.init.zeros_(YOUR_LAST.weight)" in prompt
-    # Crucially, no ready-to-use branch implementation is shipped.
-    assert "self.up = nn.Linear" not in prompt
-    assert "self.down = nn.Linear" not in prompt
+    assert len(prompt) < 1200, "prompt over-specified"
+    # The seam.
+    assert "LLMGeneratedGate(nn.Module)" in prompt
+    assert "__init__(self, model_dim: int, num_experts: int)" in prompt
+    assert "self.base = nn.Linear(model_dim, num_experts, bias=False)" in prompt
+    assert "(..., model_dim)" in prompt and "(..., num_experts)" in prompt
+    assert "single tensor, not a tuple" in prompt
+    # The host owns the routing that follows the logits.
+    assert "softmax, top-k, the auxiliary loss and expert dispatch are handled by the host" in prompt
+    # Step zero must reproduce the copied native weight.
+    assert "reproduce self.base(x) exactly" in prompt
+    # The network is explicitly free.
+    assert "your choice" in prompt
+    assert "any torch.nn layers, modules or functional ops" in prompt
+    # Shapes are injected, and no concrete model is named.
+    assert "[(2048, 64)]" in prompt
+    assert "DeepSeek" not in prompt and "MoEGate" not in prompt
+    # Weight-level instructions are deliberately absent.
+    assert "nn.init.zeros_" not in prompt
+    assert "forbidden" not in prompt.lower()
+    # Output format.
+    assert "<gate>" in prompt
 
 
 def test_baseline_gate_satisfies_the_contract():
@@ -358,6 +348,67 @@ def test_generator_retries_after_invalid_source(tmp_path: Path):
 
 # ── CLI / validation ─────────────────────────────────────────────────────────
 
+def test_cli_exposes_random_init_flag(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py"])
+    assert parse_args().gate_random_init is False
+    monkeypatch.setattr(
+        sys, "argv", ["run_moe_gate_cycle.py", "--gate-random-init"]
+    )
+    assert parse_args().gate_random_init is True
+
+
+def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
+    """--gate-random-init must not copy the native router into the gate."""
+    import torch
+
+    from moe_cycle import cycle as cycle_module
+
+    recorded = {}
+
+    class _FakeSession:
+        installs = []
+        gate_source = None
+        model = object()
+
+        def replace_source(self, source, **kwargs):
+            recorded["replace_kwargs"] = kwargs
+            return []
+
+        def freeze_except_gates(self):
+            recorded["frozen"] = True
+
+    class _FakeContext:
+        args = SimpleNamespace(
+            seed=1,
+            layers=None,
+            router_top_k=None,
+            gate_source=None,
+            gate_class="LLMGeneratedGate",
+            gate_init_noise_scale=0.0,
+            gate_random_init=True,
+            load_in_8bit=False,
+        )
+        session = _FakeSession()
+        gate_dir = tmp_path
+        sample_input = None
+        native_logits = torch.zeros(1)
+        native_repeatable = True
+        native_repeat_max_abs_difference = 0.0
+        gate_source = "class LLMGeneratedGate: pass"
+
+    monkeypatch.setattr(
+        cycle_module, "_model_logits",
+        lambda model, sample_input: torch.zeros(1),
+    )
+    monkeypatch.setattr(
+        cycle_module, "_perturb_gate_weights", lambda installs, scale, seed: []
+    )
+
+    cycle_module._install_and_verify(_FakeContext())
+
+    assert recorded["replace_kwargs"]["initialize_from_original"] is False
+
+
 def test_cli_exposes_outer_search_flag(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py"])
     args = parse_args()
@@ -377,6 +428,7 @@ def test_cli_removed_obsolete_outer_sft_flags(monkeypatch):
 def _validate_namespace(**overrides):
     defaults = dict(
         gate_outer_search=True, gate_source=None, repetition_penalty=1.0,
+        gate_random_init=False,
         generation_backend="pipeline", fixed_evaluation_prompts=False,
         gate_candidates=1, max_length=1, batch_size=1,
         gradient_checkpointing=True,

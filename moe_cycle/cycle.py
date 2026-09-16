@@ -136,6 +136,11 @@ def _initial_feedback_summary(gate_source: str | None) -> str:
 
 def _validate_args(args: Namespace) -> None:
     """Reject unsupported or contradictory CLI combinations early."""
+    if args.gate_random_init:
+        if args.gate_source is None:
+            raise ValueError("--gate-random-init requires --gate-source")
+        if args.gate_init_noise_scale != 0:
+            raise ValueError("--gate-random-init requires --gate-init-noise-scale 0")
     if args.gate_outer_search and args.gate_source is not None:
         raise ValueError(
             "--gate-outer-search generates gates itself; do not pass --gate-source"
@@ -357,7 +362,10 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
         if not args.gate_source.is_file():
             raise FileNotFoundError(f"Gate source file does not exist: {args.gate_source}")
         source = args.gate_source.read_text(encoding="utf-8")
-        _validate_gate_source(source, ctx.shapes, class_name=args.gate_class)
+        _validate_gate_source(
+            source, ctx.shapes, class_name=args.gate_class,
+            require_base=not args.gate_random_init,
+        )
     else:
         source = _generate_gate(
             proposal_chat or ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
@@ -393,9 +401,7 @@ def _install_and_verify(ctx: RunContext) -> None:
         "top_k": args.router_top_k,
         "allow_remote_code": True,
         "dynamic_discovery": False,
-        # Exact copy of the native router weights: replacement must behave
-        # bit-identically at step zero before training starts.
-        "initialize_from_original": True,
+        "initialize_from_original": not args.gate_random_init,
     }
     session.replace_source(
         ctx.gate_source,
@@ -406,7 +412,7 @@ def _install_and_verify(ctx: RunContext) -> None:
         ),
         **replace_kwargs,
     )
-    initialization_metrics = _perturb_gate_weights(
+    initialization_metrics = [] if args.gate_random_init else _perturb_gate_weights(
         session.installs, args.gate_init_noise_scale, args.seed
     )
     (gate_dir / "initialization_metrics.json").write_text(
@@ -423,7 +429,7 @@ def _install_and_verify(ctx: RunContext) -> None:
         "rtol": 1e-5,
         "atol": 1e-5,
         "gate_init_noise_scale": args.gate_init_noise_scale,
-        "initialize_from_original": True,
+        "initialize_from_original": not args.gate_random_init,
         "load_in_8bit": args.load_in_8bit,
         "native_forward_bit_repeatable": ctx.native_repeatable,
         "native_repeat_max_abs_logit_difference": ctx.native_repeat_max_abs_difference,
@@ -432,7 +438,8 @@ def _install_and_verify(ctx: RunContext) -> None:
         json.dumps(equivalence, indent=2), encoding="utf-8",
     )
     if (
-        args.gate_init_noise_scale == 0
+        not args.gate_random_init
+        and args.gate_init_noise_scale == 0
         and not equivalent
     ):
         raise RuntimeError(
@@ -507,7 +514,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         (epoch_path / "routing_mode.json").write_text(
             json.dumps({
                 "gate_implementation": args.gate_implementation,
-                "initialize_from_original": True,
+                "initialize_from_original": not args.gate_random_init,
             }, indent=2),
             encoding="utf-8",
         )

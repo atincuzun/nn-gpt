@@ -43,6 +43,8 @@ def _validate_gate_source(
     source: str,
     shapes: list[tuple[int, int]],
     class_name: str = "LLMGeneratedGate",
+    *,
+    require_base: bool = True,
 ) -> None:
     import torch
     import torch.nn as nn
@@ -70,7 +72,10 @@ def _validate_gate_source(
         if any(isinstance(module, (nn.Dropout, nn.modules.batchnorm._BatchNorm)) for module in gate.modules()):
             raise ValueError("Generated gates must be deterministic; dropout/batchnorm are unsupported")
         base = getattr(gate, "base", None)
-        if not isinstance(base, nn.Linear) or tuple(base.weight.shape) != (num_experts, model_dim):
+        if require_base and (
+            not isinstance(base, nn.Linear)
+            or tuple(base.weight.shape) != (num_experts, model_dim)
+        ):
             raise ValueError(
                 "Generated gate must define base = nn.Linear(model_dim, num_experts, bias=False)"
             )

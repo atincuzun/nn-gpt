@@ -77,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Gaussian initialization noise as a fraction of each native gate weight std",
     )
+    parser.add_argument(
+        "--gate-random-init",
+        action="store_true",
+        help="Use --gate-source constructor initialization without copying native "
+        "router weights or requiring a base projection. Requires zero initialization noise.",
+    )
     parser.add_argument("--gate-generation-attempts", type=int, default=3)
     parser.add_argument(
         "--gate-candidates",
