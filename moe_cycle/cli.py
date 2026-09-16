@@ -228,6 +228,18 @@ def parse_args() -> argparse.Namespace:
         "of per-epoch mean CV accuracies.",
     )
     parser.add_argument(
+        "--gate-author",
+        choices=("native", "last", "best"),
+        default="native",
+        help="Router state the LLM authors the next gate under (requires "
+        "--gate-outer-search). 'native' restores the original routers before each "
+        "proposal (default, comparable baseline). 'last' installs the previous "
+        "candidate's trained weights while proposing. 'best' installs the "
+        "best-scoring trained gate so far. Scores stay comparable in every mode "
+        "because each candidate still trains from a fresh native-copy "
+        "initialization.",
+    )
+    parser.add_argument(
         "--gate-phase-b",
         action="store_true",
         help="Reserved Phase B switch: train the LLM on accumulated (lower -> higher) "

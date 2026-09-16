@@ -59,6 +59,7 @@ class RunContext:
     gate_epoch_metrics: list = field(default_factory=list)
     reference_gate_id: int | None = None
     outer_summary: dict | None = None
+    author_gate_id: int | None = None
 
 
 def _log_cuda_memory(label: str) -> dict[str, float] | None:
@@ -144,6 +145,11 @@ def _validate_args(args: Namespace) -> None:
     if args.gate_outer_search and args.gate_source is not None:
         raise ValueError(
             "--gate-outer-search generates gates itself; do not pass --gate-source"
+        )
+    if args.gate_author != "native" and not args.gate_outer_search:
+        raise ValueError(
+            "--gate-author last/best installs a trained gate while proposing and "
+            "only makes sense with --gate-outer-search"
         )
     if getattr(args, "gate_phase_b", False):
         raise NotImplementedError(
@@ -378,6 +384,69 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
     ctx.used_prompts.clear()
 
 
+def _prepare_model_for_generation(ctx: RunContext) -> None:
+    """Put the model into the state generation runs under (eval, KV cache, no
+    activation checkpointing), both for CV generation and gate proposals."""
+    session = ctx.session
+    session.model.eval()
+    session.model.config.use_cache = True
+    if ctx.args.gradient_checkpointing and hasattr(session.model, "gradient_checkpointing_disable"):
+        session.model.gradient_checkpointing_disable()
+
+
+def _select_author_gate_id(mode: str, gate_id: int, gate_root) -> int | None:
+    """Which trained gate (if any) authors round ``gate_id``'s proposal.
+
+    ``native`` (and round 0) propose with the original routers. ``last`` chains
+    to the previous candidate. ``best`` installs the highest-scoring eligible
+    gate, falling back to native while the store has no eligible gate yet.
+    """
+    if mode == "native" or gate_id == 0:
+        return None
+    if mode == "last":
+        return gate_id - 1
+    if mode == "best":
+        from .gate_store import best_gate
+
+        reference = best_gate(gate_root)
+        return reference.get("gate_id") if reference is not None else None
+    raise ValueError(f"unknown gate author mode {mode!r}")
+
+
+def _install_author_gate(ctx: RunContext, author_gate_id: int) -> None:
+    """Install a previously trained gate so the LLM authors the next proposal
+    with that routing active.
+
+    No equivalence checks: trained weights are not bit-exact with the native
+    router by design. Must run inside ``with ctx.session:`` with no gates
+    currently installed.
+    """
+    args = ctx.args
+    from .gate_store import gate_dir as store_gate_dir
+
+    author_root = store_gate_dir(ctx.gate_root, author_gate_id)
+    checkpoint = author_root / "epochs" / f"A{args.epochs - 1}" / "gate_post_train"
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(f"Author gate checkpoint not found: {checkpoint}")
+    session = ctx.session
+    session.replace_source(
+        (author_root / "gate.py").read_text(encoding="utf-8"),
+        class_name="LLMGeneratedGate",
+        layers=args.layers,
+        sample_input=ctx.sample_input,
+        verify=False,
+        top_k=args.router_top_k,
+        allow_remote_code=True,
+        dynamic_discovery=False,
+        initialize_from_original=True,
+    )
+    session.load_weights(checkpoint)
+    print(
+        f"[GATE AUTHOR] gate {args.gate_author} mode: next proposal is authored "
+        f"under trained gate {author_gate_id:03d} ({checkpoint})"
+    )
+
+
 def _install_and_verify(ctx: RunContext) -> None:
     """Install replacement gates, verify step-zero equivalence, and freeze.
 
@@ -525,10 +594,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         # ── 1. Generate NN architectures + evaluate (like nn_gen in tune()) ──
 
         session.save(epoch_path / "gate_pre_generation")
-        session.model.eval()
-        session.model.config.use_cache = True
-        if args.gradient_checkpointing and hasattr(session.model, "gradient_checkpointing_disable"):
-            session.model.gradient_checkpointing_disable()
+        _prepare_model_for_generation(ctx)
 
         # Candidates are compared on CV accuracy, so a candidate's own gate
         # code/score must never leak into the prompt it is being scored on;
@@ -850,6 +916,8 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "gate_code": ctx.gate_source,
         "structural_hash": structural_hash(ctx.gate_source),
         "reference_gate_id": ctx.reference_gate_id,
+        "author_mode": ctx.args.gate_author,
+        "author_gate_id": ctx.author_gate_id,
         "score": score,
         "epochs": ctx.gate_epoch_metrics,
     }
@@ -899,6 +967,7 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         ),
         "epochs": args.epochs,
         "gate_candidates": args.gate_candidates,
+        "gate_author": args.gate_author,
         "gate_outer_search": ctx.outer_summary,
         "run_root": str(ctx.run_root),
     }
@@ -940,7 +1009,11 @@ def _outer_feedback_block(root: Path, reference: dict | None) -> str:
 
 
 def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
-    """Propose the next gate while the native router is active.
+    """Propose the next gate under the currently installed routing.
+
+    With ``--gate-author native`` (and for round 0) that is the native router.
+    With ``last``/``best`` the caller has already installed the corresponding
+    trained gate, so the proposal is authored by the improved composite.
 
     Round 0 bootstraps from the baseline contract.  Later rounds condition on the
     best prior gate (code plus measured mean accuracy) and a compact summary of
@@ -986,10 +1059,23 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
     seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
 
     for gate_id in range(args.gate_candidates):
-        _propose_gate(ctx, gate_id, seen_hashes)
-        # The session context restores the native router after every candidate,
-        # so no candidate inherits another candidate's trained gate weights.
+        author_gate_id = _select_author_gate_id(args.gate_author, gate_id, ctx.gate_root)
+        ctx.author_gate_id = author_gate_id
+        if args.gate_author == "best" and gate_id > 0 and author_gate_id is None:
+            print("[GATE AUTHOR] no eligible best gate yet; proposing under native routing")
+        if author_gate_id is None:
+            # Round 0 and native mode: the proposal is authored with the native
+            # router active, outside the session.
+            _propose_gate(ctx, gate_id, seen_hashes)
         with ctx.session:
+            if author_gate_id is not None:
+                # The trained gate authors the proposal; afterwards the native
+                # router is restored so the fresh candidate still verifies
+                # bit-exact against native at step zero.
+                _install_author_gate(ctx, author_gate_id)
+                _prepare_model_for_generation(ctx)
+                _propose_gate(ctx, gate_id, seen_hashes)
+                ctx.session.restore()
             _install_and_verify(ctx)
             epoch_paths = _run_epochs(ctx)
         candidate_epochs.append(epoch_paths)

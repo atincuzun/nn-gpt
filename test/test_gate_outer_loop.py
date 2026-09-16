@@ -1,5 +1,6 @@
 """Tests for the self-improving MoE gate search (propose, measure, revise)."""
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -426,7 +427,7 @@ def test_cli_removed_obsolete_outer_sft_flags(monkeypatch):
 def _validate_namespace(**overrides):
     defaults = dict(
         gate_outer_search=True, gate_source=None, repetition_penalty=1.0,
-        gate_random_init=False,
+        gate_random_init=False, gate_author="native",
         generation_backend="pipeline", fixed_evaluation_prompts=False,
         gate_candidates=1, max_length=1, batch_size=1,
         gradient_checkpointing=True,
@@ -442,6 +443,84 @@ def test_validate_args_rejects_gate_source_with_outer_search():
 
 def test_validate_args_allows_outer_search_without_gate_source():
     _validate_args(_validate_namespace())
+
+
+def test_validate_args_gate_author_modes_require_outer_search():
+    with pytest.raises(ValueError, match="gate-author"):
+        _validate_args(_validate_namespace(gate_outer_search=False, gate_author="last"))
+    with pytest.raises(ValueError, match="gate-author"):
+        _validate_args(_validate_namespace(gate_outer_search=False, gate_author="best"))
+    _validate_args(_validate_namespace(gate_outer_search=False, gate_author="native"))
+    _validate_args(_validate_namespace(gate_author="last"))
+    _validate_args(_validate_namespace(gate_author="best"))
+
+
+# ── gate author state (--gate-author) ────────────────────────────────────────
+
+def test_cli_gate_author_defaults_to_native(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py"])
+    assert parse_args().gate_author == "native"
+
+
+def test_cli_gate_author_accepts_last_and_best(monkeypatch):
+    for value in ("last", "best"):
+        monkeypatch.setattr(
+            sys, "argv",
+            ["run_moe_gate_cycle.py", "--gate-outer-search", "--gate-author", value],
+        )
+        assert parse_args().gate_author == value
+
+
+def test_cli_gate_author_rejects_unknown_choice(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["run_moe_gate_cycle.py", "--gate-author", "both"],
+    )
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_author_gate_id_selection(tmp_path: Path):
+    from moe_cycle.cycle import _select_author_gate_id
+
+    # native mode and round 0 never install an author gate
+    assert _select_author_gate_id("native", 3, tmp_path) is None
+    assert _select_author_gate_id("last", 0, tmp_path) is None
+    assert _select_author_gate_id("best", 0, tmp_path) is None
+
+    # last mode chains to the previous candidate
+    assert _select_author_gate_id("last", 2, tmp_path) == 1
+
+    # best mode picks the highest-scoring eligible gate, or falls back to native
+    _write_gate(tmp_path, 0, 0.40)
+    _write_gate(tmp_path, 1, 0.55)
+    _write_gate(tmp_path, 2, 0.90, eligible=False)  # ineligible gates are ignored
+    assert _select_author_gate_id("best", 3, tmp_path) == 1
+    assert _select_author_gate_id("best", 1, tmp_path / "empty") is None
+
+    with pytest.raises(ValueError, match="unknown gate author mode"):
+        _select_author_gate_id("chain", 1, tmp_path)
+
+
+def test_gate_record_stores_author_state(tmp_path: Path):
+    from moe_cycle.cycle import _write_gate_record
+
+    ctx = SimpleNamespace(
+        args=SimpleNamespace(gate_author="best"),
+        candidate_index=2,
+        gate_source=DISTINCT_GATE,
+        reference_gate_id=1,
+        gate_epoch_metrics=[_epoch(0.42, 0.5, 2, 2)],
+        gate_root=tmp_path,
+        author_gate_id=1,
+    )
+    record = _write_gate_record(ctx)
+    assert record["author_mode"] == "best"
+    assert record["author_gate_id"] == 1
+    stored = json.loads(
+        (tmp_path / "gate_002" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert stored["author_mode"] == "best"
+    assert stored["author_gate_id"] == 1
 
 
 def test_feedback_block_covers_prior_gates(tmp_path: Path):
