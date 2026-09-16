@@ -6,7 +6,26 @@ import argparse
 import json
 from pathlib import Path
 
-from ab.gpt.util.Const import DEFAULT_NN_PREFIXES
+# Comprehensive LEMUR family census (nn-gpt/db/ab.nn.db): every prefix below has
+# img-classification accuracy rows in the stat table. Prefixes are applied as
+# case-insensitive SQL "nn LIKE 'prefix%'" OR-chains, so 'alt' covers
+# alt-nn1..6/alt-1nn, 'rl-' covers rl-bb-*/rl-init*, 'llr' covers llr2/llr3,
+# 'ast-' covers ast-dimension/ast-activation, 'MoE' covers MoE4Own/MoE4/MoEv*,
+# and 'ResNet'/'UNet' also match RESNETLSTM/ResNetTransformer/UNet2D via LIKE.
+# Defined here (not in the shared Const.py) so the MoE cycle can train on the
+# full corpus without changing the upstream default corpus.
+GATE_CYCLE_NN_PREFIXES = (
+    # LLM-generated experiment families (bulk of the corpus)
+    'ga-', 'GenFractalNet', 'unq', 'rag', 'alt', 'rl-', 'llr', 'del',
+    'ast-', 'MoE', 'l1', 'l2', 'l3', 'moe-gate-cycle',
+    # Classical / torchvision families
+    'AlexNet', 'AirNet', 'AirNext', 'BagNet', 'BayesianNet', 'ComplexNet',
+    'ConvNeXt', 'DPN', 'DarkNet', 'DenseNet', 'Diffuser', 'EfficientNet',
+    'FractalNet', 'GoogLeNet', 'ICNet', 'InceptionV3', 'LSTM', 'MaxVit',
+    'MNASNet', 'MobileNet', 'RegNet', 'ResNet', 'RNN', 'ShuffleNet',
+    'SqueezeNet', 'SwinTransformer', 'TitanV', 'UNet', 'VGG',
+    'VisionTransformer',
+)
 
 
 def _json_object(value: str) -> dict[str, object]:
@@ -101,30 +120,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-prompts", type=int, default=4096)
     parser.add_argument(
         "--train-prompt-config",
-        default="NN_gate.json",
-        help="Feedback-aware prompt config under ab/gpt/conf/prompt/train",
+        default="NN_gen.json",
+        help="Paired SFT prompt config under ab/gpt/conf/prompt/train; the "
+        "upstream NN_gen.json is the default so gate training sees the same "
+        "distribution as the LoRA pipeline",
     )
     parser.add_argument(
         "--test-prompt-config",
-        default="NN_gate.json",
-        help="Feedback-aware prompt config under ab/gpt/conf/prompt/test",
+        default="NN_gen.json",
+        help="Generation prompt config under ab/gpt/conf/prompt/test; the "
+        "upstream NN_gen.json is the default",
     )
     parser.add_argument("--dataset", default="cifar-10")
     parser.add_argument(
         "--sft-nn-prefixes",
         nargs="+",
-        default=list(DEFAULT_NN_PREFIXES),
+        default=list(GATE_CYCLE_NN_PREFIXES),
         help="LEMUR model prefixes used for paired gate-training examples. "
-        "Defaults to the full LEMUR family census (see ab.gpt.util.Const). "
+        "Defaults to the full LEMUR family census (GATE_CYCLE_NN_PREFIXES). "
         "The current --nn-name-prefix is added automatically.",
     )
     parser.add_argument(
         "--generation-nn-prefixes",
         nargs="+",
-        default=list(DEFAULT_NN_PREFIXES),
+        default=list(GATE_CYCLE_NN_PREFIXES),
         help="LEMUR prefixes used as CV generation seeds (nn_gen samples one "
         "record per model). Defaults to the full LEMUR family census "
-        "(see ab.gpt.util.Const). The current --nn-name-prefix is added "
+        "(GATE_CYCLE_NN_PREFIXES). The current --nn-name-prefix is added "
         "automatically.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
@@ -149,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf-keys",
         nargs="+",
-        default=["improve_classification_gate_feedback"],
+        default=["improvement_classification_codeonly"],
     )
     parser.add_argument("--nn-name-prefix", default="moe-gate-cycle")
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16")
@@ -197,13 +219,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(gradient_checkpointing=True)
     parser.add_argument("--local-files-only", action="store_true")
-    parser.add_argument(
-        "--no-gate-feedback",
-        action="store_true",
-        help="Omit cycle feedback text from generation and training prompts "
-        "(feedback is still built and saved to disk). Useful for isolating "
-        "the effect of explicit text feedback vs implicit LEMUR DB feedback.",
-    )
     parser.add_argument(
         "--gate-outer-search",
         action="store_true",

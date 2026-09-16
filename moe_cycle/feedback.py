@@ -1,4 +1,7 @@
-"""Measured NAS feedback summaries injected into generation and training prompts."""
+"""Measured NAS feedback summaries recorded per epoch and used by the outer
+gate-proposal prompt. Deliberately never injected into CV generation or
+gate-training prompts: candidates must be scored and trained on identical
+prompt distributions to stay comparable."""
 
 from __future__ import annotations
 
@@ -47,7 +50,8 @@ def _build_gate_feedback_summary(
     cycle_results: dict,
     session: Any,
 ) -> dict:
-    """Compose the per-cycle gate outcome report injected into the training prompt.
+    """Compose the per-cycle gate outcome report saved next to the epoch and
+    summarized for the next outer proposal prompt.
 
     Reports the gate code that generated the cycle, candidate validity, measured
     accuracy, and improvement relative to each candidate's source architecture.

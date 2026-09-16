@@ -138,7 +138,6 @@ def build_nngenprompt_dataloaders(
     validation_fraction: float = 0.1,
     seed: int = 42,
     pad_to_multiple_of: Optional[int] = 8,
-    gate_summary: Optional[str] = None,
     dataset_name: Optional[str] = None,
     nn_prefixes: Optional[tuple[str, ...]] = None,
     **_ignored,
@@ -161,7 +160,6 @@ def build_nngenprompt_dataloaders(
             context_length,
             tokenizer,
             runtime_prompt_config,
-            extra_static_values={"gate_summary": gate_summary or ""},
         )
         dataset = _completion_only_dataset(
             processor,

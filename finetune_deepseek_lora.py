@@ -39,17 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-config",
         type=Path,
-        default=Path("ab/gpt/conf/prompt/train/NN_gate.json"),
-        help="Train prompt config (default: the MoE-gate NAS prompt)",
-    )
-    parser.add_argument(
-        "--gate-summary",
-        default=(
-            "No measured NAS cycle feedback is available yet. "
-            "Prioritize complete, executable LEMUR candidates that follow the "
-            "NN interface exactly."
-        ),
-        help="Text injected into the {gate_summary} placeholder during pre-finetune",
+        default=Path("ab/gpt/conf/prompt/train/NN_gen.json"),
+        help="Train prompt config (default: the upstream paired NN-gen prompt)",
     )
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -139,7 +130,6 @@ def main() -> None:
         batch_size=args.batch_size,
         validation_fraction=args.validation_fraction,
         seed=args.seed,
-        gate_summary=args.gate_summary,
     )
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(

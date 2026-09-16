@@ -18,7 +18,8 @@ GATE_SYSTEM_PROMPT = (
     "The supplied interface constrains compatibility, not your architectural creativity."
 )
 
-# Baseline reference for the first round, mirroring Gate_gen_with_gate.json.
+# Baseline reference for the first round (heritage: the removed
+# Gate_gen_with_gate.json experiment config).
 BASELINE_GATE_CODE = (
     "import torch\n"
     "import torch.nn as nn\n\n"

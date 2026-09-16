@@ -99,27 +99,27 @@ def _generation_prefixes(args: Namespace) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if value))
 
 
-def _prompt_dict_with_feedback(
+def _pinned_prompt_dict(
     prompt_dict: dict[str, Any],
     conf_keys: tuple[str, ...] | list[str],
-    feedback_summary: str,
     *,
     dataset: str,
     nn_prefixes: tuple[str, ...],
 ) -> dict[str, Any]:
-    """Render MoE-cycle feedback without modifying the shared nn_gen function."""
+    """Pin the shared CV prompt config to the run's dataset and seed prefixes
+    without modifying the shared nn_gen function.
+
+    Gate feedback deliberately never enters CV generation or gate-training
+    prompts: candidates are compared on CV accuracy, so a candidate's own gate
+    code/score must never leak into the prompt it is scored or trained on.
+    """
     rendered = copy.deepcopy(prompt_dict)
-    escaped_feedback = feedback_summary.replace("{", "{{").replace("}", "}}")
     for key in conf_keys:
         if key not in rendered:
             raise KeyError(f"Prompt key {key!r} is missing from the test prompt config")
         key_config = rendered[key]
         key_config["dataset"] = dataset
         key_config["nn_prefixes"] = list(nn_prefixes)
-        key_config["prompt"] = [
-            line.replace("{gate_summary}", escaped_feedback)
-            for line in key_config["prompt"]
-        ]
     return rendered
 
 
@@ -374,9 +374,7 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
         )
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
-    ctx.previous_feedback_summary = (
-        _initial_feedback_summary(source) if not args.no_gate_feedback else ""
-    )
+    ctx.previous_feedback_summary = _initial_feedback_summary(source)
     ctx.used_prompts.clear()
 
 
@@ -479,8 +477,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
 
     for epoch in range(args.epochs):
         print(f"\n{'='*60}\n  EPOCH {epoch} / {args.epochs}\n{'='*60}\n")
-        if args.no_gate_feedback:
-            print("[FEEDBACK] Gate feedback text omitted from prompts (--no-gate-feedback)")
         _seed_all(args.seed + epoch)
         if ctx.candidate_root is None:
             raise RuntimeError("Gate candidate was not prepared")
@@ -535,14 +531,12 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             session.model.gradient_checkpointing_disable()
 
         # Candidates are compared on CV accuracy, so a candidate's own gate
-        # code/score must never leak into the prompt it is being scored on.
-        gen_feedback = "" if outer_mode else (
-            ctx.previous_feedback_summary if not args.no_gate_feedback else ""
-        )
-        generation_prompt_dict = _prompt_dict_with_feedback(
+        # code/score must never leak into the prompt it is being scored on;
+        # gate feedback therefore lives only in the outer proposal prompt and
+        # the on-disk records.
+        generation_prompt_dict = _pinned_prompt_dict(
             ctx.prompt_dict,
             args.conf_keys,
-            gen_feedback,
             dataset=args.dataset,
             nn_prefixes=generation_prefixes,
         )
@@ -617,10 +611,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         # ── 2. Build training data from real evaluated LEMUR results ──
 
         try:
-            train_gate_summary = (
-                "" if outer_mode
-                else gate_feedback["summary"] if not args.no_gate_feedback else ""
-            )
             train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
                 tokenizer,
                 train_prompt_path,
@@ -630,7 +620,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 batch_size=args.batch_size,
                 validation_fraction=args.validation_fraction,
                 seed=args.seed + epoch,
-                gate_summary=train_gate_summary,
                 dataset_name=args.dataset,
                 nn_prefixes=training_prefixes,
             )
@@ -763,8 +752,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             "validation_loss": validation_loss,
             "current_cycle_cv_success": cycle_cv_success,
             "current_cycle_models_trained": cycle_models_trained,
-            "gate_feedback_enabled": not args.no_gate_feedback,
-            "prompt_feedback_injected": not args.no_gate_feedback and not outer_mode,
             "outer_gate_search": outer_mode,
             "train_prompt_config": args.train_prompt_config,
             "test_prompt_config": args.test_prompt_config,
@@ -896,7 +883,6 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
         "generation_backend": "upstream_default",
         "fixed_evaluation_prompts": False,
-        "gate_outcome_prompt_feedback": not args.no_gate_feedback,
         "train_prompt_config": args.train_prompt_config,
         "test_prompt_config": args.test_prompt_config,
         "dataset": args.dataset,

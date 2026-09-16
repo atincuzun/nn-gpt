@@ -25,22 +25,13 @@ class NNGenPrompt(Prompt):
     Assumes the existence of accuracies.json and folder-based dataset
     """
 
-    def __init__(
-        self,
-        max_len: int,
-        tokenizer: PreTrainedTokenizerBase,
-        prompts_path,
-        data_dir=None,
-        *,
-        extra_static_values=None,
-    ):
+    def __init__(self, max_len: int, tokenizer: PreTrainedTokenizerBase, prompts_path, data_dir=None):
         super().__init__(max_len, tokenizer)
         self.prompts_path = prompts_path
         # When set, SFT trains on this on-disk chat corpus (data_dir/train.jsonl)
         # instead of querying LEMUR. Used by the iterative pipeline so each cycle's
         # fine-tuning uses its growing curated corpus, closing the feedback loop.
         self.data_dir = data_dir
-        self.extra_static_values = dict(extra_static_values or {})
 
     def _raw_dataset_from_disk(self, n_training_prompts=None) -> DataFrame:
         """Build the SFT frame from a pipeline corpus of chat 'messages' rows
@@ -184,12 +175,6 @@ class NNGenPrompt(Prompt):
                 nn_code_max_chars = key_dict.get('nn_code_max_chars')
                 if nn_code_max_chars and 'nn_code' in para_dict and isinstance(para_dict['nn_code'], str):
                     para_dict['nn_code'] = para_dict['nn_code'][:nn_code_max_chars]
-
-                # Inject static config-provided placeholder values (not from DB)
-                static_values = dict(key_dict.get('static_values', {}))
-                static_values.update(self.extra_static_values)
-                for placeholder_name, value in static_values.items():
-                    para_dict[placeholder_name] = value
 
                 # Inject columns referenced in the output template but absent from input_list
                 if key_dict.get('output_type') == 'classification':

@@ -239,29 +239,27 @@ def test_sft_example_does_not_leak_score_into_input():
     assert assistant == "<gate>\n" + DISTINCT_GATE.strip() + "\n</gate>"
 
 
-def test_prompt_stays_short_and_states_only_the_contract():
-    """The prompt states the seam only; the network stays undefined on purpose."""
+def test_prompt_states_the_contract_and_leaves_the_architecture_open():
+    """The prompt pins the runtime contract; the network design stays open."""
     prompt = gate_proposal_prompt([(2048, 64)])
-    assert len(prompt) < 1200, "prompt over-specified"
+    assert len(prompt) < 4096, "prompt over-specified for the proposal context"
     # The seam.
     assert "LLMGeneratedGate(nn.Module)" in prompt
     assert "__init__(self, model_dim: int, num_experts: int)" in prompt
     assert "self.base = nn.Linear(model_dim, num_experts, bias=False)" in prompt
     assert "(..., model_dim)" in prompt and "(..., num_experts)" in prompt
-    assert "single tensor, not a tuple" in prompt
+    assert "a single tensor" in prompt
     # The host owns the routing that follows the logits.
-    assert "softmax, top-k, the auxiliary loss and expert dispatch are handled by the host" in prompt
+    assert "Softmax, top-k, auxiliary loss, and expert dispatch are handled by the host" in prompt
     # Step zero must reproduce the copied native weight.
     assert "reproduce self.base(x) exactly" in prompt
     # The network is explicitly free.
-    assert "your choice" in prompt
-    assert "any torch.nn layers, modules or functional ops" in prompt
+    assert "choose the internal structure yourself" in prompt
+    assert "Invent an expressive, nonlinear network" in prompt
+    assert "Derive dimensions from model_dim and num_experts" in prompt
     # Shapes are injected, and no concrete model is named.
     assert "[(2048, 64)]" in prompt
     assert "DeepSeek" not in prompt and "MoEGate" not in prompt
-    # Weight-level instructions are deliberately absent.
-    assert "nn.init.zeros_" not in prompt
-    assert "forbidden" not in prompt.lower()
     # Output format.
     assert "<gate>" in prompt
 

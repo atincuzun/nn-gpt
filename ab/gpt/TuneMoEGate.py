@@ -19,8 +19,8 @@ from ab.gpt.util.Const import (
 # ── Defaults (minimal — gate experiment bypasses PEFT/LoRA) ────────────────
 LLM_CONF = "deepseek_v2_lite_moe_gate_exp.json"
 LLM_TUNE_CONF = "NN_gen.json"
-NN_GEN_CONF = "Gate_gen_with_gate.json"
-CONF_KEYS = "improve_classification_gate"
+NN_GEN_CONF = "NN_gen.json"
+CONF_KEYS = "improvement_classification_codeonly"
 
 SKIP_EPOCHES = -1
 TEST_NN = 10

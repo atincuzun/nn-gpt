@@ -13,24 +13,7 @@ new_out_file = 'full_output.txt'
 # generation-seed selection (the in-context example models shown to the LLM),
 # so the two paths cannot silently drift apart.
 DEFAULT_DATASET = 'cifar-10'
-# Comprehensive LEMUR family census (nn-gpt/db/ab.nn.db): every prefix below has
-# img-classification accuracy rows in the stat table. Prefixes are applied as
-# case-insensitive SQL "nn LIKE 'prefix%'" OR-chains, so 'alt' covers
-# alt-nn1..6/alt-1nn, 'rl-' covers rl-bb-*/rl-init*, 'llr' covers llr2/llr3,
-# 'ast-' covers ast-dimension/ast-activation, 'MoE' covers MoE4Own/MoE4/MoEv*,
-# and 'ResNet'/'UNet' also match RESNETLSTM/ResNetTransformer/UNet2D via LIKE.
-DEFAULT_NN_PREFIXES = (
-    # LLM-generated experiment families (bulk of the corpus)
-    'ga-', 'GenFractalNet', 'unq', 'rag', 'alt', 'rl-', 'llr', 'del',
-    'ast-', 'MoE', 'l1', 'l2', 'l3', 'moe-gate-cycle',
-    # Classical / torchvision families
-    'AlexNet', 'AirNet', 'AirNext', 'BagNet', 'BayesianNet', 'ComplexNet',
-    'ConvNeXt', 'DPN', 'DarkNet', 'DenseNet', 'Diffuser', 'EfficientNet',
-    'FractalNet', 'GoogLeNet', 'ICNet', 'InceptionV3', 'LSTM', 'MaxVit',
-    'MNASNet', 'MobileNet', 'RegNet', 'ResNet', 'RNN', 'ShuffleNet',
-    'SqueezeNet', 'SwinTransformer', 'TitanV', 'UNet', 'VGG',
-    'VisionTransformer',
-)
+DEFAULT_NN_PREFIXES = ('ga-', 'GenFractalNet')
 
 gpt = 'gpt'
 gpt_dir = ab_root_path / base_module / gpt

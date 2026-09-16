@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from moe_cycle.cli import parse_args
-from moe_cycle.cycle import _generation_prefixes, _nas_prefixes, _prompt_dict_with_feedback
+from moe_cycle.cycle import _generation_prefixes, _nas_prefixes, _pinned_prompt_dict
 from moe_cycle.feedback import _build_gate_feedback_summary
 from moe_gate_only.nngpt_data import (
     _completion_only_dataset,
@@ -132,7 +132,7 @@ def test_completion_only_dataset_masks_prompt_tokens() -> None:
 
 
 def test_runtime_prompt_config_overrides_only_temporary_copy(tmp_path: Path) -> None:
-    source = tmp_path / "NN_gate.json"
+    source = tmp_path / "NN_gen.json"
     original = {"gate": {"dataset": "old", "nn_prefixes": ["base"]}}
     source.write_text(json.dumps(original), encoding="utf-8")
 
@@ -148,27 +148,25 @@ def test_runtime_prompt_config_overrides_only_temporary_copy(tmp_path: Path) -> 
     assert json.loads(source.read_text(encoding="utf-8")) == original
 
 
-def test_generation_feedback_rendering_is_format_safe() -> None:
+def test_pinned_prompt_dict_overrides_only_a_copy() -> None:
     prompt_dict = {
         "gate": {
-            "prompt": ["Feedback: {gate_summary}", "Model: {nn_code}"],
+            "prompt": ["Model: {nn_code}"],
             "dataset": "old",
             "nn_prefixes": ["old"],
         }
     }
-    rendered = _prompt_dict_with_feedback(
+    rendered = _pinned_prompt_dict(
         prompt_dict,
         ["gate"],
-        'Gate returned {"expert": 2}',
         dataset="cifar-10",
         nn_prefixes=("ga-", "moe-gate-cycle"),
     )
 
-    text = "\n".join(rendered["gate"]["prompt"]).format(nn_code="Net()")
-    assert 'Gate returned {"expert": 2}' in text
     assert rendered["gate"]["dataset"] == "cifar-10"
     assert rendered["gate"]["nn_prefixes"] == ["ga-", "moe-gate-cycle"]
     assert prompt_dict["gate"]["dataset"] == "old"
+    assert prompt_dict["gate"]["nn_prefixes"] == ["old"]
 
 
 def test_generated_prefix_is_added_once() -> None:
@@ -210,7 +208,7 @@ def test_feedback_summary_reports_candidate_accuracy_delta(tmp_path: Path) -> No
     assert "delta=+0.1200" in feedback["summary"]
 
 
-def test_nn_gate_train_prompt_receives_feedback_and_generated_prefixes(
+def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
     monkeypatch,
 ) -> None:
     module = importlib.import_module("ab.gpt.util.prompt.NNGenPrompt")
@@ -248,23 +246,17 @@ def test_nn_gate_train_prompt_receives_feedback_and_generated_prefixes(
 
     config = (
         Path(__file__).resolve().parents[1]
-        / "ab/gpt/conf/prompt/train/NN_gate.json"
+        / "ab/gpt/conf/prompt/train/NN_gen.json"
     )
     with _runtime_prompt_config(
         config,
         dataset_name="cifar-10",
         nn_prefixes=("ga-", "GenFractalNet", "moe-gate-cycle"),
     ) as runtime_config:
-        processor = module.NNGenPrompt(
-            4096,
-            FakeTokenizer(),
-            runtime_config,
-            extra_static_values={"gate_summary": "cycle accuracy improved by 0.20"},
-        )
+        processor = module.NNGenPrompt(4096, FakeTokenizer(), runtime_config)
         raw = processor.get_raw_dataset(False, 1)
 
     assert len(raw) == 1
-    assert "cycle accuracy improved by 0.20" in raw.iloc[0]["instruction"]
     assert "class Net: improved = True" in raw.iloc[0]["response"]
     assert captured["dataset"] == "cifar-10"
     assert captured["nn_prefixes"] == ("ga-", "GenFractalNet", "moe-gate-cycle")

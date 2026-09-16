@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-config",
         type=Path,
-        default=Path("ab/gpt/conf/prompt/train/NN_gate.json"),
+        default=Path("ab/gpt/conf/prompt/train/NN_gen.json"),
     )
     parser.add_argument("--train-text", type=Path, help="UTF-8 file with one example per non-empty line")
     parser.add_argument("--output", type=Path, default=Path("out/moe_gate_standalone"))
