@@ -284,8 +284,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gate-min-pairs",
         type=int,
-        default=2,
-        help="Minimum comparable gate pairs required before a Phase B training batch runs",
+        default=1,
+        help="Minimum comparable gate pairs required before a Phase B training batch runs "
+        "(default 1: train whenever any (worse -> better) pair exists, matching the LoRA "
+        "path which SFTs on corpus data regardless of current-cycle success)",
     )
     parser.add_argument(
         "--gate-fresh-proposer",
