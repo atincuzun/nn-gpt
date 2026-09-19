@@ -318,13 +318,32 @@ def _setup_run(args: Namespace) -> RunContext:
     # constructed, so generation (proposals and CV NN code) flows through the
     # adapter for the rest of the run. Adapter parameters stay frozen except
     # during Phase B training batches.
+    merge_from = None
+    merged_from_version = None
     if getattr(args, "gate_outer_sft", False):
+        # Tune.py L1139-1142 pattern: continue from the newest persisted
+        # proposer adapter so outer-loop weights compound across runs.
+        if args.gate_store is not None and not args.gate_fresh_proposer:
+            persisted = args.gate_store.resolve() / "proposer"
+            if (persisted / "adapter" / "adapter_config.json").is_file():
+                merge_from = persisted / "adapter"
+                lineage_file = persisted / "lineage.json"
+                if lineage_file.is_file():
+                    try:
+                        merged_from_version = json.loads(
+                            lineage_file.read_text(encoding="utf-8")
+                        ).get("version")
+                    except (OSError, ValueError):
+                        merged_from_version = None
+                print(
+                    f"[GATE SEARCH] outer-loop SFT: continuing proposer from {merge_from}"
+                )
         from .phase_b import wrap_proposer_with_lora
 
-        wrap_proposer_with_lora(session, args)
+        wrap_proposer_with_lora(session, args, merge_from=merge_from)
     from .phase_b import llm_version
 
-    proposer_version = llm_version(session.model, args)
+    proposer_version = llm_version(session.model, args, merged_from=merged_from_version)
 
     chat_bot = ChatBot(
         session.model, tokenizer,
@@ -1248,16 +1267,37 @@ def _run_phase_b_batch(ctx: RunContext, batch_index: int) -> str | None:
         )
         return None
     adapter_dir = ctx.run_root / "proposer_adapters" / f"batch_{batch_index:03d}"
+    parent_version = ctx.llm_version
     train_proposer(
-        ctx.session.model,
+        ctx.session,
         ctx.tokenizer,
         pairs,
         ctx.args,
         ctx.shapes,
         adapter_dir,
     )
-    new_version = version_of(ctx.session.model, ctx.args)
-    print(f"[PHASE B] proposer version {ctx.llm_version} -> {new_version}")
+    new_version = version_of(ctx.session.model, ctx.args, merged_from=parent_version)
+    if ctx.args.gate_store is not None:
+        # Persist the newest adapter so the next run continues from it
+        # (Tune.py-style weight compounding across runs).
+        persisted = Path(ctx.args.gate_store).resolve() / "proposer"
+        (persisted / "adapter").mkdir(parents=True, exist_ok=True)
+        ctx.session.model.save_pretrained(persisted / "adapter")
+        (persisted / "lineage.json").write_text(
+            json.dumps({
+                "version": new_version,
+                "parent_version": parent_version,
+                "batch": batch_index,
+                "mode": ctx.args.gate_sft_mode,
+                "pairs": len(pairs),
+                "source_run": str(ctx.run_root),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"[GATE SEARCH] outer-loop SFT: persisted proposer adapter → {persisted / 'adapter'}"
+        )
+    print(f"[GATE SEARCH] outer-loop SFT: proposer version {parent_version} -> {new_version}")
     return new_version
 
 

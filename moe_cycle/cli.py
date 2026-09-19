@@ -288,6 +288,13 @@ def parse_args() -> argparse.Namespace:
         help="Minimum comparable gate pairs required before a Phase B training batch runs",
     )
     parser.add_argument(
+        "--gate-fresh-proposer",
+        action="store_true",
+        help="Ignore any proposer adapter persisted under --gate-store and start "
+        "outer-loop SFT from the base model. Without this flag the Tune.py-style "
+        "merge-and-continue is applied automatically when a persisted adapter exists.",
+    )
+    parser.add_argument(
         "--gate-no-rematch",
         action="store_true",
         help="Skip the incumbent re-measure that normally follows each Phase B batch. "
