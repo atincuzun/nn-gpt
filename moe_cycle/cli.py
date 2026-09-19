@@ -276,7 +276,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-sft-every", type=int, default=10)
     parser.add_argument("--gate-sft-steps", type=int, default=30)
     parser.add_argument("--gate-sft-lr", type=float, default=1e-4)
-    parser.add_argument("--gate-sft-mode", choices=("dpo", "sft"), default="dpo")
+    parser.add_argument("--gate-sft-mode", choices=("sft", "dpo"), default="sft",
+                        help="Phase B loss: sft imitates the higher-scoring gate "
+                        "code (default); dpo additionally contrasts it against "
+                        "the lower-scoring gate of each pair")
     parser.add_argument("--gate-sft-rank", type=int, default=16)
     parser.add_argument(
         "--gate-min-pairs",
