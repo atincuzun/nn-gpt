@@ -104,7 +104,9 @@ class PairBatch:
     higher_labels: list[int]
 
 
-def _tokenise_pair(pair: dict[str, Any], tokenizer: Any, shapes: Any) -> PairBatch:
+def _tokenise_pair(
+    pair: dict[str, Any], tokenizer: Any, shapes: Any, *, include_lower: bool = True
+) -> PairBatch:
     from .gate_prompt import gate_sft_examples
 
     example = gate_sft_examples([pair], shapes)[0]
@@ -120,9 +122,14 @@ def _tokenise_pair(pair: dict[str, Any], tokenizer: Any, shapes: Any) -> PairBat
         labels = [-100] * len(prompt_ids) + list(completion_ids)
         return ids, labels
 
-    lower_ids, lower_labels = build(
-        tokenizer(pair["lower_source"], add_special_tokens=False)["input_ids"]
-    )
+    # The lower side is only needed for the DPO contrast; SFT imitates the
+    # winner alone, so tokenising it there would be dead work.
+    if include_lower:
+        lower_ids, lower_labels = build(
+            tokenizer(pair["lower_source"], add_special_tokens=False)["input_ids"]
+        )
+    else:
+        lower_ids, lower_labels = [], []
     higher_ids, higher_labels = build(
         tokenizer(completion + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
     )
@@ -130,9 +137,13 @@ def _tokenise_pair(pair: dict[str, Any], tokenizer: Any, shapes: Any) -> PairBat
 
 
 def build_pair_batches(
-    pairs: list[dict[str, Any]], tokenizer: Any, shapes: Any
+    pairs: list[dict[str, Any]], tokenizer: Any, shapes: Any, *,
+    include_lower: bool = True,
 ) -> list[PairBatch]:
-    return [_tokenise_pair(pair, tokenizer, shapes) for pair in pairs]
+    return [
+        _tokenise_pair(pair, tokenizer, shapes, include_lower=include_lower)
+        for pair in pairs
+    ]
 
 
 def _completion_logprob_tensor(model: Any, input_ids: list[int], labels: list[int]):
@@ -168,7 +179,9 @@ def train_proposer(
     import torch
     import torch.nn.functional as F
 
-    batches = build_pair_batches(pairs, tokenizer, shapes)
+    batches = build_pair_batches(
+        pairs, tokenizer, shapes, include_lower=(args.gate_sft_mode == "dpo"),
+    )
     if not batches:
         raise RuntimeError("Phase B received no tokenisable gate pairs")
 
