@@ -122,14 +122,30 @@ def is_duplicate_gate(source: str, seen_hashes: set[str]) -> bool:
 
 
 def gate_sft_examples(pairs: list[dict], shapes) -> list[dict]:
-    """Phase B supervision: requirements -> higher-scoring gate source.
+    """Phase B supervision, LEMUR-CV style: (weaker gate + its score) -> better gate.
 
-    Quality selects the target; it is deliberately not shown as an input, so the
-    model learns the architecture rather than the score.
+    Mirrors the CV pipeline's paired examples: the weaker gate is the *input*
+    context — its code sits in the reference block and its measured accuracy in
+    the feedback block, exactly the fields a real proposal prompt carries — and
+    the higher-scoring gate is the target.  The target's own score is never
+    shown, so the model learns the architecture rather than the number.  The
+    training prompt therefore matches the inference-time proposal prompt in
+    shape, instead of a bare requirements prompt the model never sees again.
     """
-    prompt = gate_proposal_prompt(shapes)
     examples = []
     for pair in pairs:
+        lower_accuracy = pair.get("lower_accuracy")
+        feedback = ""
+        if lower_accuracy is not None:
+            feedback = (
+                f"- gate {pair.get('lower_gate_id', '?'):03d}: "
+                f"mean CV accuracy {lower_accuracy:.4f}\n"
+            )
+        prompt = gate_proposal_prompt(
+            shapes,
+            reference_source=pair.get("lower_source", ""),
+            feedback=feedback,
+        )
         examples.append({
             "pair_id": pair["pair_id"],
             "messages": [

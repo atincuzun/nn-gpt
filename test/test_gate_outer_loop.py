@@ -232,17 +232,26 @@ def test_prompt_scope_isolates_and_restores_cv_system_prompt():
     assert chatbot.system_prompt == "cv-system-prompt"
 
 
-def test_sft_example_does_not_leak_score_into_input():
+def test_sft_example_shows_loser_as_context_hides_target_score():
+    """LEMUR-CV style: the weaker gate + its score are the input; the
+    higher-scoring gate is the target and its own score stays hidden."""
     pair = {
         "pair_id": "p1",
+        "lower_gate_id": 5,
+        "higher_gate_id": 9,
         "higher_source": DISTINCT_GATE,
         "lower_source": GATE_SOURCE,
+        "lower_accuracy": 0.4566,
         "higher_accuracy": 0.77,
     }
     example = gate_sft_examples([pair], shapes=[(8, 4)])[0]
     user_prompt = example["messages"][1]["content"]
     assistant = example["messages"][2]["content"]
     assert example["messages"][0]["content"] == GATE_SYSTEM_PROMPT
+    # The loser is the conditioning context, code and score.
+    assert GATE_SOURCE.strip() in user_prompt
+    assert "0.4566" in user_prompt
+    # The target's architecture and score never leak into the input.
     assert DISTINCT_GATE.strip() not in user_prompt
     assert "0.77" not in user_prompt
     assert assistant == "<gate>\n" + DISTINCT_GATE.strip() + "\n</gate>"
