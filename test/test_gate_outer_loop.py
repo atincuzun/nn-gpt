@@ -37,17 +37,25 @@ GATE_SOURCE = (
     "class LLMGeneratedGate(nn.Module):\n"
     "    def __init__(self, model_dim: int, num_experts: int):\n"
     "        super().__init__()\n"
-    "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n\n"
+    "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
+    "        self.branch = nn.Linear(model_dim, num_experts, bias=False)\n"
+    "        nn.init.zeros_(self.branch.weight)\n\n"
     "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n"
-    "        return self.base(x)\n"
+    "        return self.base(x) + self.branch(x)\n"
 )
 
 # Same behaviour, different serialisation (whitespace/typing) -> duplicate.
 REFORMATTED_GATE = GATE_SOURCE.replace("model_dim: int", "model_dim:int")
-# Different behaviour -> distinct architecture.
+# Different structure -> distinct architecture (silent Tanh branch).
 DISTINCT_GATE = GATE_SOURCE.replace(
-    "        return self.base(x)\n",
-    "        return self.base(x) + 0.0 * self.base(x.detach())\n",
+    "        self.branch = nn.Linear(model_dim, num_experts, bias=False)\n"
+    "        nn.init.zeros_(self.branch.weight)\n",
+    "        self.branch = nn.Sequential(\n"
+    "            nn.Linear(model_dim, 2 * model_dim),\n"
+    "            nn.Tanh(),\n"
+    "            nn.Linear(2 * model_dim, num_experts, bias=False),\n"
+    "        )\n"
+    "        nn.init.zeros_(self.branch[-1].weight)\n",
 )
 
 
@@ -417,10 +425,14 @@ def test_cli_exposes_outer_search_flag(monkeypatch):
 
 
 def test_cli_removed_obsolete_outer_sft_flags(monkeypatch):
-    """The superseded adapter/benchmark flags must no longer exist."""
+    """Superseded adapter/benchmark flags must no longer exist.
+
+    ``gate_outer_sft`` is no longer in this list: it was dead-code scaffolding
+    when this test was written, and is now the implemented Phase B switch.
+    """
     monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py"])
     args = parse_args()
-    for obsolete in ("gate_outer_sft", "gate_proposer_steps", "gate_benchmark"):
+    for obsolete in ("gate_proposer_steps", "gate_benchmark"):
         assert not hasattr(args, obsolete)
 
 

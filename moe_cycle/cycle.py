@@ -60,6 +60,8 @@ class RunContext:
     reference_gate_id: int | None = None
     outer_summary: dict | None = None
     author_gate_id: int | None = None
+    llm_version: str = "base"
+    rematch_for: int | None = None
 
 
 def _log_cuda_memory(label: str) -> dict[str, float] | None:
@@ -153,11 +155,18 @@ def _validate_args(args: Namespace) -> None:
         )
     if getattr(args, "gate_phase_b", False):
         raise NotImplementedError(
-            "Phase B (training the LLM on gate pairs) is not implemented yet. "
-            "Run Phase A with --gate-outer-search to accumulate comparable gate "
-            "records first; use moe_cycle.gate_pairs.build_gate_pairs to inspect "
-            "the pairs that are ready."
+            "--gate-phase-b is a reserved switch. Phase B is implemented as "
+            "--gate-outer-sft (batched LoRA DPO/SFT on accumulated gate pairs); "
+            "use that instead."
         )
+    if getattr(args, "gate_outer_sft", False) and not args.gate_outer_search:
+        raise ValueError(
+            "--gate-outer-sft trains on outer-search records; requires --gate-outer-search"
+        )
+    if getattr(args, "gate_outer_sft", False):
+        for name in ("gate_sft_every", "gate_sft_steps", "gate_sft_rank", "gate_min_pairs"):
+            if getattr(args, name) < 1:
+                raise ValueError(f"--{name.replace('_', '-')} must be at least 1")
     if args.repetition_penalty != 1.0:
         print("[WARN] --repetition-penalty is ignored by the upstream ChatBot")
     if args.generation_backend != "pipeline":
@@ -201,9 +210,18 @@ def _setup_run(args: Namespace) -> RunContext:
     # Derive the gates root from the RUNTIME nngpt_dir.  The module-level
     # nngpt_gate_dir in ab.gpt.util.Const is computed before the --output
     # override is applied, so using it would place gate records outside the
-    # selected run directory.
-    gate_root = nngpt_dir / "gates"
+    # selected run directory.  --gate-store overrides it with a directory
+    # shared across runs so the search accumulates instead of restarting.
+    gate_root = (
+        args.gate_store.resolve()
+        if args.gate_store is not None
+        else nngpt_dir / "gates"
+    )
     gate_root.mkdir(parents=True, exist_ok=True)
+    if args.gate_store is not None and any(gate_root.glob("gate_*")):
+        print(
+            f"[GATE SEARCH] persistent store: continuing from existing records in {gate_root}"
+        )
     print(f"[GATE SEARCH] gate root: {gate_root}")
 
     if args.load_in_8bit and args.load_in_4bit:
@@ -296,6 +314,18 @@ def _setup_run(args: Namespace) -> RunContext:
         raise RuntimeError("No MoE gate sites discovered")
     shapes = sorted({(site.model_dim, site.num_experts) for site in sites})
 
+    # Phase B: wrap the backbone with the proposer LoRA BEFORE the ChatBot is
+    # constructed, so generation (proposals and CV NN code) flows through the
+    # adapter for the rest of the run. Adapter parameters stay frozen except
+    # during Phase B training batches.
+    if getattr(args, "gate_outer_sft", False):
+        from .phase_b import wrap_proposer_with_lora
+
+        wrap_proposer_with_lora(session, args)
+    from .phase_b import llm_version
+
+    proposer_version = llm_version(session.model, args)
+
     chat_bot = ChatBot(
         session.model, tokenizer,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
@@ -344,6 +374,7 @@ def _setup_run(args: Namespace) -> RunContext:
         native_repeat_max_abs_difference=native_repeat_max_abs_difference,
         previous_feedback_summary="",
         gate_root=gate_root,
+        llm_version=proposer_version,
     )
 
 
@@ -925,6 +956,8 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "reference_gate_id": ctx.reference_gate_id,
         "author_mode": ctx.args.gate_author,
         "author_gate_id": ctx.author_gate_id,
+        "rematch_for": getattr(ctx, "rematch_for", None),
+        "llm_version": getattr(ctx, "llm_version", "base"),
         "score": score,
         "epochs": ctx.gate_epoch_metrics,
     }
@@ -1054,39 +1087,83 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
     )
 
 
-def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
-    """Self-improving gate search: propose, replace, train inner loop, measure, repeat."""
-    from .gate_store import best_gate, summarize_gate
+def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> None:
+    """Persist a failed candidate so the run continues and the store keeps the lesson."""
+    from .gate_store import write_gate_summary
 
-    candidate_epochs: list[list[Path]] = []
-    seen_hashes: set[str] = set()
-    # The proposed baselines themselves count as seen, so the first proposal
-    # cannot simply echo the baseline contract.
-    from .gate_prompt import BASELINE_GATE_CODE
-    seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
+    reason = f"{type(exc).__name__}: {exc}"
+    print(f"[GATE SEARCH] gate {gate_id:03d} FAILED, continuing: {reason}")
+    record = {
+        "gate_id": gate_id,
+        "gate_code": ctx.gate_source,
+        "structural_hash": structural_hash(ctx.gate_source) if ctx.gate_source else None,
+        "reference_gate_id": ctx.reference_gate_id,
+        "author_mode": ctx.args.gate_author,
+        "author_gate_id": ctx.author_gate_id,
+        "rematch_for": ctx.rematch_for,
+        "llm_version": ctx.llm_version,
+        "score": {
+            "objective": "mean_of_epoch_means_v1",
+            "accuracy": None,
+            "eligible": False,
+            "n_measured": 0,
+            "n_attempted": 0,
+        },
+        "epochs": [],
+        "failure": reason[:2000],
+    }
+    write_gate_summary(ctx.gate_root, gate_id, record)
 
-    for gate_id in range(args.gate_candidates):
-        author_gate_id = _select_author_gate_id(args.gate_author, gate_id, ctx.gate_root)
-        ctx.author_gate_id = author_gate_id
-        if args.gate_author == "best" and gate_id > 0 and author_gate_id is None:
-            print("[GATE AUTHOR] no eligible best gate yet; proposing under native routing")
-        if author_gate_id is None:
-            # Round 0 and native mode: the proposal is authored with the native
-            # router active, outside the session.
-            _propose_gate(ctx, gate_id, seen_hashes)
+
+def _run_candidate_once(
+    ctx: RunContext, gate_id: int, seen_hashes: set[str], *, rematch_for: int | None = None,
+) -> list[Path]:
+    """One outer candidate: author selection, proposal, install, inner loop.
+
+    ``rematch_for`` re-runs a prior gate's code without a new proposal
+    (king-of-the-hill re-measure after a Phase B batch). Failures never
+    propagate: the candidate is recorded as failed and an empty list returns
+    so the search continues.
+    """
+    args = ctx.args
+    ctx.rematch_for = rematch_for
+    # Reset per-candidate state: a failed proposal must not leave the previous
+    # candidate's code/id in the failed record.
+    ctx.gate_source = None
+    ctx.reference_gate_id = None
+    ctx.gate_epoch_metrics = []
+    author_gate_id = (
+        None if rematch_for is not None
+        else _select_author_gate_id(args.gate_author, gate_id, ctx.gate_root)
+    )
+    ctx.author_gate_id = author_gate_id
+    if args.gate_author == "best" and gate_id > 0 and author_gate_id is None:
+        print("[GATE AUTHOR] no eligible best gate yet; proposing under native routing")
+    try:
         with ctx.session:
-            if author_gate_id is not None:
-                # The trained gate authors the proposal; afterwards the native
-                # router is restored so the fresh candidate still verifies
-                # bit-exact against native at step zero.
-                _install_author_gate(ctx, author_gate_id)
-                _prepare_model_for_generation(ctx)
-                _propose_gate(ctx, gate_id, seen_hashes)
-                ctx.session.restore()
+            if rematch_for is not None:
+                _prepare_rematch_candidate(ctx, gate_id, rematch_for)
+            else:
+                if author_gate_id is not None:
+                    try:
+                        _install_author_gate(ctx, author_gate_id)
+                    except FileNotFoundError as exc:
+                        print(
+                            f"[GATE AUTHOR] trained gate {author_gate_id:03d} unavailable "
+                            f"({exc}); proposing under native routing instead"
+                        )
+                        author_gate_id = None
+                        ctx.author_gate_id = None
+                    else:
+                        _prepare_model_for_generation(ctx)
+                        _propose_gate(ctx, gate_id, seen_hashes)
+                        ctx.session.restore()
+                if author_gate_id is None:
+                    # Round 0 and native mode: the proposal is authored with the
+                    # native router active, outside the session.
+                    _propose_gate(ctx, gate_id, seen_hashes)
             _install_and_verify(ctx)
             epoch_paths = _run_epochs(ctx)
-        candidate_epochs.append(epoch_paths)
-
         record = _write_gate_record(ctx)
         score = record["score"]
         accuracy = score.get("accuracy")
@@ -1095,12 +1172,146 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
             f"mean CV accuracy "
             f"{f'{accuracy:.4f}' if isinstance(accuracy, float) else 'unavailable'} "
             f"({score.get('n_measured', 0)}/{score.get('n_attempted', 0)} measured)"
+            + (f" [rematch of {rematch_for:03d}]" if rematch_for is not None else "")
         )
+        return epoch_paths
+    except Exception as exc:
+        _record_failed_candidate(ctx, gate_id, exc)
+        return []
+
+
+def _prepare_rematch_candidate(ctx: RunContext, gate_id: int, source_gate_id: int) -> None:
+    """Re-install a prior gate's code verbatim for a re-measure.
+
+    Duplicate-structure rejection is intentionally bypassed: the rematch
+    exists precisely to re-score the incumbent under the current proposer.
+    """
+    from .gate_store import gate_dir as store_gate_dir
+
+    ctx.candidate_index = gate_id
+    ctx.candidate_root = store_gate_dir(ctx.gate_root, gate_id)
+    ctx.gate_dir = ctx.candidate_root / "gate_source"
+    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    source_file = store_gate_dir(ctx.gate_root, source_gate_id) / "gate.py"
+    source = source_file.read_text(encoding="utf-8")
+    (ctx.candidate_root / "gate.py").write_text(source, encoding="utf-8")
+    ctx.gate_source = source
+    ctx.reference_gate_id = source_gate_id
+    ctx.previous_feedback_summary = _initial_feedback_summary(source)
+    ctx.used_prompts.clear()
+    print(
+        f"[GATE SEARCH] rematch: re-measuring gate {source_gate_id:03d} under "
+        f"proposer {ctx.llm_version} as gate {gate_id:03d}"
+    )
+
+
+def _run_phase_b_batch(ctx: RunContext, batch_index: int) -> str | None:
+    """Train the proposer on accumulated pairs; return the new version tag.
+
+    Returns None when there is not enough comparable data yet (nothing is
+    trained, the version does not change).  Pairs measured under the current
+    proposer version are preferred; earlier-version pairs are only used when
+    the current version alone cannot fill --gate-min-pairs, because scores
+    across versions carry generator drift on top of gate quality.
+    """
+    from .gate_pairs import build_gate_pairs
+    from .gate_store import load_gate_summaries
+    from .phase_b import llm_version as version_of
+    from .phase_b import train_proposer
+
+    all_pairs = build_gate_pairs(ctx.gate_root)
+    if not all_pairs:
+        print(f"[PHASE B] skipping batch {batch_index}: no comparable gate pairs yet")
+        return None
+    version_by_id = {
+        summary["gate_id"]: summary.get("llm_version")
+        for summary in load_gate_summaries(ctx.gate_root)
+    }
+    current_version_pairs = [
+        pair for pair in all_pairs
+        if version_by_id.get(pair["lower_gate_id"]) == ctx.llm_version
+        and version_by_id.get(pair["higher_gate_id"]) == ctx.llm_version
+    ]
+    if len(current_version_pairs) >= getattr(ctx.args, "gate_min_pairs", 2):
+        pairs = current_version_pairs
+    else:
+        pairs = all_pairs
+    if len(pairs) < getattr(ctx.args, "gate_min_pairs", 2):
+        print(
+            f"[PHASE B] skipping batch {batch_index}: {len(pairs)} comparable "
+            f"pair(s) < --gate-min-pairs {getattr(ctx.args, 'gate_min_pairs', 2)}"
+        )
+        return None
+    adapter_dir = ctx.run_root / "proposer_adapters" / f"batch_{batch_index:03d}"
+    train_proposer(
+        ctx.session.model,
+        ctx.tokenizer,
+        pairs,
+        ctx.args,
+        ctx.shapes,
+        adapter_dir,
+    )
+    new_version = version_of(ctx.session.model, ctx.args)
+    print(f"[PHASE B] proposer version {ctx.llm_version} -> {new_version}")
+    return new_version
+
+
+def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
+    """Self-improving gate search: propose, replace, train inner loop, measure, repeat.
+
+    Bad candidates are rejected and recorded, never fatal. With
+    ``--gate-outer-sft`` the proposer itself is fine-tuned every
+    ``--gate-sft-every`` candidates, followed by a king-of-the-hill re-measure
+    of the incumbent under the new proposer version.
+    """
+    from .gate_store import best_gate, load_gate_summaries, next_gate_id, summarize_gate
+
+    candidate_epochs: list[list[Path]] = []
+    # A persistent store carries dedup history across runs; a fresh store only
+    # knows the baseline contract, so the first proposal cannot echo it.
+    seen_hashes = {
+        summary["structural_hash"]
+        for summary in load_gate_summaries(ctx.gate_root)
+        if summary.get("structural_hash")
+    }
+    from .gate_prompt import BASELINE_GATE_CODE
+
+    seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
+    sft_batch = 0
+    candidates_run = 0
+
+    while candidates_run < args.gate_candidates:
+        if (
+            getattr(args, "gate_outer_sft", False)
+            and candidates_run > 0
+            and candidates_run % getattr(args, "gate_sft_every", 10) == 0
+        ):
+            sft_batch += 1
+            new_version = _run_phase_b_batch(ctx, sft_batch)
+            if new_version is not None:
+                ctx.llm_version = new_version
+                if not getattr(args, "gate_no_rematch", False):
+                    incumbent = best_gate(ctx.gate_root)
+                    if incumbent is not None:
+                        candidate_epochs.append(
+                            _run_candidate_once(
+                                ctx, next_gate_id(ctx.gate_root),
+                                seen_hashes, rematch_for=incumbent["gate_id"],
+                            )
+                        )
+        # Fresh id each iteration: rematch candidates also consume store ids,
+        # so a precomputed counter would collide with them.
+        candidate_epochs.append(
+            _run_candidate_once(ctx, next_gate_id(ctx.gate_root), seen_hashes)
+        )
+        candidates_run += 1
+
+        record_probe = best_gate(ctx.gate_root)
         ctx.outer_summary = {
             "gate_root": str(ctx.gate_root),
             "gate_candidates": args.gate_candidates,
-            "objective": score.get("objective"),
-            "best": (summarize_gate(best_gate(ctx.gate_root)) if best_gate(ctx.gate_root) else None),
+            "llm_version": ctx.llm_version,
+            "best": (summarize_gate(record_probe) if record_probe else None),
             "phase_b_ready": _phase_b_status(ctx.gate_root),
         }
     return candidate_epochs

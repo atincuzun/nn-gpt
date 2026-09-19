@@ -20,6 +20,7 @@ import ast
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +37,44 @@ def fingerprint(value: Any) -> str:
 
 
 def structural_hash(source: str) -> str:
-    """AST-based hash so formatting/comments do not defeat deduplication."""
-    return fingerprint(ast.dump(ast.parse(source), include_attributes=False))
+    """AST hash for deduplication, normalised against cosmetic rewrites.
+
+    Type annotations and docstrings are stripped before hashing: the observed
+    failure mode was a bare linear gate echoing the baseline contract with
+    annotations added, which changed the raw AST while the architecture was
+    identical.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            node.body = [stmt for stmt in node.body if not (
+                isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            )] or node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.returns = None
+            for argument in list(node.args.args) + list(node.args.kwonlyargs) + list(node.args.posonlyargs):
+                argument.annotation = None
+        if isinstance(node, ast.AnnAssign):
+            node.annotation = None
+    return fingerprint(ast.dump(tree, include_attributes=False))
+
+
+def next_gate_id(root: Path) -> int:
+    """First gate id not already recorded in the store (0 for a fresh store).
+
+    Lets a persistent store shared across runs continue its numbering instead
+    of overwriting earlier ``gate_XXX`` directories.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return 0
+    used = {
+        int(match.group(1))
+        for directory in root.glob("gate_*")
+        if (match := re.fullmatch(r"gate_(\d+)", directory.name))
+    }
+    return max(used) + 1 if used else 0
 
 
 def write_json(path: Path, value: Any) -> None:

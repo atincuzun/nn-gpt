@@ -88,6 +88,27 @@ def _validate_gate_source(
                 raise ValueError(f"Expected gate output {expected}, got {getattr(output, 'shape', None)}")
             if not torch.isfinite(output).all():
                 raise ValueError("Generated gate returned non-finite logits")
+        if require_base:
+            # Reject degenerate proposals: the architecture must add trainable
+            # parameters that participate in forward. Connectivity (grad is not
+            # None), not magnitude: a silent branch (zero-initialised last
+            # layer) has zero-valued but connected gradients and is the
+            # intended pattern, while a bare linear copy of the base adds none.
+            probe = gate_cls(model_dim, num_experts).float()
+            output = probe(torch.randn(2, model_dim))
+            if not isinstance(output, torch.Tensor) or not output.requires_grad:
+                raise ValueError("Gate output does not depend on any trainable parameter")
+            output.sum().backward()
+            connected = any(
+                parameter.grad is not None
+                for name, parameter in probe.named_parameters()
+                if not name.startswith("base.")
+            )
+            if not connected:
+                raise ValueError(
+                    "Gate must add trainable parameters beyond self.base "
+                    "(e.g. a residual branch); a plain linear copy is not a new architecture"
+                )
 
 
 def _generate_gate(

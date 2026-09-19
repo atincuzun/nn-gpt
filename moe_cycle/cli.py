@@ -256,4 +256,39 @@ def parse_args() -> argparse.Namespace:
         "gate pairs so it authors better gate code directly. The training mechanism "
         "is undecided, so this currently fails fast instead of silently doing nothing.",
     )
+    parser.add_argument(
+        "--gate-store",
+        type=Path,
+        help="Persistent gate store directory shared across runs. Default places the "
+        "store inside this run's output directory, so nothing survives the run; a "
+        "shared directory lets later runs continue gate ids, dedup history, best-gate "
+        "reference, and Phase B pairs from earlier runs.",
+    )
+    parser.add_argument(
+        "--gate-outer-sft",
+        action="store_true",
+        help="Phase B proposer training: every --gate-sft-every candidates, fine-tune "
+        "a LoRA adapter on the accumulated (lower -> higher) gate pairs so the LLM "
+        "authors better gates directly. Requires --gate-outer-search. The adapter "
+        "stays active (unmerged) for the rest of the run; each gate record stores the "
+        "proposer version it was measured under.",
+    )
+    parser.add_argument("--gate-sft-every", type=int, default=10)
+    parser.add_argument("--gate-sft-steps", type=int, default=30)
+    parser.add_argument("--gate-sft-lr", type=float, default=1e-4)
+    parser.add_argument("--gate-sft-mode", choices=("dpo", "sft"), default="dpo")
+    parser.add_argument("--gate-sft-rank", type=int, default=16)
+    parser.add_argument(
+        "--gate-min-pairs",
+        type=int,
+        default=2,
+        help="Minimum comparable gate pairs required before a Phase B training batch runs",
+    )
+    parser.add_argument(
+        "--gate-no-rematch",
+        action="store_true",
+        help="Skip the incumbent re-measure that normally follows each Phase B batch. "
+        "The re-match re-runs the current best gate under the updated proposer so "
+        "cross-version score comparisons stay fair (king-of-the-hill).",
+    )
     return parser.parse_args()
