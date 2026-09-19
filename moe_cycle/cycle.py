@@ -958,6 +958,11 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "author_gate_id": ctx.author_gate_id,
         "rematch_for": getattr(ctx, "rematch_for", None),
         "llm_version": getattr(ctx, "llm_version", "base"),
+        # gate_pairs.build_gate_pairs groups comparable records on exactly
+        # these three keys; without them no Phase B pairs can ever form.
+        "task": "img-classification",
+        "dataset": getattr(ctx.args, "dataset", "cifar-10"),
+        "metric": "accuracy",
         "score": score,
         "epochs": ctx.gate_epoch_metrics,
     }
@@ -1281,9 +1286,16 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
     candidates_run = 0
 
     while candidates_run < args.gate_candidates:
+        # Fresh id each iteration: rematch candidates also consume store ids,
+        # so a precomputed counter would collide with them.
+        candidate_epochs.append(
+            _run_candidate_once(ctx, next_gate_id(ctx.gate_root), seen_hashes)
+        )
+        candidates_run += 1
+        # Fire after the batch completes, not before the next one starts:
+        # with candidates == sft_every the "before" placement never triggers.
         if (
             getattr(args, "gate_outer_sft", False)
-            and candidates_run > 0
             and candidates_run % getattr(args, "gate_sft_every", 10) == 0
         ):
             sft_batch += 1
@@ -1299,12 +1311,6 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
                                 seen_hashes, rematch_for=incumbent["gate_id"],
                             )
                         )
-        # Fresh id each iteration: rematch candidates also consume store ids,
-        # so a precomputed counter would collide with them.
-        candidate_epochs.append(
-            _run_candidate_once(ctx, next_gate_id(ctx.gate_root), seen_hashes)
-        )
-        candidates_run += 1
 
         record_probe = best_gate(ctx.gate_root)
         ctx.outer_summary = {
