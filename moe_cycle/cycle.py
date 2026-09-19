@@ -504,10 +504,17 @@ def _install_and_verify(ctx: RunContext) -> None:
     (gate_dir / "step_zero_equivalence.json").write_text(
         json.dumps(equivalence, indent=2), encoding="utf-8",
     )
+    skip_step_zero_verify = getattr(args, "gate_skip_step_zero_verify", False)
+    if not equivalent and skip_step_zero_verify:
+        print(
+            "[GATE VERIFY] step-zero mismatch accepted (--gate-skip-step-zero-verify): "
+            f"max_abs_difference={max_abs_diff}"
+        )
     if (
         not args.gate_random_init
         and args.gate_init_noise_scale == 0
         and not equivalent
+        and not skip_step_zero_verify
     ):
         raise RuntimeError(
             "Replacement gates do not reproduce native step-zero model logits: "

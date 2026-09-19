@@ -102,6 +102,14 @@ def parse_args() -> argparse.Namespace:
         help="Use --gate-source constructor initialization without copying native "
         "router weights or requiring a base projection. Requires zero initialization noise.",
     )
+    parser.add_argument(
+        "--gate-skip-step-zero-verify",
+        action="store_true",
+        help="Install the proposed gate even when its step-zero model logits diverge "
+        "from the native model instead of raising the max_abs_difference RuntimeError. "
+        "The measured difference is still recorded in step_zero_equivalence.json; the "
+        "non-finite-logits guard stays active.",
+    )
     parser.add_argument("--gate-generation-attempts", type=int, default=3)
     parser.add_argument(
         "--gate-candidates",
