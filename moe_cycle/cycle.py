@@ -397,15 +397,18 @@ def _setup_run(args: Namespace) -> RunContext:
     )
 
 
-def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
-                            outer_feedback: str, proposal_chat: Any = None,
+def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
                             reference_source: str = "",
+                            reference_accuracy: float | None = None,
+                            goal_accuracy: float | None = None,
+                            dataset: str | None = None,
+                            proposal_chat: Any = None,
                             seen_hashes: set[str] | None = None) -> None:
     """Generate/load one gate architecture while the native router is active.
 
-    The prompt carries the current best gate plus measured feedback from earlier
-    candidates.  Round 0 has no prior gate, so it bootstraps from the baseline
-    contract.
+    The prompt carries one reference gate with its measured accuracy and the
+    goal accuracy (LEMUR-CV pairing). With no scored prior gate it bootstraps
+    from the baseline contract.
     """
     from .gate_store import gate_dir
 
@@ -425,8 +428,12 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int,
     else:
         source = _generate_gate(
             proposal_chat or ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
-            args.gate_max_new_tokens, ctx.gate_dir, outer_feedback,
-            reference_source=reference_source, seen_hashes=seen_hashes,
+            args.gate_max_new_tokens, ctx.gate_dir,
+            reference_source=reference_source,
+            reference_accuracy=reference_accuracy,
+            goal_accuracy=goal_accuracy,
+            dataset=dataset,
+            seen_hashes=seen_hashes,
         )
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
@@ -1059,20 +1066,6 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
     print(f"MoE gate cycle completed: {ctx.run_root}")
 
 
-def _outer_feedback_block(root: Path, reference: dict | None) -> str:
-    """Measured outcomes of earlier gates for the next proposal prompt."""
-    from .gate_store import load_gate_summaries, summarize_gate
-
-    lines = []
-    if reference is not None:
-        lines.append(f"- current best prior gate: {summarize_gate(reference)[2:]}")
-    for summary in load_gate_summaries(root):
-        if reference is not None and summary.get("gate_id") == reference.get("gate_id"):
-            continue
-        lines.append(summarize_gate(summary))
-    return "\n".join(lines)
-
-
 def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
     """Propose the next gate under the currently installed routing.
 
@@ -1080,19 +1073,25 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
     With ``last``/``best`` the caller has already installed the corresponding
     trained gate, so the proposal is authored by the improved composite.
 
-    Round 0 bootstraps from the baseline contract.  Later rounds condition on the
-    best prior gate (code plus measured mean accuracy) and a compact summary of
-    earlier candidates, so the search improves in context.
+    The prompt is one LEMUR-CV pairing: the best prior gate's code with its
+    measured accuracy as the reference, its score as the goal. Round 0 (or an
+    empty store) bootstraps from the baseline contract without scores.
     """
     from .gate_prompt import BASELINE_GATE_CODE
     from .gate_store import best_gate
 
     reference = best_gate(ctx.gate_root)
     reference_source = ""
+    reference_accuracy = None
+    goal_accuracy = None
     ctx.reference_gate_id = None
     if reference is not None:
         reference_source = reference.get("gate_code") or ""
         ctx.reference_gate_id = reference.get("gate_id")
+        score = (reference.get("score") or {}).get("accuracy")
+        if isinstance(score, float):
+            reference_accuracy = score
+            goal_accuracy = score
     elif gate_id > 0:
         # No eligible prior gate yet: fall back to the baseline contract so the
         # model still has an explicit reference to diverge from.
@@ -1101,8 +1100,10 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
     _prepare_gate_candidate(
         ctx,
         gate_id,
-        _outer_feedback_block(ctx.gate_root, reference),
         reference_source=reference_source,
+        reference_accuracy=reference_accuracy,
+        goal_accuracy=goal_accuracy,
+        dataset=ctx.args.dataset,
         seen_hashes=seen_hashes,
     )
     print(

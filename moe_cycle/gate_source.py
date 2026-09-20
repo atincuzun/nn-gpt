@@ -113,21 +113,27 @@ def _validate_gate_source(
 
 def _generate_gate(
     chat_bot: Any, shapes: list[tuple[int, int]], attempts: int,
-    max_new_tokens: int, artifact_dir: Path, feedback_summary: str = "",
+    max_new_tokens: int, artifact_dir: Path, *,
     reference_source: str = "",
+    reference_accuracy: float | None = None,
+    goal_accuracy: float | None = None,
+    dataset: str | None = None,
     seen_hashes: set[str] | None = None,
     max_attempts_per_duplicate: int = 3,
 ) -> str:
     """Ask the LLM for a replacement gate source.
 
-    Its base weight is copied from the native router, so the replaced model stays
-    bit-identical at step zero before training begins.  The prompt carries the
-    current best gate as a reference plus measured feedback from earlier
-    candidates, mirroring how the CV pipeline conditions generation on one
-    reference artefact.
+    Its base weight is copied from the native router, so the replaced model
+    stays bit-identical at step zero before training begins. The prompt
+    carries one reference gate with its score and the goal score (LEMUR-CV
+    pairing); failed attempts append their validation errors, nothing else.
     """
     prompt = gate_proposal_prompt(
-        shapes, reference_source=reference_source, feedback=feedback_summary,
+        shapes,
+        reference_source=reference_source,
+        reference_accuracy=reference_accuracy,
+        goal_accuracy=goal_accuracy,
+        dataset=dataset,
     )
     seen = seen_hashes if seen_hashes is not None else set()
     artifact_dir.mkdir(parents=True, exist_ok=True)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from moe_cycle.cli import parse_args
-from moe_cycle.cycle import _outer_feedback_block, _validate_args
+from moe_cycle.cycle import _validate_args
 from moe_cycle.gate_prompt import (
     BASELINE_GATE_CODE,
     GATE_SYSTEM_PROMPT,
@@ -208,21 +208,27 @@ def test_similarity_helper_is_advisory_on_templated_code():
 
 # ── prompt ───────────────────────────────────────────────────────────────────
 
-def test_proposal_prompt_includes_reference_and_feedback():
+def test_proposal_prompt_includes_reference_pairing():
+    """LEMUR-CV pairing: reference code + its score + the goal score; no tables."""
     prompt = gate_proposal_prompt(
-        [(8, 4)], reference_source=GATE_SOURCE, feedback="- gate 000: mean 0.4",
+        [(8, 4)], reference_source=GATE_SOURCE,
+        reference_accuracy=0.45, goal_accuracy=0.52, dataset="cifar-10",
     )
     assert "<gate>" in prompt and "LLMGeneratedGate" in prompt
     assert "self.base = nn.Linear" in prompt
-    assert GATE_SOURCE.strip() in prompt          # reference present in round > 0
-    assert "- gate 000: mean 0.4" in prompt       # measured feedback present
-    assert "[(8, 4)]" in prompt
+    assert GATE_SOURCE.strip() in prompt           # reference present
+    assert "0.4500" in prompt                      # reference score
+    assert "at least 0.5200" in prompt             # goal score, NN_gen style
+    assert "cifar-10" in prompt
+    assert "Measured results" not in prompt        # history table is gone
+    assert "unavailable" not in prompt
 
 
 def test_proposal_prompt_bootstrap_has_no_reference():
     prompt = gate_proposal_prompt([(8, 4)])
     assert GATE_SOURCE.strip() not in prompt
     assert "current best MoE router gate" not in prompt
+    assert "at least" not in prompt                # no goal without a scored reference
 
 
 def test_prompt_scope_isolates_and_restores_cv_system_prompt():
@@ -232,9 +238,9 @@ def test_prompt_scope_isolates_and_restores_cv_system_prompt():
     assert chatbot.system_prompt == "cv-system-prompt"
 
 
-def test_sft_example_shows_loser_as_context_hides_target_score():
-    """LEMUR-CV style: the weaker gate + its score are the input; the
-    higher-scoring gate is the target and its own score stays hidden."""
+def test_sft_example_mirrors_nn_gen_pairing():
+    """NN_gen.json mirror: reference gate + its score in the prompt, the
+    better gate's score stated as the goal, better code only as the target."""
     pair = {
         "pair_id": "p1",
         "lower_gate_id": 5,
@@ -243,38 +249,42 @@ def test_sft_example_shows_loser_as_context_hides_target_score():
         "lower_source": GATE_SOURCE,
         "lower_accuracy": 0.4566,
         "higher_accuracy": 0.77,
+        "dataset": "cifar-10",
     }
     example = gate_sft_examples([pair], shapes=[(8, 4)])[0]
     user_prompt = example["messages"][1]["content"]
     assistant = example["messages"][2]["content"]
     assert example["messages"][0]["content"] == GATE_SYSTEM_PROMPT
-    # The loser is the conditioning context, code and score.
+    # Reference gate: code + measured accuracy.
     assert GATE_SOURCE.strip() in user_prompt
     assert "0.4566" in user_prompt
-    # The target's architecture and score never leak into the input.
+    # Goal: the better score, stated like NN_gen's "increase to at least".
+    assert "at least 0.7700" in user_prompt
+    # The better architecture appears only as the target.
     assert DISTINCT_GATE.strip() not in user_prompt
-    assert "0.77" not in user_prompt
     assert assistant == "<gate>\n" + DISTINCT_GATE.strip() + "\n</gate>"
 
 
 def test_prompt_states_the_contract_and_leaves_the_architecture_open():
     """The prompt pins the runtime contract; the network design stays open."""
     prompt = gate_proposal_prompt([(2048, 64)])
-    assert len(prompt) < 4096, "prompt over-specified for the proposal context"
+    assert len(prompt) < 5000, "prompt over-specified for the proposal context"
     # The seam.
     assert "LLMGeneratedGate(nn.Module)" in prompt
     assert "__init__(self, model_dim: int, num_experts: int)" in prompt
     assert "self.base = nn.Linear(model_dim, num_experts, bias=False)" in prompt
-    assert "(..., model_dim)" in prompt and "(..., num_experts)" in prompt
-    assert "a single tensor" in prompt
+    assert "Input shape:" in prompt and "Output shape:" in prompt
+    assert '`(..., model_dim)`' in prompt and '`(..., num_experts)`' in prompt
+    assert "finite raw router logits" in prompt
     # The host owns the routing that follows the logits.
-    assert "Softmax, top-k, auxiliary loss, and expert dispatch are handled by the host" in prompt
+    assert "Softmax, expert selection, top-k routing, auxiliary routing losses, and expert dispatch are handled externally" in prompt
     # Step zero must reproduce the copied native weight.
-    assert "reproduce self.base(x) exactly" in prompt
+    assert "reproduce `self.base(x)` exactly" in prompt
+    # Connectivity without degeneracy.
+    assert "connected to the output computation" in prompt
     # The network is explicitly free.
-    assert "choose the internal structure yourself" in prompt
-    assert "Invent an expressive, nonlinear network" in prompt
-    assert "Derive dimensions from model_dim and num_experts" in prompt
+    assert "Choose the architecture, internal representations, transformations, nonlinearities, parameterization, and composition yourself" in prompt
+    assert "meaningful learnable capacity beyond the required native-weight interface" in prompt
     # Shapes are injected, and no concrete model is named.
     assert "[(2048, 64)]" in prompt
     assert "DeepSeek" not in prompt and "MoEGate" not in prompt
@@ -313,7 +323,7 @@ class _ScriptedChatBot:
 def _run_generate(tmp_path, outputs, *, reference="", seen=None, attempts=3):
     return _generate_gate(
         _ScriptedChatBot(outputs), [(8, 4)], attempts, 64, tmp_path,
-        feedback_summary="", reference_source=reference,
+        reference_source=reference,
         seen_hashes=seen if seen is not None else set(),
     )
 
@@ -551,14 +561,6 @@ def test_gate_record_stores_author_state(tmp_path: Path):
     assert stored["author_gate_id"] == 1
 
 
-def test_feedback_block_covers_prior_gates(tmp_path: Path):
-    _write_gate(tmp_path, 0, 0.40)
-    _write_gate(tmp_path, 1, 0.70)
-    reference = best_gate(tmp_path)
-    block = _outer_feedback_block(tmp_path, reference)
-    assert "current best prior gate" in block
-    assert "gate 000" in block  # earlier candidates are still described
-    assert "gate 001" in block
 
 
 # ── Phase B seam ─────────────────────────────────────────────────────────────
