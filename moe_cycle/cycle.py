@@ -1175,7 +1175,8 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
 
 
 def _run_candidate_once(
-    ctx: RunContext, gate_id: int, seen_hashes: set[str], *, rematch_for: int | None = None,
+    ctx: RunContext, gate_id: int, seen_hashes: set[str], *,
+    rematch_for: int | None = None, seed: bool = False,
 ) -> list[Path]:
     """One outer candidate: author selection, proposal, install, inner loop.
 
@@ -1203,7 +1204,7 @@ def _run_candidate_once(
         with ctx.session:
             if rematch_for is not None:
                 _prepare_rematch_candidate(ctx, gate_id, rematch_for)
-            elif gate_id < getattr(args, "gate_seed_candidates", 0):
+            elif seed:
                 # Cold-start bootstrap: built-in compliant gates fill the store
                 # with scored references before the proposer is trusted.
                 _prepare_seed_candidate(ctx, gate_id)
@@ -1374,7 +1375,10 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
         # Fresh id each iteration: rematch candidates also consume store ids,
         # so a precomputed counter would collide with them.
         candidate_epochs.append(
-            _run_candidate_once(ctx, next_gate_id(ctx.gate_root), seen_hashes)
+            _run_candidate_once(
+                ctx, next_gate_id(ctx.gate_root), seen_hashes,
+                seed=candidates_run < getattr(args, "gate_seed_candidates", 0),
+            )
         )
         candidates_run += 1
         # Fire after the batch completes, not before the next one starts:
