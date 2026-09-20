@@ -977,6 +977,7 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "author_gate_id": ctx.author_gate_id,
         "rematch_for": getattr(ctx, "rematch_for", None),
         "llm_version": getattr(ctx, "llm_version", "base"),
+        "seeded": getattr(ctx, "seeded", False),
         # gate_pairs.build_gate_pairs groups comparable records on exactly
         # these three keys; without them no Phase B pairs can ever form.
         "task": "img-classification",
@@ -1111,6 +1112,39 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
     )
 
 
+def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
+    """Cold-start bootstrap: install a built-in compliant seed gate.
+
+    Seeds bypass the LLM proposal entirely so the store accumulates scored,
+    valid, creative references even when the proposer cannot produce one.
+    Seeds are validated with the same rules as LLM proposals and fail loudly
+    if they ever stop complying.
+    """
+    from .gate_seeds import seed_gate_name, seed_gate_source
+    from .gate_store import gate_dir
+
+    ctx.candidate_index = gate_id
+    ctx.candidate_root = gate_dir(ctx.gate_root, gate_id)
+    ctx.gate_dir = ctx.candidate_root / "gate_source"
+    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    source = seed_gate_source(gate_id)
+    _validate_gate_source(source, ctx.shapes)
+    (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
+    (ctx.gate_dir / "proposal_prompt.txt").write_text(
+        f"[cold-start bootstrap] built-in seed gate '{seed_gate_name(gate_id)}' "
+        "installed without an LLM proposal\n",
+        encoding="utf-8",
+    )
+    ctx.gate_source = source
+    ctx.seeded = True
+    ctx.previous_feedback_summary = _initial_feedback_summary(source)
+    ctx.used_prompts.clear()
+    print(
+        f"[GATE SEARCH] gate {gate_id:03d} seeded (cold-start bootstrap): "
+        f"{seed_gate_name(gate_id)}"
+    )
+
+
 def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> None:
     """Persist a failed candidate so the run continues and the store keeps the lesson."""
     from .gate_store import write_gate_summary
@@ -1126,6 +1160,7 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
         "author_gate_id": ctx.author_gate_id,
         "rematch_for": ctx.rematch_for,
         "llm_version": ctx.llm_version,
+        "seeded": getattr(ctx, "seeded", False),
         "score": {
             "objective": "mean_of_epoch_means_v1",
             "accuracy": None,
@@ -1156,6 +1191,7 @@ def _run_candidate_once(
     ctx.gate_source = None
     ctx.reference_gate_id = None
     ctx.gate_epoch_metrics = []
+    ctx.seeded = False
     author_gate_id = (
         None if rematch_for is not None
         else _select_author_gate_id(args.gate_author, gate_id, ctx.gate_root)
@@ -1167,6 +1203,10 @@ def _run_candidate_once(
         with ctx.session:
             if rematch_for is not None:
                 _prepare_rematch_candidate(ctx, gate_id, rematch_for)
+            elif gate_id < getattr(args, "gate_seed_candidates", 0):
+                # Cold-start bootstrap: built-in compliant gates fill the store
+                # with scored references before the proposer is trusted.
+                _prepare_seed_candidate(ctx, gate_id)
             else:
                 if author_gate_id is not None:
                     try:
@@ -1322,6 +1362,11 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
     from .gate_prompt import BASELINE_GATE_CODE
 
     seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
+    # Seed architectures are also off-limits for verbatim LLM re-emission.
+    from .gate_seeds import SEED_GATES
+
+    for seed_source, _seed_name in SEED_GATES:
+        seen_hashes.add(structural_hash(seed_source))
     sft_batch = 0
     candidates_run = 0
 

@@ -110,7 +110,16 @@ def parse_args() -> argparse.Namespace:
         "The measured difference is still recorded in step_zero_equivalence.json; the "
         "non-finite-logits guard stays active.",
     )
-    parser.add_argument("--gate-generation-attempts", type=int, default=3)
+    parser.add_argument("--gate-generation-attempts", type=int, default=100)
+    parser.add_argument(
+        "--gate-seed-candidates",
+        type=int,
+        default=3,
+        help="Cold-start bootstrap: the first N outer candidates install built-in "
+        "compliant seed gates (additive MLP, gated two-branch, multiplicative "
+        "modulation) instead of LLM proposals, so the store accumulates scored "
+        "valid references before the proposer generates its own. 0 disables seeding.",
+    )
     parser.add_argument(
         "--gate-candidates",
         type=int,

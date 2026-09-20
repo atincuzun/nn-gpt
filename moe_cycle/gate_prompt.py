@@ -18,17 +18,25 @@ GATE_SYSTEM_PROMPT = (
     "The supplied interface constrains compatibility, not your architectural creativity."
 )
 
-# Baseline reference for the first round (heritage: the removed
-# Gate_gen_with_gate.json experiment config).
+# Baseline reference for the first round. MUST satisfy the same validator as
+# every proposal: it carries a zero-initialised residual branch (silent at
+# step zero, trainable afterwards), so the LLM is shown a COMPLIANT pattern
+# instead of a plain linear gate our own degenerate-gate check would reject.
 BASELINE_GATE_CODE = (
     "import torch\n"
     "import torch.nn as nn\n\n"
     "class LLMGeneratedGate(nn.Module):\n"
     "    def __init__(self, model_dim: int, num_experts: int):\n"
     "        super().__init__()\n"
-    "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n\n"
-    "    def forward(self, x: torch.Tensor) -> torch.Tensor:\n"
-    "        return self.base(x)\n"
+    "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
+    "        self.branch = nn.Sequential(\n"
+    "            nn.Linear(model_dim, 4 * num_experts),\n"
+    "            nn.Tanh(),\n"
+    "            nn.Linear(4 * num_experts, num_experts, bias=False),\n"
+    "        )\n"
+    "        nn.init.zeros_(self.branch[-1].weight)\n\n"
+    "    def forward(self, x):\n"
+    "        return self.base(x) + self.branch(x)\n"
 )
 
 

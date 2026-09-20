@@ -606,3 +606,53 @@ def test_phase_b_cli_flag_fails_fast(monkeypatch):
     assert args.gate_phase_b is True
     with pytest.raises(NotImplementedError, match="Phase B"):
         _validate_args(args)
+
+
+# ── cold-start bootstrap seeds ────────────────────────────────────────────────
+
+def test_seed_gates_satisfy_the_llm_proposal_validator():
+    """Seeds must pass the SAME contract/degenerate checks as LLM proposals."""
+    from moe_cycle.gate_seeds import SEED_GATES
+    from moe_cycle.gate_source import _validate_gate_source
+
+    hashes = set()
+    for name, source in SEED_GATES:
+        _validate_gate_source(source, [(2048, 64), (512, 8)])
+        hashes.add(structural_hash(source))
+    assert len(hashes) == len(SEED_GATES), "seed mechanisms must be distinct"
+
+
+def test_baseline_reference_is_not_degenerate():
+    """The round-0 reference must itself satisfy the enforced contract."""
+    from moe_cycle.gate_prompt import BASELINE_GATE_CODE
+    from moe_cycle.gate_seeds import SEED_GATES
+    from moe_cycle.gate_source import _validate_gate_source
+
+    _validate_gate_source(BASELINE_GATE_CODE, [(2048, 64)])
+    seed_hashes = {structural_hash(source) for _name, source in SEED_GATES}
+    assert structural_hash(BASELINE_GATE_CODE) not in seed_hashes
+
+
+def test_seed_candidates_prepare_without_llm(tmp_path: Path, monkeypatch):
+    """_prepare_seed_candidate writes a valid gate with no chatbot involved."""
+    import torch
+
+    from moe_cycle.cycle import _prepare_seed_candidate
+
+    ctx = SimpleNamespace(
+        gate_root=tmp_path, shapes=[(2048, 64)], gate_source=None,
+        used_prompts=[], seeded=None,
+    )
+    monkeypatch.setattr(
+        "moe_cycle.cycle._initial_feedback_summary", lambda source: ""
+    )
+    _prepare_seed_candidate(ctx, 1)
+    assert (tmp_path / "gate_001" / "gate.py").is_file()
+    assert ctx.seeded is True
+    source = (tmp_path / "gate_001" / "gate.py").read_text(encoding="utf-8")
+    namespace = {}
+    exec(compile(source, "<seed>", "exec"), namespace)
+    gate = namespace["LLMGeneratedGate"](2048, 64).float().eval()
+    with torch.no_grad():
+        out = gate(torch.randn(2, 2048))
+    assert out.shape == (2, 64) and torch.isfinite(out).all()
