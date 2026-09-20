@@ -62,6 +62,7 @@ class RunContext:
     author_gate_id: int | None = None
     llm_version: str = "base"
     rematch_for: int | None = None
+    gate_pool: list = field(default_factory=list)
 
 
 def _log_cuda_memory(label: str) -> dict[str, float] | None:
@@ -403,12 +404,13 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
                             goal_accuracy: float | None = None,
                             dataset: str | None = None,
                             proposal_chat: Any = None,
-                            seen_hashes: set[str] | None = None) -> None:
-    """Generate/load one gate architecture while the native router is active.
+                            seen_hashes: set[str] | None = None,
+                            source: str | None = None) -> None:
+    """Prepare one gate architecture while the native router is active.
 
-    The prompt carries one reference gate with its measured accuracy and the
-    goal accuracy (LEMUR-CV pairing). With no scored prior gate it bootstraps
-    from the baseline contract.
+    ``source`` comes from the proposal pool (harvested in an earlier round);
+    without it a proposal round runs, the first harvested gate is used here
+    and the remainder join the pool for later candidates.
     """
     from .gate_store import gate_dir
 
@@ -425,8 +427,8 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             source, ctx.shapes, class_name=args.gate_class,
             require_base=not args.gate_random_init,
         )
-    else:
-        source = _generate_gate(
+    elif source is None:
+        sources = _generate_gate(
             proposal_chat or ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
             args.gate_max_new_tokens, ctx.gate_dir,
             reference_source=reference_source,
@@ -435,6 +437,13 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             dataset=dataset,
             seen_hashes=seen_hashes,
         )
+        source = sources[0]
+        if len(sources) > 1:
+            ctx.gate_pool.extend(sources[1:])
+            print(
+                f"[GATE SEARCH] {len(sources) - 1} extra valid gate(s) -> "
+                f"proposal pool ({len(ctx.gate_pool)} waiting)"
+            )
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
@@ -1066,7 +1075,8 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
     print(f"MoE gate cycle completed: {ctx.run_root}")
 
 
-def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
+def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str],
+                  source: str | None = None) -> None:
     """Propose the next gate under the currently installed routing.
 
     With ``--gate-author native`` (and for round 0) that is the native router.
@@ -1105,6 +1115,7 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str]) -> None:
         goal_accuracy=goal_accuracy,
         dataset=ctx.args.dataset,
         seen_hashes=seen_hashes,
+        source=source,
     )
     print(
         f"[GATE SEARCH] proposed gate {gate_id:03d} "
@@ -1201,6 +1212,13 @@ def _run_candidate_once(
     ctx.author_gate_id = author_gate_id
     if args.gate_author == "best" and gate_id > 0 and author_gate_id is None:
         print("[GATE AUTHOR] no eligible best gate yet; proposing under native routing")
+    pooled_source = None
+    if not seed and rematch_for is None and ctx.gate_pool:
+        pooled_source = ctx.gate_pool.pop(0)
+        print(
+            f"[GATE SEARCH] gate {gate_id:03d} taken from proposal pool "
+            f"({len(ctx.gate_pool)} still waiting)"
+        )
     try:
         with ctx.session:
             if rematch_for is not None:
@@ -1222,12 +1240,12 @@ def _run_candidate_once(
                         ctx.author_gate_id = None
                     else:
                         _prepare_model_for_generation(ctx)
-                        _propose_gate(ctx, gate_id, seen_hashes)
+                        _propose_gate(ctx, gate_id, seen_hashes, source=pooled_source)
                         ctx.session.restore()
                 if author_gate_id is None:
                     # Round 0 and native mode: the proposal is authored with the
                     # native router active, outside the session.
-                    _propose_gate(ctx, gate_id, seen_hashes)
+                    _propose_gate(ctx, gate_id, seen_hashes, source=pooled_source)
             _install_and_verify(ctx)
             epoch_paths = _run_epochs(ctx)
         record = _write_gate_record(ctx)

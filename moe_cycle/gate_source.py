@@ -120,13 +120,21 @@ def _generate_gate(
     dataset: str | None = None,
     seen_hashes: set[str] | None = None,
     max_attempts_per_duplicate: int = 3,
-) -> str:
-    """Ask the LLM for a replacement gate source.
+) -> list[str]:
+    """Ask the LLM for replacement gate sources; HARVEST every valid distinct one.
+
+    Valid proposals are the scarce resource, so nothing usable is discarded:
+    all valid, structurally distinct gates across the attempts are returned
+    (order preserved). The first is meant for the current candidate; the rest
+    feed the outer loop's proposal pool.
+
+    Stop rule: while nothing valid has been found, every attempt is used
+    (retry-until-valid). Once at least one gate is harvested, the first dry
+    attempt (no new valid gate) ends the round — productive streaks are
+    drained, polishing is not chased.
 
     Its base weight is copied from the native router, so the replaced model
-    stays bit-identical at step zero before training begins. The prompt
-    carries one reference gate with its score and the goal score (LEMUR-CV
-    pairing); failed attempts append their validation errors, nothing else.
+    stays bit-identical at step zero before training begins.
     """
     prompt = gate_proposal_prompt(
         shapes,
@@ -140,6 +148,7 @@ def _generate_gate(
     (artifact_dir / "proposal_prompt.txt").write_text(prompt, encoding="utf-8")
     previous_error = ""
     duplicate_attempts = 0
+    harvested: list[str] = []
     for attempt in range(1, attempts + 1):
         current_prompt = prompt
         if previous_error:
@@ -150,30 +159,39 @@ def _generate_gate(
             )
         (artifact_dir / f"generation_attempt_{attempt}.txt").write_text(raw, encoding="utf-8")
         errors: list[str] = []
-        # A single generation can yield several parseable strings.  Duplicate
-        # attempts are counted per generation, not per string, otherwise one
-        # templated response would exhaust the retry budget immediately.
-        saw_valid_candidate = False
+        new_this_attempt = 0
+        # A single generation can yield several parseable strings; every valid
+        # distinct one is harvested, not just the first.
         for candidate in _gate_candidates(raw):
             try:
                 _validate_gate_source(candidate, shapes)
             except Exception as exc:
                 errors.append(str(exc))
                 continue
-            saw_valid_candidate = True
             if is_duplicate_gate(candidate, seen):
                 errors.append("structurally identical to an earlier gate candidate")
                 continue
             seen.add(structural_hash(candidate))
-            (artifact_dir / "gate.py").write_text(candidate.rstrip() + "\n", encoding="utf-8")
-            return candidate
-        if saw_valid_candidate:
-            # Every structurally valid proposal this round was already seen.
-            duplicate_attempts += 1
-            if duplicate_attempts >= max_attempts_per_duplicate:
-                raise RuntimeError(
-                    "LLM kept re-emitting a duplicate gate architecture; "
-                    "cannot build a distinct candidate"
-                )
+            harvested.append(candidate)
+            new_this_attempt += 1
+        if harvested and new_this_attempt == 0:
+            break  # productive streak drained; stop polishing
+        if not harvested:
+            # Duplicate-stall guard only applies while nothing valid exists.
+            if any("structurally identical" in e for e in errors):
+                duplicate_attempts += 1
+                if duplicate_attempts >= max_attempts_per_duplicate:
+                    raise RuntimeError(
+                        "LLM kept re-emitting a duplicate gate architecture; "
+                        "cannot build a distinct candidate"
+                    )
         previous_error = "; ".join(errors) or "No usable <gate> source was found"
-    raise RuntimeError(f"LLM did not generate a valid gate after {attempts} attempts: {previous_error}")
+    if not harvested:
+        raise RuntimeError(f"LLM did not generate a valid gate after {attempts} attempts: {previous_error}")
+    (artifact_dir / "gate.py").write_text(harvested[0].rstrip() + "\n", encoding="utf-8")
+    if len(harvested) > 1:
+        print(
+            f"[GATE SEARCH] proposal round harvested {len(harvested)} valid "
+            "distinct gates (pool)"
+        )
+    return harvested

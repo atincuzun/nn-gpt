@@ -330,9 +330,10 @@ def _run_generate(tmp_path, outputs, *, reference="", seen=None, attempts=3):
 
 def test_generator_accepts_valid_gate_and_records_prompt(tmp_path: Path):
     chatbot_holder = _ScriptedChatBot([f"<gate>\n{GATE_SOURCE}\n</gate>"])
-    source = _generate_gate(chatbot_holder, [(8, 4)], 3, 64, tmp_path,
-                            reference_source=GATE_SOURCE)
-    assert structural_hash(source) == structural_hash(GATE_SOURCE)
+    sources = _generate_gate(chatbot_holder, [(8, 4)], 3, 64, tmp_path,
+                             reference_source=GATE_SOURCE)
+    assert len(sources) == 1
+    assert structural_hash(sources[0]) == structural_hash(GATE_SOURCE)
     assert (tmp_path / "gate.py").is_file()
     assert (tmp_path / "proposal_prompt.txt").is_file()
     # The proposal must not inherit a CV-style system prompt.
@@ -340,14 +341,34 @@ def test_generator_accepts_valid_gate_and_records_prompt(tmp_path: Path):
     assert GATE_SOURCE.strip() in chatbot_holder.prompts[0]
 
 
+def test_generator_harvests_all_valid_gates_from_one_response(tmp_path: Path):
+    """Nothing usable is discarded: multiple valid distinct gates in one
+    response are all returned, order preserved."""
+    raw = f"<gate>\n{GATE_SOURCE}\n</gate>\n<gate>\n{DISTINCT_GATE}\n</gate>"
+    sources = _run_generate(tmp_path, [raw])
+    assert [structural_hash(s) for s in sources] == [
+        structural_hash(GATE_SOURCE), structural_hash(DISTINCT_GATE)]
+    # First harvested gate is the round's artifact.
+    assert structural_hash((tmp_path / "gate.py").read_text(encoding="utf-8"))         == structural_hash(GATE_SOURCE)
+
+
+def test_generator_harvest_stops_after_first_dry_attempt(tmp_path: Path):
+    """Once something valid is harvested, one dry attempt ends the round."""
+    raw_good = f"<gate>\n{GATE_SOURCE}\n</gate>"
+    sources = _run_generate(tmp_path, [raw_good, "no gate here", raw_good])
+    assert len(sources) == 1
+    assert len(chatbot_attempt_files := list(tmp_path.glob("generation_attempt_*.txt"))) == 2
+
+
+
 def test_generator_rejects_duplicate_and_retries_with_distinct_gate(tmp_path: Path):
     seen = {structural_hash(GATE_SOURCE)}
-    source = _run_generate(
+    sources = _run_generate(
         tmp_path,
         [f"<gate>\n{REFORMATTED_GATE}\n</gate>", f"<gate>\n{DISTINCT_GATE}\n</gate>"],
         seen=seen,
     )
-    assert structural_hash(source) == structural_hash(DISTINCT_GATE)
+    assert [structural_hash(s) for s in sources] == [structural_hash(DISTINCT_GATE)]
     # The duplicate is now recorded so later rounds also avoid it.
     assert structural_hash(DISTINCT_GATE) in seen
 
@@ -365,11 +386,11 @@ def test_generator_fails_when_only_duplicates_are_emitted(tmp_path: Path):
 
 
 def test_generator_retries_after_invalid_source(tmp_path: Path):
-    source = _run_generate(
+    sources = _run_generate(
         tmp_path,
         ["<gate>\nimport os\n</gate>", f"<gate>\n{GATE_SOURCE}\n</gate>"],
     )
-    assert structural_hash(source) == structural_hash(GATE_SOURCE)
+    assert structural_hash(sources[0]) == structural_hash(GATE_SOURCE)
 
 
 # ── CLI / validation ─────────────────────────────────────────────────────────
