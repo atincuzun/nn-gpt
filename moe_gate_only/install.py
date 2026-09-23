@@ -157,14 +157,16 @@ def _install_gate_site(site: GateSite, new_gate: nn.Module, top_k: Optional[int]
         else:
             wrapped = _wrap_gate_for_contract(site, new_gate, top_k)
             _copy_gate_attrs(site.gate, wrapped)
-            wrapped.train(site.gate.training)
+            # The block is attached to the live model, so its training flag is
+            # current; the native gate may be detached with a stale flag.
+            wrapped.train(site.block.training)
             _assign_child(site.block, site.gate_attr, wrapped)
             installed_gate = wrapped
 
     elif site.pattern == "parameter_gate":
         wrapped = _wrap_gate_for_contract(site, new_gate, top_k)
         _copy_gate_attrs(site.gate, wrapped)
-        wrapped.train(site.gate.training)
+        wrapped.train(site.block.training)
         _assign_child(site.block, site.gate_attr, wrapped)
         installed_gate = wrapped
 
@@ -378,10 +380,19 @@ def install_gates(
         if not installs:
             raise ValueError("No MoE gates found in the model")
 
-        if verify and not _verify_forward(model, installs, sample_input=sample_input):
-            raise RuntimeError(
-                "Gate installation failed verification and was rolled back"
-            )
+        if verify:
+            verify_errors: List[BaseException] = []
+            if not _verify_forward(
+                model, installs, sample_input=sample_input, errors=verify_errors,
+            ):
+                detail = ""
+                if verify_errors:
+                    cause = verify_errors[-1]
+                    detail = f" ({type(cause).__name__}: {cause})"
+                raise RuntimeError(
+                    "Gate installation failed verification and was rolled back"
+                    + detail
+                )
 
         # Register hooks only after verification so verify-forward does not
         # pollute the first call to get_gate_logits().

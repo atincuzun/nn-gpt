@@ -16,11 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 def _verify_forward(model: nn.Module, installs: List[GateInstall],
-                    sample_input: Optional[Any] = None) -> bool:
+                    sample_input: Optional[Any] = None,
+                    errors: Optional[List[BaseException]] = None) -> bool:
     """Run a dummy forward to verify the model still works after replacement.
 
     Returns ``True`` if the forward succeeds or if the model is on meta
-    device (where forward is impossible).
+    device (where forward is impossible).  When ``errors`` is provided, every
+    caught forward exception is appended to it so callers can report the real
+    cause instead of a bare boolean (an install-time CUDA OOM otherwise hides
+    behind "failed verification").
     """
     if not installs:
         return True
@@ -36,6 +40,34 @@ def _verify_forward(model: nn.Module, installs: List[GateInstall],
     except StopIteration:
         device = torch.device("cpu")
 
+    # A verification smoke pass must never depend on the ambient train/eval
+    # state.  Train-mode DeepSeek MoE blocks apply AddAuxiliaryLoss with the
+    # gate's aux output; an eval-flagged replacement wrapper returns None
+    # there and the forward dies with "'NoneType' object has no attribute
+    # 'numel'" (stale native-gate flags after a restore make exactly that
+    # combination reachable).  Evaluate in eval mode, then restore the mode.
+    was_training = model.training
+    model.eval()
+    try:
+        return _verify_forward_eval(model, installs, sample_input, errors, device)
+    finally:
+        model.train(was_training)
+
+
+def _verify_forward_eval(
+    model: nn.Module,
+    installs: List[GateInstall],
+    sample_input: Optional[Any],
+    errors: Optional[List[BaseException]],
+    device: Any,
+) -> bool:
+    def _record(exc: BaseException, stage: str) -> None:
+        if errors is not None:
+            errors.append(exc)
+        logger.warning(
+            "Gate verification forward failed (%s): %s", stage, exc, exc_info=exc,
+        )
+
     with torch.no_grad():
         if sample_input is not None:
             try:
@@ -43,7 +75,7 @@ def _verify_forward(model: nn.Module, installs: List[GateInstall],
                 _forward_with_sample(model, sample)
                 return True
             except Exception as exc:
-                logger.debug("Gate verification with sample_input failed", exc_info=exc)
+                _record(exc, "sample_input")
                 return False
 
         vocab = _discover_vocab_size(model) or 1000
@@ -54,18 +86,18 @@ def _verify_forward(model: nn.Module, installs: List[GateInstall],
             model(ids)
             return True
         except Exception as exc:
-            logger.debug("Gate verification with positional input_ids failed", exc_info=exc)
+            _record(exc, "positional input_ids")
         try:
             model(input_ids=ids)
             return True
         except Exception as exc:
-            logger.debug("Gate verification with keyword input_ids failed", exc_info=exc)
+            _record(exc, "keyword input_ids")
         # Try seq2seq forward
         try:
             model(input_ids=ids, decoder_input_ids=ids)
             return True
         except Exception as exc:
-            logger.debug("Gate verification with seq2seq input_ids failed", exc_info=exc)
+            _record(exc, "seq2seq input_ids")
     return False
 
 

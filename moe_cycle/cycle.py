@@ -97,6 +97,23 @@ def _log_cuda_memory(label: str) -> dict[str, float] | None:
     return status
 
 
+def _release_cuda_memory() -> None:
+    """Return fragmented CUDA reserve to the driver between candidates.
+
+    A candidate that OOMs leaves GiBs reserved-but-unallocated; the next
+    candidate's install-verification forward then inherits the shortage and
+    fails for no architectural reason (run 20260922_222052: gates 032/033
+    were rolled back this way right after gate 031's training OOM).
+    """
+    import gc
+
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _nas_prefixes(args: Namespace) -> tuple[str, ...]:
     """Return stable LEMUR prefixes including this cycle's generated models."""
     values = [*args.sft_nn_prefixes, args.nn_name_prefix]
@@ -585,6 +602,10 @@ def _install_and_verify(ctx: RunContext) -> None:
     session = ctx.session
     gate_dir = ctx.gate_dir
 
+    # A previous candidate's gate training leaves the model in train mode
+    # with use_cache disabled and stale flags on detached native gates; every
+    # install must start from the clean generation state.
+    _prepare_model_for_generation(ctx)
     _seed_all(args.seed)
     replace_kwargs = {
         "layers": args.layers,
@@ -949,6 +970,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         def log_step(step: int, loss: float) -> None:
             print(f"epoch={epoch} gate_step={step:04d} total_loss={loss:.6f}")
 
+        oom_recovered = False
         try:
             result, optimizer = train_gates(
                 session.model,
@@ -965,22 +987,31 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             _log_cuda_memory(f"epoch={epoch} gate-training OOM")
             print(
                 "[VRAM] Gate-training OOM: 4-bit quantization reduces frozen "
-                "weights but not attention/MLP activations. Keep gradient "
-                "checkpointing enabled (the default), reduce --max-length, "
-                "or reduce --batch-size."
+                "weights but not attention/MLP activations. Harvesting the "
+                "epochs measured so far and stopping this candidate early "
+                "instead of discarding its score; reduce --max-length or "
+                "--batch-size to avoid a recurrence."
             )
-            raise
+            _release_cuda_memory()
+            oom_recovered = True
+            result = None
+            optimizer = None
         post_training_vram = _log_cuda_memory(
             f"epoch={epoch} after gate training"
         )
 
         validation_loss = None
-        if val_loader is not None:
-            validation_loss = evaluate_language_model_loss(
-                session.model,
-                val_loader,
-                max_steps=args.validation_steps,
-            )
+        if val_loader is not None and not oom_recovered:
+            try:
+                validation_loss = evaluate_language_model_loss(
+                    session.model,
+                    val_loader,
+                    max_steps=args.validation_steps,
+                )
+            except torch.cuda.OutOfMemoryError:
+                print(f"[epoch={epoch}] validation-loss evaluation OOM; skipping it")
+                _release_cuda_memory()
+                validation_loss = None
 
         if args.gradient_checkpointing:
             if hasattr(session.model, "disable_input_require_grads"):
@@ -998,9 +1029,10 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             "gradient_checkpointing": args.gradient_checkpointing,
             "vram_before_training": pre_training_vram,
             "vram_after_training": post_training_vram,
-            "steps": result.steps,
-            "mean_train_loss": result.mean_train_loss,
+            "steps": result.steps if result is not None else 0,
+            "mean_train_loss": result.mean_train_loss if result is not None else None,
             "validation_loss": validation_loss,
+            "oom_recovered": oom_recovered,
             "current_cycle_cv_success": cycle_cv_success,
             "current_cycle_models_trained": cycle_models_trained,
             "outer_gate_search": outer_mode,
@@ -1034,7 +1066,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         if outer_mode:
             epoch_metrics = _harvest_epoch_metrics(
                 epoch, epoch_path, gate_feedback, cycle_results,
-                cycle_models_trained, result.mean_train_loss, validation_loss,
+                cycle_models_trained,
+                result.mean_train_loss if result is not None else None,
+                validation_loss,
                 active_layers,
             )
             ctx.gate_epoch_metrics.append(epoch_metrics)
@@ -1043,6 +1077,15 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 epoch_metrics,
             )
 
+        if oom_recovered:
+            # The candidate keeps the epochs it already measured; a truncated
+            # protocol beats discarding a working gate (its score averages the
+            # epochs that completed).
+            print(
+                f"[epoch={epoch}] gate training OOM recovered: stopping candidate "
+                f"early with {len(ctx.gate_epoch_metrics)} harvested epoch(s)"
+            )
+            break
         print(
             f"[epoch={epoch}] train_loss={result.mean_train_loss:.6f} "
             f"val_loss={validation_loss}"
@@ -1299,7 +1342,10 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
             "n_measured": 0,
             "n_attempted": 0,
         },
-        "epochs": [],
+        # Partial measurements survive the failure: the candidate stays
+        # ineligible (it never completed the protocol) but its epochs remain
+        # analysable instead of being discarded with the record.
+        "epochs": ctx.gate_epoch_metrics,
         "failure": reason[:2000],
     }
     write_gate_summary(ctx.gate_root, gate_id, record)
@@ -1411,6 +1457,11 @@ def _run_candidate_once(
     except Exception as exc:
         _record_failed_candidate(ctx, gate_id, exc)
         return []
+    finally:
+        # Whether the candidate succeeded or was rejected, hand fragmented
+        # CUDA reserve back to the driver so the next install-verification
+        # forward is not doomed by this candidate's peak usage.
+        _release_cuda_memory()
 
 
 def _prepare_rematch_candidate(ctx: RunContext, gate_id: int, source_gate_id: int) -> None:
@@ -1597,7 +1648,18 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
             and candidates_run % getattr(args, "gate_sft_every", 10) == 0
         ):
             sft_batch += 1
-            new_version = _run_sft_batch_under_best_gate(ctx, sft_batch)
+            try:
+                new_version = _run_sft_batch_under_best_gate(ctx, sft_batch)
+            except Exception as exc:
+                # The proposer SFT has never run end-to-end on this hardware;
+                # a broken batch must not take the whole search down with it.
+                _release_cuda_memory()
+                print(
+                    f"[GATE SEARCH] proposer SFT batch {sft_batch} failed "
+                    f"({type(exc).__name__}: {exc}); continuing with proposer "
+                    f"{ctx.llm_version}"
+                )
+                new_version = None
             if new_version is not None:
                 ctx.llm_version = new_version
                 if not getattr(args, "gate_no_rematch", False):

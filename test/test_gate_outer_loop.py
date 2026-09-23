@@ -125,8 +125,15 @@ def test_score_of_empty_metrics_is_empty():
 
 # ── storage ──────────────────────────────────────────────────────────────────
 
-def _write_gate(root, gate_id, accuracy, *, eligible=True, source=GATE_SOURCE,
+def _write_gate(root, gate_id, accuracy, *, eligible=True, source=None,
                 task="img-classification", dataset="cifar-10", metric="acc"):
+    if source is None:
+        # Distinct architecture per gate: build_gate_pairs excludes
+        # same-architecture reruns by structural hash, so a shared default
+        # source would silently empty the pair set.
+        source = GATE_SOURCE.replace(
+            "class LLMGeneratedGate", f"class LLMGeneratedGateV{gate_id}"
+        )
     record = {
         "gate_id": gate_id,
         "gate_code": source,
@@ -412,10 +419,16 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
 
     recorded = {}
 
+    class _FakeModel:
+        config = SimpleNamespace(use_cache=False)
+
+        def eval(self):
+            return self
+
     class _FakeSession:
         installs = []
         gate_source = None
-        model = object()
+        model = _FakeModel()
 
         def replace_source(self, source, **kwargs):
             recorded["replace_kwargs"] = kwargs
@@ -434,6 +447,7 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
             gate_init_noise_scale=0.0,
             gate_random_init=True,
             load_in_8bit=False,
+            gradient_checkpointing=False,
         )
         session = _FakeSession()
         gate_dir = tmp_path

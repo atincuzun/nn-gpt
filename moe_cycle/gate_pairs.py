@@ -17,6 +17,17 @@ from .gate_store import load_gate_summaries
 PAIR_REQUIRED_MATCH = ("task", "dataset", "metric")
 
 
+def _same_architecture(lower: dict, higher: dict) -> bool:
+    """True when both records carry the same structural hash (a rerun)."""
+    lower_hash = lower.get("structural_hash")
+    higher_hash = higher.get("structural_hash")
+    return (
+        lower_hash is not None
+        and higher_hash is not None
+        and lower_hash == higher_hash
+    )
+
+
 def eligible_gates(root, *, required_match: tuple[str, ...] = PAIR_REQUIRED_MATCH) -> list[dict]:
     """Gates with a usable score, grouped-friendly for pairing."""
     gates = []
@@ -62,6 +73,12 @@ def build_gate_pairs(
             for higher in gates[lower_index + 1:]:
                 gap = higher["score"]["accuracy"] - lower["score"]["accuracy"]
                 if gap <= min_accuracy_gap:
+                    continue
+                if _same_architecture(lower, higher):
+                    # Reruns of one architecture (e.g. seed gates re-scored in
+                    # a later run) teach SFT nothing architectural — trained
+                    # on them it would learn to echo the reference verbatim,
+                    # which is exactly the behavior the proposer must unlearn.
                     continue
                 pairs.append({
                     "pair_id": f"{lower['gate_id']:03d}->{higher['gate_id']:03d}",
