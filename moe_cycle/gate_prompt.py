@@ -47,6 +47,7 @@ def gate_proposal_prompt(
     reference_accuracy: float | None = None,
     goal_accuracy: float | None = None,
     dataset: str | None = None,
+    inherit_reference: bool = False,
 ) -> str:
     """Single-reference gate proposal prompt, LEMUR-CV pairing style.
 
@@ -67,7 +68,27 @@ def gate_proposal_prompt(
             f"accuracy of the neural networks generated through it{dataset_text}."
         )
     if reference_source.strip():
-        if reference_accuracy is not None:
+        if inherit_reference:
+            if reference_accuracy is not None:
+                reference_sentence = (
+                    "The following reference gate is your current router "
+                    f"architecture; it achieved a mean CV accuracy of {reference_accuracy:.4f} "
+                    "under identical evaluation conditions. Its trained weights are "
+                    "copied into your new code by parameter name. Improve it by "
+                    "extending it."
+                )
+            else:
+                reference_sentence = (
+                    "The following reference gate is your current router "
+                    "architecture. Its trained weights are copied into your new "
+                    "code by parameter name. Improve it by extending it."
+                )
+            closing = (
+                "Keep the reference's module and parameter names for every part "
+                "you reuse; put all new ideas in new submodules.\n\n"
+                "Respond with only the complete Python module between `<gate>` and `</gate>`."
+            )
+        elif reference_accuracy is not None:
             reference_sentence = (
                 "Use the following reference gate, which achieved a mean CV "
                 f"accuracy of {reference_accuracy:.4f} under identical "
@@ -75,20 +96,25 @@ def gate_proposal_prompt(
                 "inspiration. Improve it by making fundamental changes to the "
                 "gate design."
             )
+            closing = (
+                "Develop your own architecture rather than copying the reference. "
+                "Your design must go beyond the reference's mechanism, not restate it.\n\n"
+                "Respond with only the complete Python module between `<gate>` and `</gate>`."
+            )
         else:
             reference_sentence = (
                 "Use the following reference gate as the baseline for "
                 "architectural inspiration. Improve it by making fundamental "
                 "changes to the gate design."
             )
+            closing = (
+                "Develop your own architecture rather than copying the reference. "
+                "Your design must go beyond the reference's mechanism, not restate it.\n\n"
+                "Respond with only the complete Python module between `<gate>` and `</gate>`."
+            )
         reference_block = (
-            "Baseline gate code:\n"
+            ("Current gate code:" if inherit_reference else "Baseline gate code:") + "\n"
             f"<gate>\n{reference_source.strip()}\n</gate>\n"
-        )
-        closing = (
-            "Develop your own architecture rather than copying the reference. "
-            "Your design must go beyond the reference's mechanism, not restate it.\n\n"
-            "Respond with only the complete Python module between `<gate>` and `</gate>`."
         )
     else:
         reference_sentence = ""
@@ -140,12 +166,18 @@ def gate_proposal_prompt(
 * The output must be a single tensor containing finite raw router logits.
 
 * Expose exactly:
-  `self.base = nn.Linear(model_dim, num_experts, bias=False)`
+  `self.base = nn.Linear(model_dim, num_experts, bias=False)`""")
+    if inherit_reference:
+        parts.append("""
+* The host copies the reference gate's trained weights into your modules by parameter name: every name you keep, including `self.base`, receives the reference's trained value.
 
+* After that copy, the complete gate must reproduce the reference gate's output exactly for arbitrary valid inputs. Keep every reused module computationally unchanged, and make each new branch contribute exactly zero at initialization (zero-initialize its output layer) so only training moves the gate away from the reference's behavior.""")
+    else:
+        parts.append("""
 * The host system copies the native router weights into `self.base`.
 
-* Immediately after initialization and after those native weights have been copied, the complete gate must reproduce `self.base(x)` exactly for arbitrary valid inputs.
-
+* Immediately after initialization and after those native weights have been copied, the complete gate must reproduce `self.base(x)` exactly for arbitrary valid inputs.""")
+    parts.append("""
 * Additional trainable parameters must nevertheless be connected to the output computation so that optimization can move the gate away from its initialization behavior.
 
 * Softmax, expert selection, top-k routing, auxiliary routing losses, and expert dispatch are handled externally. Do not implement them.
@@ -225,7 +257,8 @@ def is_duplicate_gate(source: str, seen_hashes: set[str]) -> bool:
         return False
 
 
-def gate_sft_examples(pairs: list[dict], shapes) -> list[dict]:
+def gate_sft_examples(pairs: list[dict], shapes, *,
+                      inherit_reference: bool = False) -> list[dict]:
     """Outer-loop SFT supervision, LEMUR-CV pairing style (NN_gen.json mirror).
 
     Each pair becomes one training row exactly like the CV improvement rows:
@@ -242,6 +275,7 @@ def gate_sft_examples(pairs: list[dict], shapes) -> list[dict]:
             reference_accuracy=pair.get("lower_accuracy"),
             goal_accuracy=pair.get("higher_accuracy"),
             dataset=pair.get("dataset"),
+            inherit_reference=inherit_reference,
         )
         examples.append({
             "pair_id": pair["pair_id"],

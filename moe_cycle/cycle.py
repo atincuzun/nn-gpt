@@ -29,6 +29,8 @@ from .morphism import (
     _model_logits,
     _perturb_gate_weights,
     _seed_all,
+    carry_gate_weights,
+    verify_parent_function_carry,
 )
 
 
@@ -63,6 +65,10 @@ class RunContext:
     llm_version: str = "base"
     rematch_for: int | None = None
     gate_pool: list = field(default_factory=list)
+    seeded: bool = False
+    carry_source_id: int | None = None
+    parent_logits: Any = None
+    carry_forward_metrics: dict | None = None
 
 
 def _log_cuda_memory(label: str) -> dict[str, float] | None:
@@ -154,6 +160,23 @@ def _validate_args(args: Namespace) -> None:
             "--gate-author last/best installs a trained gate while proposing and "
             "only makes sense with --gate-outer-search"
         )
+    carry_mode = getattr(args, "gate_carry_forward", None)
+    if carry_mode is not None:
+        if not args.gate_outer_search:
+            raise ValueError(
+                "--gate-carry-forward carries trained gate weights between outer "
+                "candidates and requires --gate-outer-search"
+            )
+        if args.gate_author not in ("native", carry_mode):
+            raise ValueError(
+                f"--gate-carry-forward {carry_mode} conflicts with "
+                f"--gate-author {args.gate_author}; pick one gate selection mode"
+            )
+        if args.gate_init_noise_scale != 0:
+            raise ValueError(
+                "--gate-carry-forward continues from trained weights; "
+                "--gate-init-noise-scale must remain 0"
+            )
     if getattr(args, "gate_phase_b", False):
         raise NotImplementedError(
             "--gate-phase-b is a reserved switch. Phase B is implemented as "
@@ -436,6 +459,7 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             goal_accuracy=goal_accuracy,
             dataset=dataset,
             seen_hashes=seen_hashes,
+            inherit_reference=getattr(args, "gate_carry_forward", None) is not None,
         )
         source = sources[0]
         if len(sources) > 1:
@@ -479,21 +503,50 @@ def _select_author_gate_id(mode: str, gate_id: int, gate_root) -> int | None:
     raise ValueError(f"unknown gate author mode {mode!r}")
 
 
-def _install_author_gate(ctx: RunContext, author_gate_id: int) -> None:
-    """Install a previously trained gate so the LLM authors the next proposal
-    with that routing active.
+def _latest_trained_checkpoint(gate_root: Path, gate_id: int) -> Path | None:
+    """Newest ``gate_post_train`` checkpoint recorded for a store entry.
 
-    No equivalence checks: trained weights are not bit-exact with the native
-    router by design. Must run inside ``with ctx.session:`` with no gates
-    currently installed.
+    Scans every ``epochs/A*`` directory so a candidate that stopped mid-run
+    still carries its most recently trained weights.
+    """
+    from .gate_store import gate_dir as store_gate_dir
+
+    epochs_root = store_gate_dir(gate_root, gate_id) / "epochs"
+    if not epochs_root.is_dir():
+        return None
+    best: tuple[int, Path] | None = None
+    for directory in epochs_root.iterdir():
+        name = directory.name
+        if not (name.startswith("A") and name[1:].isdigit()):
+            continue
+        checkpoint = directory / "gate_post_train"
+        if not checkpoint.is_dir():
+            continue
+        epoch = int(name[1:])
+        if best is None or epoch > best[0]:
+            best = (epoch, checkpoint)
+    return best[1] if best else None
+
+
+def _install_author_gate(ctx: RunContext, author_gate_id: int, *,
+                         mode: str | None = None,
+                         purpose: str | None = None) -> None:
+    """Install a previously trained gate so the LLM works under its routing.
+
+    Used while the LLM authors the next proposal and while proposer SFT
+    batches run. No equivalence checks: trained weights are not bit-exact
+    with the native router by design. Must run inside ``with ctx.session:``
+    with no gates currently installed.
     """
     args = ctx.args
     from .gate_store import gate_dir as store_gate_dir
 
     author_root = store_gate_dir(ctx.gate_root, author_gate_id)
-    checkpoint = author_root / "epochs" / f"A{args.epochs - 1}" / "gate_post_train"
-    if not checkpoint.is_dir():
-        raise FileNotFoundError(f"Author gate checkpoint not found: {checkpoint}")
+    checkpoint = _latest_trained_checkpoint(ctx.gate_root, author_gate_id)
+    if checkpoint is None:
+        raise FileNotFoundError(
+            f"Author gate checkpoint not found under {author_root / 'epochs'}"
+        )
     session = ctx.session
     session.replace_source(
         (author_root / "gate.py").read_text(encoding="utf-8"),
@@ -507,10 +560,16 @@ def _install_author_gate(ctx: RunContext, author_gate_id: int) -> None:
         initialize_from_original=True,
     )
     session.load_weights(checkpoint)
-    print(
-        f"[GATE AUTHOR] gate {args.gate_author} mode: next proposal is authored "
-        f"under trained gate {author_gate_id:03d} ({checkpoint})"
-    )
+    if purpose is None:
+        print(
+            f"[GATE AUTHOR] gate {mode or args.gate_author} mode: next proposal is authored "
+            f"under trained gate {author_gate_id:03d} ({checkpoint})"
+        )
+    else:
+        print(
+            f"[GATE AUTHOR] gate {mode or args.gate_author} mode: trained gate "
+            f"{author_gate_id:03d} installed for {purpose} ({checkpoint})"
+        )
 
 
 def _install_and_verify(ctx: RunContext) -> None:
@@ -545,6 +604,32 @@ def _install_and_verify(ctx: RunContext) -> None:
         ),
         **replace_kwargs,
     )
+    carried = False
+    carry_source_id = getattr(ctx, "carry_source_id", None)
+    if getattr(args, "gate_carry_forward", None) is not None and carry_source_id is not None:
+        checkpoint = _latest_trained_checkpoint(ctx.gate_root, carry_source_id)
+        if checkpoint is None:
+            print(
+                f"[GATE CARRY] gate {carry_source_id:03d} has no trained checkpoint "
+                "yet; installing from the native copy"
+            )
+        else:
+            ctx.carry_forward_metrics = carry_gate_weights(session.installs, checkpoint)
+            ctx.carry_forward_metrics.update({
+                "mode": args.gate_carry_forward,
+                "source_gate_id": carry_source_id,
+                "target_gate_id": ctx.candidate_index,
+            })
+            (gate_dir / "carry_forward.json").write_text(
+                json.dumps(ctx.carry_forward_metrics, indent=2), encoding="utf-8",
+            )
+            carried = True
+            print(
+                f"[GATE CARRY] trained weights of gate {carry_source_id:03d} -> "
+                f"gate {ctx.candidate_index:03d} initialization "
+                f"({ctx.carry_forward_metrics['n_parameters_copied']} parameters copied, "
+                f"{ctx.carry_forward_metrics['n_parameters_fresh']} fresh)"
+            )
     initialization_metrics = [] if args.gate_random_init else _perturb_gate_weights(
         session.installs, args.gate_init_noise_scale, args.seed
     )
@@ -556,6 +641,10 @@ def _install_and_verify(ctx: RunContext) -> None:
         raise RuntimeError("Replacement gates produced non-finite model logits")
     max_abs_diff = float((ctx.native_logits - replacement_logits).abs().max().item())
     equivalent = bool(torch.allclose(ctx.native_logits, replacement_logits, rtol=1e-5, atol=1e-5))
+    parent_check = None
+    parent_logits = getattr(ctx, "parent_logits", None)
+    if carried and parent_logits is not None:
+        parent_check = verify_parent_function_carry(parent_logits, replacement_logits)
     equivalence = {
         "equivalent": equivalent,
         "max_abs_logit_difference": max_abs_diff,
@@ -566,21 +655,44 @@ def _install_and_verify(ctx: RunContext) -> None:
         "load_in_8bit": args.load_in_8bit,
         "native_forward_bit_repeatable": ctx.native_repeatable,
         "native_repeat_max_abs_logit_difference": ctx.native_repeat_max_abs_difference,
+        "carried_trained_weights": carried,
+        "carry_source_gate_id": carry_source_id,
+        "parent_function_equivalent": parent_check["equivalent"] if parent_check else None,
+        "parent_logit_bit_exact": parent_check["bit_exact"] if parent_check else None,
+        "parent_logit_max_abs_difference": (
+            parent_check["max_abs_difference"] if parent_check else None
+        ),
     }
     (gate_dir / "step_zero_equivalence.json").write_text(
         json.dumps(equivalence, indent=2), encoding="utf-8",
     )
+    if parent_check is not None and not parent_check["equivalent"]:
+        # Reject-and-continue: the candidate is recorded as failed by the
+        # caller, the incumbent stays the self.
+        raise RuntimeError(
+            "Function-preserving carry failed: the successor gate does not "
+            "reproduce the parent gate's step-zero logits "
+            f"(max_abs_difference={parent_check['max_abs_difference']:.6g}); "
+            "keep the inherited modules unchanged and put new capacity in "
+            "zero-initialized branches"
+        )
     skip_step_zero_verify = getattr(args, "gate_skip_step_zero_verify", False)
     if not equivalent and skip_step_zero_verify:
         print(
             "[GATE VERIFY] step-zero mismatch accepted (--gate-skip-step-zero-verify): "
             f"max_abs_difference={max_abs_diff}"
         )
+    if carried and not equivalent:
+        print(
+            "[GATE CARRY] step-zero logits diverge from native as expected after "
+            f"weight carry: max_abs_difference={max_abs_diff}"
+        )
     if (
         not args.gate_random_init
         and args.gate_init_noise_scale == 0
         and not equivalent
         and not skip_step_zero_verify
+        and not carried
     ):
         raise RuntimeError(
             "Replacement gates do not reproduce native step-zero model logits: "
@@ -989,8 +1101,10 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "gate_code": ctx.gate_source,
         "structural_hash": structural_hash(ctx.gate_source),
         "reference_gate_id": ctx.reference_gate_id,
-        "author_mode": ctx.args.gate_author,
+        "author_mode": getattr(ctx.args, "gate_carry_forward", None) or ctx.args.gate_author,
         "author_gate_id": ctx.author_gate_id,
+        "carry_source_gate_id": getattr(ctx, "carry_source_id", None),
+        "carry_forward": getattr(ctx, "carry_forward_metrics", None),
         "rematch_for": getattr(ctx, "rematch_for", None),
         "llm_version": getattr(ctx, "llm_version", "base"),
         "seeded": getattr(ctx, "seeded", False),
@@ -1049,6 +1163,7 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         "epochs": args.epochs,
         "gate_candidates": args.gate_candidates,
         "gate_author": args.gate_author,
+        "gate_carry_forward": getattr(args, "gate_carry_forward", None),
         "gate_outer_search": ctx.outer_summary,
         "run_root": str(ctx.run_root),
     }
@@ -1056,7 +1171,9 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         candidate_root = nngpt_dir / "gate_candidates" / f"candidate_{candidate_index:03d}"
         candidate: dict[str, Any] = {
             "gate_source": str(candidate_root / "gate_source" / "gate.py"),
-            "independent_native_initialization": True,
+            "independent_native_initialization": (
+                getattr(args, "gate_carry_forward", None) is None
+            ),
         }
         for epoch, epoch_path in enumerate(epoch_paths):
             training_path = epoch_path / "gate_training_metrics.json"
@@ -1168,8 +1285,10 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
         "gate_code": ctx.gate_source,
         "structural_hash": structural_hash(ctx.gate_source) if ctx.gate_source else None,
         "reference_gate_id": ctx.reference_gate_id,
-        "author_mode": ctx.args.gate_author,
+        "author_mode": getattr(ctx.args, "gate_carry_forward", None) or ctx.args.gate_author,
         "author_gate_id": ctx.author_gate_id,
+        "carry_source_gate_id": getattr(ctx, "carry_source_id", None),
+        "carry_forward": getattr(ctx, "carry_forward_metrics", None),
         "rematch_for": ctx.rematch_for,
         "llm_version": ctx.llm_version,
         "seeded": getattr(ctx, "seeded", False),
@@ -1205,12 +1324,17 @@ def _run_candidate_once(
     ctx.reference_gate_id = None
     ctx.gate_epoch_metrics = []
     ctx.seeded = False
+    ctx.carry_source_id = None
+    ctx.parent_logits = None
+    ctx.carry_forward_metrics = None
+    carry_mode = getattr(args, "gate_carry_forward", None)
+    author_mode = carry_mode or args.gate_author
     author_gate_id = (
         None if rematch_for is not None
-        else _select_author_gate_id(args.gate_author, gate_id, ctx.gate_root)
+        else _select_author_gate_id(author_mode, gate_id, ctx.gate_root)
     )
     ctx.author_gate_id = author_gate_id
-    if args.gate_author == "best" and gate_id > 0 and author_gate_id is None:
+    if author_mode == "best" and gate_id > 0 and author_gate_id is None:
         print("[GATE AUTHOR] no eligible best gate yet; proposing under native routing")
     pooled_source = None
     if not seed and rematch_for is None and ctx.gate_pool:
@@ -1223,6 +1347,20 @@ def _run_candidate_once(
         with ctx.session:
             if rematch_for is not None:
                 _prepare_rematch_candidate(ctx, gate_id, rematch_for)
+                if carry_mode is not None:
+                    # Function-carry verification needs the parent's logits:
+                    # reinstall the re-measured gate with its trained weights,
+                    # capture, and restore before the successor is installed.
+                    try:
+                        _install_author_gate(ctx, rematch_for, mode=carry_mode)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        _prepare_model_for_generation(ctx)
+                        ctx.parent_logits = _model_logits(
+                            ctx.session.model, ctx.sample_input
+                        )
+                        ctx.session.restore()
             elif seed:
                 # Cold-start bootstrap: built-in compliant gates fill the store
                 # with scored references before the proposer is trusted.
@@ -1230,7 +1368,7 @@ def _run_candidate_once(
             else:
                 if author_gate_id is not None:
                     try:
-                        _install_author_gate(ctx, author_gate_id)
+                        _install_author_gate(ctx, author_gate_id, mode=author_mode)
                     except FileNotFoundError as exc:
                         print(
                             f"[GATE AUTHOR] trained gate {author_gate_id:03d} unavailable "
@@ -1240,12 +1378,23 @@ def _run_candidate_once(
                         ctx.author_gate_id = None
                     else:
                         _prepare_model_for_generation(ctx)
+                        ctx.parent_logits = _model_logits(
+                            ctx.session.model, ctx.sample_input
+                        )
                         _propose_gate(ctx, gate_id, seen_hashes, source=pooled_source)
                         ctx.session.restore()
                 if author_gate_id is None:
                     # Round 0 and native mode: the proposal is authored with the
                     # native router active, outside the session.
                     _propose_gate(ctx, gate_id, seen_hashes, source=pooled_source)
+            if carry_mode is not None:
+                # Weight-carry source: the incumbent for fresh proposals, or the
+                # re-measured gate itself for a rematch. Seeds bootstrap from the
+                # native copy like every first-generation gate.
+                if rematch_for is not None:
+                    ctx.carry_source_id = rematch_for
+                elif not seed:
+                    ctx.carry_source_id = author_gate_id
             _install_and_verify(ctx)
             epoch_paths = _run_epochs(ctx)
         record = _write_gate_record(ctx)
@@ -1361,13 +1510,54 @@ def _run_phase_b_batch(ctx: RunContext, batch_index: int) -> str | None:
     return new_version
 
 
+def _run_sft_batch_under_best_gate(ctx: RunContext, batch_index: int) -> str | None:
+    """Run one proposer SFT batch with the best inner-loop gate installed.
+
+    The SFT loss is teacher-forced on gate-code text, but its forward pass is
+    still routed by the currently installed gates. The batch therefore runs
+    with the best gate candidate's architecture and trained weights active —
+    the same carried routing state the proposer will author proposals from —
+    instead of the native routers the session restores after every candidate.
+    Gate parameters themselves stay frozen; only the proposer LoRA trains
+    (full-model adaptation, unlike the gate-only training of the inner loop).
+
+    Without a scored incumbent, without a trained checkpoint, or when
+    installing/training under the carried gate fails, the batch falls back to
+    native routing so a broken incumbent can never block proposer training.
+    """
+    from .gate_store import best_gate
+
+    incumbent = best_gate(ctx.gate_root)
+    if incumbent is not None and _latest_trained_checkpoint(
+        ctx.gate_root, incumbent["gate_id"]
+    ) is not None:
+        try:
+            with ctx.session:
+                _install_author_gate(
+                    ctx, incumbent["gate_id"], mode="sft-carry",
+                    purpose=f"proposer SFT batch {batch_index}",
+                )
+                for install in ctx.session.installs:
+                    for parameter in install.new_gate.parameters():
+                        parameter.requires_grad_(False)
+                return _run_phase_b_batch(ctx, batch_index)
+        except Exception as exc:
+            print(
+                "[GATE SEARCH] proposer SFT batch under trained gate "
+                f"{incumbent['gate_id']:03d} failed ({type(exc).__name__}: {exc}); "
+                "falling back to native routing"
+            )
+    return _run_phase_b_batch(ctx, batch_index)
+
+
 def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
     """Self-improving gate search: propose, replace, train inner loop, measure, repeat.
 
     Bad candidates are rejected and recorded, never fatal. With
     ``--gate-outer-sft`` the proposer itself is fine-tuned every
-    ``--gate-sft-every`` candidates, followed by a king-of-the-hill re-measure
-    of the incumbent under the new proposer version.
+    ``--gate-sft-every`` candidates — under the best trained gate's routing —
+    followed by a king-of-the-hill re-measure of the incumbent under the new
+    proposer version.
     """
     from .gate_store import best_gate, load_gate_summaries, next_gate_id, summarize_gate
 
@@ -1407,7 +1597,7 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
             and candidates_run % getattr(args, "gate_sft_every", 10) == 0
         ):
             sft_batch += 1
-            new_version = _run_phase_b_batch(ctx, sft_batch)
+            new_version = _run_sft_batch_under_best_gate(ctx, sft_batch)
             if new_version is not None:
                 ctx.llm_version = new_version
                 if not getattr(args, "gate_no_rematch", False):
@@ -1455,7 +1645,12 @@ def main() -> None:
         candidate_epochs = []
         outer_feedback = ""
         for candidate_index in range(args.gate_candidates):
-            _prepare_gate_candidate(ctx, candidate_index, outer_feedback)
+            if outer_feedback:
+                # Pre-dates the keyword-only signature; accumulated results only
+                # reach later candidates through the log and the best-gate
+                # reference prompt.
+                print(outer_feedback)
+            _prepare_gate_candidate(ctx, candidate_index)
             # The context restores native routers after every candidate, so no
             # candidate inherits another candidate's trained gate parameters.
             with ctx.session:

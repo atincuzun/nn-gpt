@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import random
+from pathlib import Path
 from typing import Any
 
 
@@ -246,3 +248,104 @@ def _morphism_initialization_metrics(installs: list[Any]) -> list[dict[str, Any]
             **gate_metrics,
         })
     return metrics
+
+
+def verify_parent_function_carry(
+    parent_logits: Any,
+    replacement_logits: Any,
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+) -> dict[str, Any]:
+    """Check that a successor gate reproduces its parent's step-zero function.
+
+    With inherited modules copied by name and every new branch zero-initialized,
+    the successor must emit exactly the parent's model logits before training.
+    Divergence means the successor rewrote the inherited path (or the weight
+    carry lost parameters) and the function-preserving carry is broken.
+    """
+    import torch
+
+    parent_logits = parent_logits.detach().float().cpu()
+    replacement_logits = replacement_logits.detach().float().cpu()
+    difference = (parent_logits - replacement_logits).abs()
+    return {
+        "equivalent": bool(torch.allclose(parent_logits, replacement_logits, rtol=rtol, atol=atol)),
+        "bit_exact": bool(torch.equal(parent_logits, replacement_logits)),
+        "max_abs_difference": float(difference.max().item()),
+        "rtol": rtol,
+        "atol": atol,
+    }
+
+
+def carry_gate_weights(installs: list[Any], checkpoint_dir: Any) -> dict[str, Any]:
+    """Seed freshly installed gates with a parent gate's trained weights.
+
+    Parameters are matched by name: same-name, same-shape tensors are
+    overwritten with the parent's trained values (cast to the successor's
+    dtype/device), while parameters the parent never had keep their constructor
+    initialization. This is the ``--gate-carry-forward`` transfer: the successor
+    continues training where the parent stopped instead of restarting from the
+    native router copy.
+    """
+    import torch
+
+    source = Path(checkpoint_dir)
+    metadata = json.loads((source / "metadata.json").read_text(encoding="utf-8"))
+    payload = torch.load(source / "gate_weights.pt", map_location="cpu", weights_only=True)
+    states = payload["gate_states"]
+    by_path: dict[str, dict[str, Any]] = {}
+    by_layer: dict[int, dict[str, Any]] = {}
+    for site in metadata.get("sites", []):
+        saved = states.get(site.get("key"))
+        if saved is None:
+            continue
+        path = site.get("path")
+        if path:
+            if path in by_path and by_path[path] is not saved:
+                # Several sites share one path (some discovery modes record ""
+                # or reuse a name). Path matching could hand one layer's
+                # trained weights to another, so only layer_index is trusted.
+                by_path[path] = None
+            elif path not in by_path:
+                by_path[path] = saved
+        if site.get("layer_index") is not None:
+            by_layer[int(site["layer_index"])] = saved
+
+    site_reports: list[dict[str, Any]] = []
+    total_copied = 0
+    total_fresh = 0
+    for install in installs:
+        saved = by_path.get(install.site.path)
+        matched_by = "path" if saved is not None else None
+        if saved is None:
+            saved = by_layer.get(install.site.layer_index)
+            matched_by = "layer_index" if saved is not None else None
+        gate = install.new_gate
+        merged: dict[str, Any] = {}
+        copied: list[str] = []
+        fresh: list[str] = []
+        for name, value in gate.state_dict().items():
+            saved_value = saved.get(name) if saved else None
+            if isinstance(saved_value, torch.Tensor) and saved_value.shape == value.shape:
+                merged[name] = saved_value.to(device=value.device, dtype=value.dtype)
+                copied.append(name)
+            else:
+                merged[name] = value
+                fresh.append(name)
+        gate.load_state_dict(merged, strict=True)
+        total_copied += len(copied)
+        total_fresh += len(fresh)
+        site_reports.append({
+            "layer_index": install.site.layer_index,
+            "path": install.site.path,
+            "matched_parent_by": matched_by,
+            "parameters_copied": copied,
+            "parameters_fresh": fresh,
+        })
+    return {
+        "checkpoint": str(source),
+        "sites": site_reports,
+        "n_parameters_copied": total_copied,
+        "n_parameters_fresh": total_fresh,
+    }

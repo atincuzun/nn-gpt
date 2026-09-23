@@ -120,6 +120,7 @@ def _generate_gate(
     dataset: str | None = None,
     seen_hashes: set[str] | None = None,
     max_attempts_per_duplicate: int = 3,
+    inherit_reference: bool = False,
 ) -> list[str]:
     """Ask the LLM for replacement gate sources; HARVEST every valid distinct one.
 
@@ -142,6 +143,7 @@ def _generate_gate(
         reference_accuracy=reference_accuracy,
         goal_accuracy=goal_accuracy,
         dataset=dataset,
+        inherit_reference=inherit_reference,
     )
     seen = seen_hashes if seen_hashes is not None else set()
     artifact_dir.mkdir(parents=True, exist_ok=True)

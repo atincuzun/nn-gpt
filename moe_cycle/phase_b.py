@@ -133,11 +133,12 @@ class PairBatch:
 
 
 def _tokenise_pair(
-    pair: dict[str, Any], tokenizer: Any, shapes: Any, *, include_lower: bool = True
+    pair: dict[str, Any], tokenizer: Any, shapes: Any, *, include_lower: bool = True,
+    inherit_reference: bool = False,
 ) -> PairBatch:
     from .gate_prompt import gate_sft_examples
 
-    example = gate_sft_examples([pair], shapes)[0]
+    example = gate_sft_examples([pair], shapes, inherit_reference=inherit_reference)[0]
     messages = example["messages"]
     prompt_text = tokenizer.apply_chat_template(
         messages[:-1], tokenize=False, add_generation_prompt=True,
@@ -167,10 +168,13 @@ def _tokenise_pair(
 
 def build_pair_batches(
     pairs: list[dict[str, Any]], tokenizer: Any, shapes: Any, *,
-    include_lower: bool = True,
+    include_lower: bool = True, inherit_reference: bool = False,
 ) -> list[PairBatch]:
     return [
-        _tokenise_pair(pair, tokenizer, shapes, include_lower=include_lower)
+        _tokenise_pair(
+            pair, tokenizer, shapes,
+            include_lower=include_lower, inherit_reference=inherit_reference,
+        )
         for pair in pairs
     ]
 
@@ -211,8 +215,10 @@ def train_proposer(
     import torch.nn.functional as F
 
     model = session.model
+    inherit_reference = getattr(args, "gate_carry_forward", None) is not None
     batches = build_pair_batches(
         pairs, tokenizer, shapes, include_lower=(args.gate_sft_mode == "dpo"),
+        inherit_reference=inherit_reference,
     )
     if not batches:
         raise RuntimeError("Outer-loop SFT received no tokenisable gate pairs")
@@ -289,7 +295,7 @@ def train_proposer(
 
         rows = []
         for pair in pairs:
-            example = gate_sft_examples([pair], shapes)[0]
+            example = gate_sft_examples([pair], shapes, inherit_reference=inherit_reference)[0]
             prompt_text = tokenizer.apply_chat_template(
                 example["messages"][:-1], tokenize=False, add_generation_prompt=True,
             )

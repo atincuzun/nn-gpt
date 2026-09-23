@@ -259,6 +259,16 @@ def parse_args() -> argparse.Namespace:
         "initialization.",
     )
     parser.add_argument(
+        "--gate-carry-forward",
+        choices=("best", "last"),
+        help="Self-improving architecture mode (requires --gate-outer-search): the "
+        "selected trained gate ('best' scoring so far, or the 'last' candidate) stays "
+        "installed as the LLM's router architecture while it authors the next gate, "
+        "and its trained weights seed the successor's training (parameters matched by "
+        "name; parameters the parent never had keep their constructor initialization). "
+        "'best' is elitist: the incumbent only changes when a successor scores higher.",
+    )
+    parser.add_argument(
         "--gate-phase-b",
         action="store_true",
         help="Reserved Phase B switch: train the LLM on accumulated (lower -> higher) "
@@ -276,11 +286,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gate-outer-sft",
         action="store_true",
-        help="Phase B proposer training: every --gate-sft-every candidates, fine-tune "
+        help="Outer-loop proposer training: every --gate-sft-every candidates, fine-tune "
         "a LoRA adapter on the accumulated (lower -> higher) gate pairs so the LLM "
-        "authors better gates directly. Requires --gate-outer-search. The adapter "
+        "authors better gates directly. Requires --gate-outer-search. Each batch runs "
+        "with the best trained gate installed (architecture + carried weights), so the "
+        "proposer trains in the routing state it will propose from. The adapter "
         "stays active (unmerged) for the rest of the run; each gate record stores the "
-        "proposer version it was measured under.",
+        "proposer version it was measured under."
     )
     parser.add_argument("--gate-sft-every", type=int, default=10)
     parser.add_argument("--gate-sft-steps", type=int, default=30)
