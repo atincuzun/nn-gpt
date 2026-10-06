@@ -51,8 +51,7 @@ LEMUR neural-network dataset [@goodarzi2025lemur], evaluates it under a
 standardized protocol, and can feed the measured result back to improve the
 generator.
 
-The package combines several cooperating capabilities around a common LEMUR-based
-evaluation and logging substrate: prompt-driven generation and editing of network
+The package combines several cooperating capabilities around a common vision: prompt-driven generation and programmatical editing of network
 source code, hyperparameter recommendation, prediction of final accuracy and of
 the epoch at which it peaks, retrieval-augmented reuse of existing PyTorch
 blocks, and a reinforcement-learning loop. From a task configuration, `NNGPT`
@@ -73,9 +72,9 @@ image.
 
 # Statement of need
 
-Researchers studying LLM-generated neural-network programs need reusable
-infrastructure for generating candidates, checking interface conformity,
-evaluating their behaviour, and reusing measured outcomes in subsequent
+Researchers studying neural-network programs at scale need reusable
+infrastructure for candidate behaviour. This requires checking interface conformity,
+evaluating their dynamics, and reusing measured outcomes in subsequent
 generation and adaptation. AutoML and neural-architecture-search tools provide
 parts of this, and recent LLM-based methods can propose architectures or
 hyperparameters, but these pieces are usually tied to a specific method or
@@ -87,7 +86,7 @@ back to the generator. It combines, in one reusable open-source package, three
 capabilities that are otherwise spread across separate research prototypes and
 scripts: (i) an initial generation call that produces a candidate training
 program, followed by repair and bounded retries where needed before standardized
-evaluation; (ii) a predictor that estimates final accuracy and the epoch at which
+evaluation; (ii) decision on the final accuracy and the epoch at which
 it peaks from early training signals; and (iii) a feedback mechanism that turns
 execution results into new training data and reward signal for the generator.
 Because each accepted candidate is validated once and its code and measurements
@@ -110,23 +109,15 @@ search spaces, while tabular benchmarks such as NAS-Bench-101
 [@ying2019nasbench101] avoid training during search by serving precomputed
 evaluations for a fixed cell-based space.
 
-LLM-based methods are closer in spirit. EvoPrompting [@chen2023evoprompting]
+EvoPrompting [@chen2023evoprompting]
 uses an LLM as an adaptive mutation and crossover operator and already trains,
 evaluates, and reuses candidates for prompt tuning; LLAMBO [@liu2024llambo]
 couples LLM suggestions with Bayesian optimization; and LLMatic
 [@nasir2024llmatic] and GPT-NAS [@yu2023gptnas] generate or complete candidate
-architectures. Closing a feedback loop is therefore not by itself novel. What is less developed is a shared layer coupling generation to a
-common executable-program interface and evaluation substrate. `NNGPT` provides
-such a layer: a configurable package that generates, repairs, evaluates, and
-reuses programs through the LEMUR interface across tasks and backbones, with an
-accuracy and peak-epoch predictor and execution-informed generator adaptation.
-We built a separate layer rather than extending these projects because the
-closest LLM-NAS prototypes implement a fixed search procedure for their own
-harness and would require reimplementing generation, repair, evaluation, storage,
-and adaptation to reach this scope; LEMUR [@goodarzi2025lemur] is a dataset and
-evaluation substrate, not a generator, so `NNGPT` sits on top of it. A detailed
-comparison is in the companion methods paper
-[@kochnev2026nngpt].
+architectures. Although these studies already demonstrate closed feedback loops, `NNGPT` provides
+such a layer on open-ended token basis, while targeting improvement of the neural networks by applying in-context learning with LoRA/QLoRA.
+`NNGPT` is built on top of a separate layer rather than extending these projects because the
+closest prototypes implement a fixed search procedure without packaging configurable LLM-based synthesis, seed extension, program repair, and code-aware accuracy and peak-epoch prediction as well as containing indifference to the reproducability aspect with the evaluation of the networks and storage of the experiments. 
 
 # Software design
 
@@ -135,12 +126,9 @@ comparison is in the companion methods paper
 The core workflow retrieves seed networks from LEMUR, builds a prompt, generates
 a candidate program, repairs it, evaluates it through the LEMUR evaluator, and
 stores successful results. Within this loop, generator fine-tuning runs each
-cycle but can be skipped; hyperparameter recommendation, accuracy prediction, and
-reinforcement learning are additional components with their own entry points. Across iterations, the available candidate corpus
-and retrieved examples can change; adapter weights are updated when generator
-fine-tuning is enabled. "Learning from execution" here means that accepted
-programs and their measured outcomes become fine-tuning data and, on the RL path,
-reward signal.
+cycle with hyperparameter recommendation and accuracy prediction. The seed models can be programmatically extended before running the LLM cycle using the additional components with their entry points. Across iterations, the available candidate corpus
+and retrieved examples can change. The adapter weights are updated when generator
+is fine-tuned. Hence, the accepted programs and their measured outcomes become fine-tuning data.
 
 The package is organized around the following components.
 
@@ -150,19 +138,17 @@ The package is organized around the following components.
   Backbones and prompt templates
   are selected by declarative JSON and assembled at runtime with task, dataset,
   and seed-model context, so a new model or prompt is adopted by configuration
-  rather than code; a backend with genuinely new capabilities may still require
-  implementation work.
+  rather than code.
 * **Generation and repair.** From a task prompt and seed models retrieved through
-  the LEMUR API, the LLM emits a `Net` class and training code. Extractors parse
+  the LEMUR API, the LLM is asked to emit a compatible neural network code with a `Net` class and training code. Extractors parse
   the output, and an AST-based post-processor repairs imports, input-shape
   unpacking, class and method names, and unused hyperparameters before evaluation;
-  an AST-only checker validates the contract without executing code. In delta mode
+  an AST checker validates the contract without executing code. In delta mode
   the model emits unified diffs with up to two validation retries. Repair enforces
   structural conformity but does not establish that a program trains correctly.
 * **Hyperparameter recommendation.** A separate fine-tuning pipeline trains code
   LLMs to emit hyperparameter values from task, dataset, and a target accuracy,
-  and can produce a full set in one call from a fine-tuned adapter; it is a
-  standalone component.
+  and can produce a full set in one call from a fine-tuned adapter.
 * **Execution substrate.** Generated models must implement the LEMUR `Net`
   contract [@paszke2019pytorch]. Evaluation runs through the LEMUR evaluator;
   successful runs are archived in its SQLite database through the LEMUR API and
