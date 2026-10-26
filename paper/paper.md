@@ -33,198 +33,185 @@ authors:
 affiliations:
   - name: Computer Vision Lab, CAIDAS & IFI, University of Würzburg, Germany
     index: 1
-date: 18 October 2026
+date: 26 October 2026
 bibliography: paper.bib
 ---
 
 # Summary
 
-`NNGPT` is a Python package that turns a code-capable large language model into a
-pipeline for designing neural networks. A language model is asked to write a
-complete training program. The package checks the program against a fixed
-interface, repairs the parts that do not conform, runs the program, and uses the
-measured outcome to improve the generator. The same loop also proposes
-hyperparameters, predicts how a run will end, and edits a program that already
-exists instead of writing one from scratch.
+[`NNGPT`](https://github.com/ABrain-One/nn-gpt) is a standalone open source Python
+package for generating, evaluating, and adapting neural network programs with
+language models. A language model writes source code that defines a network and
+how it learns from data. The package brings together program generation and
+editing, structural analysis and repair, execution based evaluation, and learning
+from measured outcomes. These outcomes can become examples or feedback for
+adapting the generator, allowing researchers to investigate how execution
+experience changes the programs it produces.
 
-The pipeline is built from components with their own entry points. They cover
-program generation and editing, structural repair, hyperparameter recommendation,
-prediction of final accuracy and of the epoch at which it peaks, reinforcement
-learning from execution results, preference optimization, an agent mode that
-routes work between them, and generators that do not use a language model and
-exist for comparison.
-
-`NNGPT` is written for researchers who want to automate the design of neural
-networks and who want to inspect how a language model makes design decisions. It
-is distributed under the MIT licence. The language model components require Linux,
-an NVIDIA graphics processor, and CUDA, while the static checks, the repair step,
-and the data preparation run on the processor alone. The package is published on
-PyPI as `nn-gpt`, and the project documents a public Docker image.
+The output includes inspectable Python source for network architectures and
+training methods, together with training settings and evaluation results.
+Generation, evaluation, and adaptation have separate entry points and can be
+studied individually or combined into repeated cycles. Additional components
+recommend training settings and estimate the outcome of a partially completed
+training run. The software is available on PyPI as
+[`nn-gpt`](https://pypi.org/project/nn-gpt/) under the MIT licence.
 
 # Statement of need
 
-A language model that writes neural network code is easy to demonstrate and hard
-to use at scale. In research prototypes, the parts of the process are usually
-separate scripts bound to one model, one dataset, and one experiment. Asking for
-a program, checking it, running it, and deciding what to ask for next are
-re-implemented for every study. A study that compares several generation
-strategies repeats this work for every strategy.
+Research on automated neural network design increasingly treats source code as
+the object being searched. Comparing generators requires more than changing a
+prompt. Candidate programs must be associated with tasks and datasets, checked
+for compatibility with an evaluator, executed under stated training conditions,
+and retained alongside their outcomes. Experiments that also adapt the generator
+must turn these outcomes into training examples or rewards. Repeating this
+integration separately for every generation strategy makes comparisons harder to
+maintain and inspect.
 
-`NNGPT` provides the process as one package in which the steps are separate
-components, each usable on its own, and the loop is assembled from them. Model
-selection, prompt templates, and generation settings are read from declarative
-configuration files, so a new language model or prompt is adopted by
-configuration instead of by changing code. The work is also observable.
-Generated programs, the prompts that produced them, and the outcome of each step
-are written to disk, so a run that stops can be inspected to see which step
-produced which artifact.
+`NNGPT` targets researchers in automated machine learning and language model
+program synthesis who need reusable components for these experiments. It brings
+program generation, editing, evaluation, and generator adaptation into a shared
+codebase, with configurable models and prompts. The research object is both the
+generated network and the process that produced it.
 
-The package needs three things from an evaluation backend. It needs stored
-programs to use as examples, it needs a way to submit a candidate program for
-training, and it needs a way to hand an accepted program back. The companion
-`nn-dataset` distribution [@nndataset2026] provides these on top of the LEMUR
-dataset [@goodarzi2025lemur].
+The package supports method development as well as controlled comparisons.
+Researchers can vary the language model, prompt examples, generation mode, or
+feedback objective while reusing the remaining workflow. Separate entry points
+also support focused studies of program structure, architecture editing, early
+performance prediction, and hyperparameter recommendation.
+
 # State of the field
 
-Black-box search tools such as Optuna [@akiba2019optuna], Hyperopt
-[@bergstra2011hyperopt], and Google Vizier [@golovin2017vizier] search
-hyperparameters well but cannot write a training program, and they need many
-evaluations before they find a good setting. Architecture search systems such as
-ENAS [@pham2018enas], DARTS [@liu2018darts], and AutoKeras [@jin2019autokeras]
-extend the search to architectures within a fixed space and remain expensive.
+Optuna [@akiba2019optuna], Hyperopt [@bergstra2011hyperopt], and Google Vizier
+[@golovin2017vizier] optimize user supplied objectives over parameterized search
+spaces. ENAS [@pham2018enas], DARTS [@liu2018darts], and AutoKeras
+[@jin2019autokeras] search architectures using specified representations.
+NAS-Bench-101 [@ying2019nasbench101] supplies recorded evaluations for an
+enumerated architecture space. Together, these tools provide established
+approaches to optimization and architecture benchmarking.
 
-A second line of work places a language model inside the search. EvoPrompting
-[@chen2023evoprompting] uses one as a mutation and crossover operator, LLAMBO
-[@liu2024llambo] combines its suggestions with Bayesian optimization, and LLMatic
-[@nasir2024llmatic] and GPT-NAS [@yu2023gptnas] generate or complete candidate
-architectures. This work establishes that a closed loop between generation and
-evaluation is useful, and that a language model can write code that runs.
-Benchmarks such as NAS-Bench-101 [@ying2019nasbench101] reach the same end by
-serving evaluations of an enumerated space, which fixes the space in advance.
+Language model approaches differ in their search representations and feedback.
+EvoPrompting [@chen2023evoprompting] and LLMatic [@nasir2024llmatic] combine code
+generation with evolutionary search. LLAMBO [@liu2024llambo] provides modular
+language model assistance for Bayesian optimization. GPT-NAS [@yu2023gptnas]
+uses a generative transformer trained on architecture representations within
+evolutionary search. Related research also investigates language models as
+hyperparameter recommenders [@kochnev2025optuna]. These studies establish several
+ways to incorporate language models into optimization and architecture design.
 
-`NNGPT` builds on this line and differs in what it packages. It provides the
-steps of the loop as configurable components with separate entry points, so that a
-reader can change the model, the dataset, or the step under study without
-rewriting the surrounding code. The nearest prototypes implement one fixed search
-procedure and do not separate these capabilities.
+`NNGPT` organizes research around executable programs and evaluation feedback.
+It brings program generation, interface repair, execution, prediction, and
+generator adaptation into one configurable package. Keeping these stages
+separate allows researchers to compare generation strategies while reusing
+evaluation and adapter training functions. The package therefore serves both
+as a research workflow and as a collection of components for building new
+program generation methods.
 
 # Software design
 
-The unit of work is a training program that defines a network, its training loop,
-and its hyperparameter set. Programs are written against a fixed interface in
-which a program names a network class, declares its hyperparameters, and
-provides the training procedure. A static checker parses a program as Python
-source and verifies that the required class, methods, and module level
-declarations are present. It does not run the program, which separates questions
-about program shape from questions about infrastructure.
+The common artifact is a PyTorch program defining a network, its training
+methods, and its supported hyperparameters. A shared program interface specifies
+how a network is constructed, configured, and trained. Representing candidates
+as Python source allows changes to both architecture and training behaviour,
+while the shared interface gives generation and evaluation components a
+consistent way to work with them. Generation methods can therefore evolve
+independently of the routines used to evaluate their outputs.
 
-Generation assembles a prompt from a task description, a dataset, and examples
-retrieved from the evaluation backend, then asks the configured model for a
-program. Two output modes are supported. The first returns a complete program.
-The second, delta mode, returns a unified diff against an existing program,
-which is applied, validated, and measured for similarity to the program it
-started from so that near duplicates are rejected. A diff that fails validation
-is requested again, at most twice. A separate entry point generates from
-prepared retrieval data and rejects a candidate that resembles the material the
-model was tuned on.
+The static analysis utility parses Python syntax and reports the presence of
+required classes, methods, and declarations without executing the program.
+The repair stage combines syntax analysis and text rewriting in five ordered
+passes addressing a missing functional import, a particular input shape
+unpacking pattern, network class naming, training method naming, and unused
+declared hyperparameters. These tools support inspecting program structure and
+processing recurring interface patterns before evaluation.
 
-Programs that nearly follow the interface are repaired rather than discarded. A
-post-processing step reads the program as Python syntax and applies five fixes
-in a fixed order. It adds a missing functional import, corrects a shape
-unpacking that names three variables where four are needed, renames the network
-class and the training method when they differ from the required names, and
-removes declared hyperparameters the program never reads. These fixes change
-only the shape of the program and do not establish that it trains.
+Model configurations and prompt templates separate experiment settings from
+shared generation logic. Prompts combine task and dataset information with
+reference programs. Retrieval workflows can also use prepared code examples or
+extracted blocks. Full program generation supports changes throughout a
+candidate, while delta generation requests a unified diff against an existing
+program. Diffs provide a compact representation of proposed edits and make
+local changes easy to inspect. They undergo application and syntax checks, with
+bounded feedback retries and a full code fallback. Approximate similarity
+checks support comparing generated code with supplied corpora and earlier
+candidates.
 
-Execution of generated programs is handled by a worker pool that keeps a fixed
-number of workers alive across runs and allocates graphics processor memory
-through configurable budgets. Programs that were already executed in the same
-directory are not run again, and programs with a recorded verification failure
-are skipped. The outcome of a cycle is passed to the next cycle. The parameter
-count and the operation count of a generated program can also be obtained
-without training it, so the cost of a candidate is known before it is run.
+Reusable worker processes execute evaluation jobs and collect candidate
+outcomes, reducing repeated process setup. Successful local results can be
+reused, and each cycle records generated source, sampled reference records,
+model responses, and evaluation summaries. These artifacts support inspecting
+candidates and following progress between cycles. Separating evaluation from
+generation allows the same candidate to be investigated without retraining the
+language model.
 
-Adaptation of the generator is optional and uses LoRA [@hu2021lora] and QLoRA
-[@dettmers2023qlora] adapters through `peft`, with four bit quantization when the
-base model is loaded in that mode [@wolf2020transformers]. DeepSpeed and Unsloth
-are available for training. Because training programs are long, examples are
-split into windows before training, and a run resumes from the last trainer
-checkpoint rather than starting over. An adapter can be applied to a chosen
-range of layers, trained on the output head alone, or trained as a soft prompt
-that leaves the base weights unchanged, and several adapters can be merged into
-one model afterwards. Generation can be limited to a fixed number of output
-tokens, and a reasoning block opened by the model can be closed before its
-answer is read.
+Generator adaptation builds on Transformers [@wolf2020transformers] and `peft`,
+using LoRA [@hu2021lora] with optional four bit QLoRA
+[@dettmers2023qlora]. Updating adapters rather than all model weights reduces
+the memory required for experiments. Input length filtering and truncation bound
+training sequence lengths. Selected workflows accept explicit trainer
+checkpoints for resuming optimization. Optional graph orchestration combines
+shared generation, evaluation, and fine tuning functions in a state based
+workflow.
 
-The agent mode replaces the fixed loop with a workflow in which a manager node
-decides between generation, evaluation, and fine tuning, and an optional
-predictor node can intervene. The stage functions are shared with the fixed
-loop, and the workflow resumes from the last completed node after an
-interruption.
-Prediction of training outcome is a separate entry point. A Qwen3-8B model is
-fine tuned with four bit QLoRA to predict the best accuracy reached and the epoch
-at which it is reached, from the accuracies observed in the first epochs
-together with quantities computed without training, including synflow, NWOT,
-gradient norm, the logarithm of the parameter count, and network depth. The fine
-tuned predictor is published as a checkpoint with a function that applies it to
-a running training. A second entry point fine tunes a model to emit
-hyperparameter values for a task, a dataset, and a target accuracy.
+Execution feedback can also train the generator through reinforcement learning
+or preference optimization. Reward workflows assess properties such as model
+construction, output shape, and training behaviour, with configurable objective
+terms. Direct preference optimization [@rafailov2023dpo] uses preferred and
+rejected completions, whereas KTO [@ethayarajh2024kto] learns from binary
+desirability labels. These alternatives support experiments with graded rewards,
+paired rankings, and binary feedback using the same kind of generated program
+artifact.
 
-Reinforcement learning is available as its own entry point. A candidate program
-is executed and the outcome is converted into a scalar reward that combines
-successful construction, a correct output shape, a completed training step, and
-a reduction in loss. Optional terms cover validation gain, inference latency,
-parameter count, computation cost, a critic estimate, and a divergence penalty
-against the reference model. A policy gradient method updates the adapters of
-the generator, and reward computation is isolated in workers so that a failed
-candidate does not end the run. Preference optimization is offered for two
-objectives, a paired preferred and rejected completion and a single binary
-label, and both trainers keep the same checkpoint behaviour.
+A separate Qwen3-8B predictor estimates the best accuracy and the epoch at which
+it occurs from early training accuracies and architecture features. A
+[public adapter checkpoint](https://huggingface.co/ABrain/Accuracy-Prediction)
+and an inference function allow researchers to apply the trained predictor to
+new training observations. Another component learns hyperparameter
+recommendations conditioned on a task, dataset, and target accuracy.
+Non-language-model alternatives, including genetic search, fractal templates,
+and syntax level mutation, provide comparison workflows.
 
-Generators that do not use a language model are included for comparison. They
-comprise a genetic algorithm over an evolvable network, fractal construction
-templates, mutation of an existing program at the syntax level, heterogeneous
-mixture of experts assembly, pruning, learning rate schedules, layer wise
-learning rates, and generation of data transformation programs. Three further
-pipelines address narrower questions. One generates networks under a parameter
-budget and scores them by accuracy divided by inference latency. One improves
-its prompt between iterations and keeps a memory of earlier attempts. One
-generates captioning models. The generator itself can also be exported to ONNX
-for serving.
+The package requires Python 3.10 or later. The documented language model
+environment uses Linux, NVIDIA GPUs, and CUDA. Static analysis and source repair
+run on the CPU. Docker and cluster launch examples are provided in the
+repository.
 
 # Research impact statement
 
-Studies that used these components include the description of the generation
-pipeline [@kochnev2026nngpt], a study of architecture change through diffs
-[@adhikari2026delta], and a study of novel architecture synthesis
-[@khalid2026creativity]. Further studies used them for hyperparameter tuning
-[@kochnev2025optuna], few shot generation [@duvvuri2025fewshot], transformation
-design [@shrestha2026transforms], and extraction of network blocks from external
-repositories [@khalid2025nnrag]. The programs the pipeline produced were
-contributed to the LEMUR dataset [@goodarzi2025lemur] and to its extension
-[@uzun2026lemur2].
+`NNGPT` has supported research by its developers and collaborators. The
+framework publication describes and evaluates its generation and adaptation
+pipelines [@kochnev2026nngpt]. Subsequent studies explicitly use the framework
+for iterative architecture synthesis [@khalid2026creativity], modification
+through code diffs [@adhikari2026delta], and few shot prompting and duplicate
+validation [@duvvuri2025fewshot]. The few shot study identifies its prompting
+and validation contributions as NNGPT implementations and reports 1,900 generated
+architectures.
 
-Development is open and has been public since December 2024. The repository has
-68 recorded contributors, 8 tagged releases, a changelog, a contribution guide,
-and a code of conduct. Continuous integration byte compiles the package and runs
-the test suite on Python 3.10 and 3.11, and the tests cover generation filters,
-pruning, response parsing, and the reinforcement learning path. The package is
-published on PyPI as `nn-gpt`, and the project documents a public Docker image
-and cluster launch scripts.
+Further publications investigate synthesis from extracted module specifications
+[@khalid2025nnrag] and performance guided data transformation design
+[@shrestha2026transforms]. These applications and related studies illustrate
+research directions spanning architecture synthesis, code editing, reusable
+block generation, and data processing.
+
+[Public pull requests](https://github.com/ABrain-One/nn-gpt/pull/1) date to
+January 2025, and package releases on PyPI span 2025 and 2026. The repository
+provides installation and usage instructions, tagged versions, a changelog,
+contribution guidelines, and a code of conduct. Automated tests and a GitHub
+Actions workflow support ongoing development.
 
 # AI usage disclosure
 
-Generative AI tools were used in the development of this software and in the
-preparation of this manuscript. DeepSeek V4.1 Flash was used for code
-suggestions, refactoring, documentation, and drafting, and ChatGPT was used to
-review drafts. The human authors reviewed, edited, and validated all assisted
-output, tested the software, and made the design decisions. No AI tools were
+Generative AI tools were used in software development and manuscript
+preparation. DeepSeek V4.1 Flash assisted with code suggestions, refactoring,
+documentation, and drafting. ChatGPT assisted with draft review. Kilo Code with
+OpenAI GPT-6.1 Sol assisted with manuscript revision, source checks, and citation
+validation. The human authors reviewed, edited, and validated AI-assisted
+outputs, tested the software, and made the core design decisions. The authors
+remain responsible for all claims and submitted materials. No AI tools were
 used in interactions with editors or reviewers.
 
 # Acknowledgements
 
-We thank the contributors to the `NNGPT` repository and the developers of the
-LEMUR dataset and its ecosystem, on which this work builds. This work was
-partially supported by the Alexander von Humboldt Foundation.
+We thank the contributors to the `NNGPT` repository. This work was partially
+supported by the Alexander von Humboldt Foundation.
 
 # References
