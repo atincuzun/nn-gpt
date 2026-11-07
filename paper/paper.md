@@ -62,65 +62,86 @@ NNGPT works with the source code of a neural network, not only with its hyperpar
 # Software design
 
 `NNGPT` separates source-code generation from the training engine, so generation,
-repair, and fine-tuning can be used with an evaluation backend. JSON configuration
-files select the language model and prompt template. The prompt can contain task
+repair, and fine-tuning can be used with an evaluation backend. The generated
+source file is the unit passed among generation, repair, and fine-tuning. JSON
+configuration files hold model and prompt settings. The prompt can contain task
 instructions, a metric, and a reference program. The model returns full PyTorch
 source code or a diff. The package applies the diff, checks the Python syntax,
 repairs common code errors, and passes the source to the evaluation step. The
-returned result can be used to fine-tune the language model. The same steps can
-run in a fixed loop or an optional agent mode. This separation allows the
-evaluation backend to be replaced without changing the generation and
-fine-tuning code.
+returned result can be used to fine-tune the language model. A fixed loop is the
+choice for repeatable runs. An optional agent mode is the choice when a study
+needs a different order of steps.
 
-**Program representation and generation.** `NNGPT` represents a candidate as
-PyTorch source code, which allows the model to change the network and its
-internal operations beyond a fixed list of layers. A program can be written from
-scratch or changed with a diff. Full generation allows broad changes. A diff
-makes a local change and keeps the surrounding code visible. Diffs reduce output
-length and preserve context. Patch checks, bounded retries, and a fallback to
-full generation keep editing reliable. The package applies the diff, checks the
-Python syntax, and asks the model to correct a patch that does not apply before
-using the full-generation fallback.
+**Program representation.** `NNGPT` represents a candidate as PyTorch source
+code. A fixed list of layers would simplify checking, but it would limit the
+model to operations in the list. Source code lets the model change the network
+and its internal operations. This expands the programs a study can compare and
+lets experiments address code-level design rather than layer selection alone. A
+study that needs code-level changes uses source code. A study that needs only
+layer selection can use a fixed-list method.
+
+**Generation and editing.** A program can be written from scratch or changed
+with a diff. Full generation is the choice for broad changes. Diff editing is the
+choice for local changes because it reduces output length and keeps the baseline
+visible. A shorter output leaves more room in the context window, so a study can
+isolate the effect of a small edit. The package applies the diff, checks the
+Python syntax, and asks the model to correct a patch that does not apply. A
+fallback to full generation keeps the editing path reliable. A study that needs a
+wide change uses full generation. A study that needs a small change uses a diff.
 
 **Prompt and model configuration.** The language model and prompt template are
-selected by JSON files. A custom JSON prompt supplies task instructions,
-reference programs, and the expected output structure. A custom model JSON
-supplies a Hugging Face model identifier, context length, quantization, and chat
-template. This lets a study change the model or prompt without changing the
-generation code. Sampling settings are supplied as options.
+selected by JSON files instead of being hard-coded. A JSON model file supplies a
+Hugging Face model identifier, context length, quantization, and chat template. A
+JSON prompt file supplies task instructions, reference programs, and the expected
+output structure. This separation lets a study replace a model or prompt without
+editing the generation code, so comparisons use the same generation path. A study
+that adds a model or prompt uses a new JSON file. A study with fixed settings
+keeps one configuration.
 
-**Repair and prediction.** The repair step fixes five common errors. These are a
-missing import for functional operations, incorrect unpacking of the input shape,
-a network class with the wrong name, a required function with the wrong name, and
-declared hyperparameters the program never uses. Repair handles these recurring
-errors before evaluation, which lets the experiment focus on design choices. An
-optional predictor provides an early estimate of the best accuracy and the epoch
-at which it occurs from early observations. A separate tool recommends
-hyperparameters for a task and target accuracy. These tools support scheduling
-and initial settings while measured results remain the basis for comparison.
+**Repair.** The repair step fixes five recurring errors. These are a missing
+import for functional operations, incorrect unpacking of the input shape, a
+network class with the wrong name, a required function with the wrong name, and
+declared hyperparameters the program never uses. Repair is the choice when one of
+these patterns is present. Discarding the program would lose the candidate and
+require another generation call. Repair keeps the candidate, so compute goes to
+evaluation rather than regeneration. A study that needs other checks can add them
+separately.
 
-**Language-model fine-tuning and feedback.** Parameter-efficient adapters keep
-repeated fine-tuning practical. The package uses the Transformers library
-[@wolf2020transformers] and LoRA adapters [@hu2021lora]. Adapters can be saved
-separately and reused across runs with the same base model. Four-bit QLoRA
-[@dettmers2023qlora] reduces memory use when GPU memory is limited. A scalar
-reward assigns one value to each generated program. Direct preference
-optimization [@rafailov2023dpo] uses a preferred program and a rejected program.
-KTO [@ethayarajh2024kto] uses one good or bad label for each program. The three
-methods support different forms of feedback and use the same generated programs
-and returned results.
+**Prediction and hyperparameter recommendation.** An optional predictor estimates
+the best accuracy and the epoch at which it occurs from early observations. A
+separate tool recommends hyperparameters for a task and target accuracy. The
+predictor is the choice when early scheduling matters. An early estimate can stop
+low-value runs and leave more compute for other candidates. The recommender is
+the choice when a starting configuration is useful. A full search is the choice
+when the best settings are required. Measured results remain the basis for
+comparison.
 
-**Dependencies and comparison tools.** The package requires Python and PyTorch.
-Generation and fine-tuning use Hugging Face Transformers and PEFT. Code repair
-and configuration work on the CPU, while language-model work uses a GPU when
-available. The package also includes generators that do not use a language
-model. These are genetic search, syntax-tree mutation, fractal and
-mixture-of-experts templates, pruning, learning-rate schedules, and
-data-transformation generation. These provide alternative programs in the same
-source-code format for comparison with language-model generation. A separate
-tool ranks generated networks for small devices by accuracy divided by inference
-time. An optional agent mode provides an
-alternative control path.
+**Fine-tuning and feedback.** Adapters are the choice when memory or reuse
+matters. The package uses the Transformers library [@wolf2020transformers] and
+LoRA adapters [@hu2021lora]. Four-bit QLoRA [@dettmers2023qlora] reduces memory
+use when GPU memory is limited. Lower memory per run lets several prompt or
+feedback conditions share one base model, so comparisons keep the base model
+fixed. Adapters can be saved and reused. A scalar reward is the choice for graded
+outcomes. Direct preference optimization [@rafailov2023dpo] is the choice for a
+preferred program and a rejected program. KTO [@ethayarajh2024kto] is the choice
+for one good or bad label. The three methods use the same generated programs and
+returned results.
+
+**Comparison tools and edge scoring.** The package includes generators that do
+not use a language model. These are genetic search, syntax-tree mutation, fractal
+and mixture-of-experts templates, pruning, learning-rate schedules, and
+data-transformation generation. They produce alternative programs in the same
+source-code format. A shared format lets a study compare language-model and
+non-language-model generation without changing the rest of the experiment. They
+are the choice when a non-language-model comparison is needed. A separate tool
+ranks generated networks for small devices by accuracy divided by inference time.
+It is the choice when inference time matters alongside accuracy.
+
+The package targets Python and PyTorch. Generation and fine-tuning use Hugging
+Face Transformers and PEFT. Code repair and configuration work on the CPU, while
+language-model work uses a GPU when available. Automated tests cover generation
+filters, response parsing, repair, and feedback paths, so changes to these parts
+are checked before release.
 
 # Research impact statement
 
