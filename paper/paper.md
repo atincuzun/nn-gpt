@@ -39,16 +39,14 @@ bibliography: paper.bib
 
 # Summary
 
-`NNGPT` is an open-source Python package for research experiments in which large language models write the source code for neural networks. A language model writes or edits PyTorch source code for a neural network. NNGPT repairs common code errors and repeatedly runs program generation and language-model fine-tuning. It can fine-tune the language model from those experiments with a numerical reward, with pairs of better and worse programs, or with good or bad labels. This lets researchers compare language models, prompts, and fine-tuning methods on the same problems.
-
-Program generation and language-model fine-tuning can be used separately. For comparison, the package includes program generators that do not use a language model. Further tools recommend training settings, rank networks for small devices by accuracy divided by inference time, and predict the highest accuracy of a network and the epoch at which it occurs from the first two training epochs. The software is available on PyPI as `nn-gpt` under the MIT licence.
+NNGPT is an open-source Python package for experiments in which language models write the code for neural networks and data transformations. Designing such code by hand takes time and expert knowledge, and NNGPT lets researchers study how well language models can do this work instead. A language model writes new PyTorch programs or changes existing ones. NNGPT automatically fixes common errors in the generated code, so that programs with small mistakes can still be trained and evaluated with the LEMUR framework. The training results are then used to fine-tune the language model, and the process repeats. The same steps for writing, fixing, and evaluating programs support several ways of fine-tuning. The language model can learn from successful programs, from a numerical score, from pairs of better and worse programs, or from programs labelled good or bad. Researchers can therefore compare language models, prompts, and fine-tuning methods on the same tasks and datasets, with the same evaluation. NNGPT also includes program generators that do not use a language model, as a baseline for these comparisons. NNGPT can also predict the highest accuracy of a network from its first two training epochs.
 
 
 # Statement of need
 
-Researchers in automated machine learning, neural architecture search, and language-model program synthesis use language models to write source code for neural networks. The generated code can contain errors such as missing imports, wrong class names, or incorrect tensor shapes. If each study repairs these errors separately, a comparison between language models or prompts also includes differences in the repair code. Existing architecture-search tools assume a fixed architecture or parameter space, and general code-generation tools do not provide a common repair and fine-tuning procedure.
+Neural architecture search looks for network designs that perform well on a task. Most methods choose from a fixed set of layers and connections that is defined before the search begins. A language model can instead write the code of a network directly. Because the code is written as text, the network is not limited to a fixed set of operations, and the language model can use what it learned about neural networks during pretraining. The language model can also be fine-tuned on the results of the networks it wrote, so that it improves as the search goes on. Researchers in automated machine learning, neural architecture search, and code generation use this approach to find new networks.
 
-NNGPT provides one implementation of these steps. It generates and edits PyTorch source code, repairs common code errors, and fine-tunes the language model over repeated rounds. A study can change the language model, prompt, or fine-tuning method without rewriting the repair step. The package also includes non-language-model generators for comparison, ranks networks for small devices by accuracy divided by inference time, recommends hyperparameters, and predicts the highest accuracy of a network and the epoch at which it occurs.
+Code written by a language model is not guaranteed to run. It can contain errors such as a missing import, a wrong class name, or layers whose tensor shapes do not match. Each program must therefore be checked, fixed where possible, trained, and evaluated before its result can be used to fine-tune the language model. NNGPT provides these steps in one package. It fixes common errors directly, can test each network on example input before full training, and can return error messages to the language model so that it can correct its output. Researchers can then change the language model, the prompt, or the fine-tuning method while the other steps stay the same, so that differences in results come from the part that was changed.
 
 # State of the field
 
@@ -56,92 +54,25 @@ Related tools differ in what they search and how they use the result. Optuna [@a
 
 Language model methods use a model to propose candidates. EvoPrompting [@chen2023evoprompting] and LLMatic [@nasir2024llmatic] modify or recombine network code and select candidates by validation accuracy. LLAMBO [@liu2024llambo] assists Bayesian optimization, and related work uses language models for hyperparameter recommendation [@kochnev2025optuna]. GPT-NAS [@yu2023gptnas] proposes architecture components within an evolutionary search. These tools search over configurations, architectures, or candidate programs, and each uses its own procedure to evaluate and select them.
 
-NNGPT works with the source code of a neural network, not only with its hyperparameters or layer names. It writes and edits that code, recommends hyperparameters, predicts best accuracy and the epoch at which it occurs, reuses code blocks from other programs, and fine-tunes the language model after runs. All five steps use the same source file and the same recorded result. Each step can use the output of the earlier steps.
-
+NNGPT also uses a language model to write network code at the token level. Unlike the tools above, it covers the whole process from writing code to fine-tuning the language model in one package. It checks and repairs the generated code, trains and evaluates every program in the same way, and fine-tunes the language model on the results. Every search method that uses a language model needs these steps, so NNGPT provides them in a separate package that several search methods share. One of these methods is the package’s own version of the LLMatic search, which can therefore be used with fine-tuning and compared with other methods under the same evaluation.
 
 # Software design
 
-`NNGPT` separates source-code generation from the training engine, so generation,
-repair, and fine-tuning can be used with an evaluation backend. The generated
-source file is the unit passed among generation, repair, and fine-tuning. JSON
-configuration files hold model and prompt settings. The prompt can contain task
-instructions, a metric, and a reference program. The model returns full PyTorch
-source code or a diff. The package applies the diff, checks the Python syntax,
-repairs common code errors, and passes the source to the evaluation step. The
-returned result can be used to fine-tune the language model. A fixed loop is the
-choice for repeatable runs. An optional agent mode is the choice when a study
-needs a different order of steps.
+`NNGPT` is designed so that a language model learns from the results of the networks it writes. Each round of writing, checking, training, and evaluation produces data that is used to fine-tune the language model, and the next round starts from the improved model. The language model, the prompt, the search strategy, and the fine-tuning method can each be replaced while the others stay fixed, so researchers can see which part changes the results. Training and evaluation are done by the LEMUR framework [@nndataset2026], so `NNGPT` focuses on writing programs and fine-tuning the language model.
 
-**Program representation.** `NNGPT` represents a candidate as PyTorch source
-code. A fixed list of layers would simplify checking, but it would limit the
-model to operations in the list. Source code lets the model change the network
-and its internal operations. This expands the programs a study can compare and
-lets experiments address code-level design rather than layer selection alone. A
-study that needs code-level changes uses source code. A study that needs only
-layer selection can use a fixed-list method.
+**Models and prompts.** Language models and prompts are set in JSON files that are loaded at the start of a run. A model file names any language model on Hugging Face, loaded through Transformers [@wolf2020transformers] or Unsloth. A prompt file holds the instructions, the template, and the rules that pick database records for it, such as the task, the dataset, and the number of reference programs. A new model or prompt therefore needs a short file rather than new code, so researchers spend their time on experiments instead of changing the pipeline.
 
-**Generation and editing.** A program can be written from scratch or changed
-with a diff. Full generation is the choice for broad changes. Diff editing is the
-choice for local changes because it reduces output length and keeps the baseline
-visible. A shorter output leaves more room in the context window, so a study can
-isolate the effect of a small edit. The package applies the diff, checks the
-Python syntax, and asks the model to correct a patch that does not apply. A
-fallback to full generation keeps the editing path reliable. A study that needs a
-wide change uses full generation. A study that needs a small change uses a diff.
+**Generation and editing.** The language model writes complete PyTorch programs that follow the LEMUR conventions, so each program goes straight to training and can use any layer that PyTorch offers. Writing from the beginning gives the most freedom for new designs. Editing a working program keeps most of it unchanged, so the result is more likely to run, and a diff is much shorter than a full program. A structured edit names only a few choices, such as width or pooling, and the package writes the code. A template built on pretrained TorchVision networks lets the model write only the parts that join them, so a new design starts from learned features. Blocks that `nn-rag` [@khalid2025nnrag] takes from public repositories add working code written by people and make the generated networks more diverse.
 
-**Prompt and model configuration.** The language model and prompt template are
-selected by JSON files instead of being hard-coded. A JSON model file supplies a
-Hugging Face model identifier, context length, quantization, and chat template. A
-JSON prompt file supplies task instructions, reference programs, and the expected
-output structure. This separation lets a study replace a model or prompt without
-editing the generation code, so comparisons use the same generation path. A study
-that adds a model or prompt uses a new JSON file. A study with fixed settings
-keeps one configuration.
+**Checks, repair, and novelty.** Programs with small mistakes, such as a wrong class name, are repaired directly, which costs far less than asking the language model to write them again. Several modes run each new network once on random input to check its output shape, a quick test that keeps GPU time for programs that run. Error messages from edits go back to the language model so it can correct its output. Each program also receives a structure signature that ignores names and formatting, and a text similarity score, so near copies of earlier programs are found before training.
 
-**Repair.** The repair step fixes five recurring errors. These are a missing
-import for functional operations, incorrect unpacking of the input shape, a
-network class with the wrong name, a required function with the wrong name, and
-declared hyperparameters the program never uses. Repair is the choice when one of
-these patterns is present. Discarding the program would lose the candidate and
-require another generation call. Repair keeps the candidate, so compute goes to
-evaluation rather than regeneration. A study that needs other checks can add them
-separately.
+**Search and fine-tuning.** Writing a strong network is hard, but checking one is simple, because it only has to be trained and evaluated. `NNGPT` lets the language model write programs and checks them automatically, so every run produces new examples without manual work. These examples improve the language model in two ways. Search strategies place them in the prompt, for example by moving from similar to distant reference programs, by giving an edit that improved one network as a hint for another, or by rewriting the prompt from results. Fine-tuning learns from them directly, with supervised fine-tuning on successful programs by default, or with GRPO, PPO, DPO [@rafailov2023dpo], and KTO [@ethayarajh2024kto], which also learn from weaker programs. LoRA [@hu2021lora] and QLoRA [@dettmers2023qlora] let several runs share one base model.
 
-**Prediction and hyperparameter recommendation.** An optional predictor estimates
-the best accuracy and the epoch at which it occurs from early observations. A
-separate tool recommends hyperparameters for a task and target accuracy. The
-predictor is the choice when early scheduling matters. An early estimate can stop
-low-value runs and leave more compute for other candidates. The recommender is
-the choice when a starting configuration is useful. A full search is the choice
-when the best settings are required. Measured results remain the basis for
-comparison.
+**Prediction and recommendation.** Full training is the most expensive step, because a network can need many epochs to reach its best accuracy. A fine-tuned language model reads the code of a network and its accuracy after two epochs, and predicts its best accuracy and the epoch at which it occurs. This gives the researcher the option to stop long runs early when the predicted accuracy is low, and to spend the compute on promising or efficient networks. The predictor is optional and switched on by a setting, so full training stays the default. A second fine-tuned model recommends training settings for a task and a target accuracy, which gives a starting point without a separate search. Both are published on Hugging Face, the predictor as [Accuracy-Prediction](https://huggingface.co/ABrain/Accuracy-Prediction) and the recommender in two sizes, [HPGPT 1.3B](https://huggingface.co/ABrain/HPGPT-DeepSeek-Coder-1.3b-Base-R) and [HPGPT 7B](https://huggingface.co/ABrain/HPGPT-DeepSeek-R1-Distill-Qwen-7B-R).
 
-**Fine-tuning and feedback.** Adapters are the choice when memory or reuse
-matters. The package uses the Transformers library [@wolf2020transformers] and
-LoRA adapters [@hu2021lora]. Four-bit QLoRA [@dettmers2023qlora] reduces memory
-use when GPU memory is limited. Lower memory per run lets several prompt or
-feedback conditions share one base model, so comparisons keep the base model
-fixed. Adapters can be saved and reused. A scalar reward is the choice for graded
-outcomes. Direct preference optimization [@rafailov2023dpo] is the choice for a
-preferred program and a rejected program. KTO [@ethayarajh2024kto] is the choice
-for one good or bad label. The three methods use the same generated programs and
-returned results.
+**Mobile deployment.** Phones and other small devices have limited memory, power, and response time, so a network must also be small and fast to be useful there. The mobile track asks for networks under a parameter limit, exports each network to the eight-bit TFLite format used on phones, and ranks networks by accuracy divided by running time. Because accuracy after conversion and running time on a real phone can differ from desktop numbers, an optional step measures networks on a connected phone and keeps a result only when its score stays equal or improves.
 
-**Comparison tools and edge scoring.** The package includes generators that do
-not use a language model. These are genetic search, syntax-tree mutation, fractal
-and mixture-of-experts templates, pruning, learning-rate schedules, and
-data-transformation generation. They produce alternative programs in the same
-source-code format. A shared format lets a study compare language-model and
-non-language-model generation without changing the rest of the experiment. They
-are the choice when a non-language-model comparison is needed. A separate tool
-ranks generated networks for small devices by accuracy divided by inference time.
-It is the choice when inference time matters alongside accuracy.
-
-The package targets Python and PyTorch. Generation and fine-tuning use Hugging
-Face Transformers and PEFT. Code repair and configuration work on the CPU, while
-language-model work uses a GPU when available. Automated tests cover generation
-filters, response parsing, repair, and feedback paths, so changes to these parts
-are checked before release.
+**Baselines.** The package also includes algorithmic generators, such as genetic search, syntax tree mutation, and pruning. Their programs pass through the same checks and evaluation, so a language model is compared with them on equal terms.
 
 # Research impact statement
 
@@ -168,14 +99,12 @@ Actions workflow support ongoing development.
 
 # AI usage disclosure
 
-Generative AI tools were used in software development and manuscript
-preparation. DeepSeek V4.1 Flash assisted with code suggestions, refactoring,
-documentation, and drafting. ChatGPT assisted with draft review. Kilo Code with
-OpenAI GPT-6.1 Sol assisted with manuscript revision, source checks, and citation
-validation. The human authors reviewed, edited, and validated AI-assisted
-outputs, tested the software, and made the core design decisions. The authors
-remain responsible for all claims and submitted materials. No AI tools were
-used in interactions with editors or reviewers.
+Generative AI tools assisted with software development and with writing this
+paper. DeepSeek V4.1 Flash helped with code, refactoring, and documentation, and
+Claude Opus 5.5 helped with drafting, editing, and checking sources. The authors
+reviewed and tested all AI-assisted output, made the design decisions, and
+remain responsible for the content. No AI tools were used in interactions with
+editors or reviewers.
 
 # Acknowledgements
 
