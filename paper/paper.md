@@ -8,25 +8,9 @@ tags:
   - code generation
   - PyTorch
 authors:
-  - name: Roman Kochnev
-    affiliation: 1
-  - name: Waleed Khalid
+  - name: Dmitry Ignatov
     affiliation: 1
   - name: Tolgay Atinc Uzun
-    affiliation: 1
-  - name: Xi Zhang
-    affiliation: 1
-  - name: Yashkumar Sanjaybhai Dhameliya
-    affiliation: 1
-  - name: Furui Qin
-    affiliation: 1
-  - name: Chandini Vysyaraju
-    affiliation: 1
-  - name: Raghuvir Duvvuri
-    affiliation: 1
-  - name: Avi Goyal
-    affiliation: 1
-  - name: Dmitry Ignatov
     affiliation: 1
   - name: Radu Timofte
     affiliation: 1
@@ -58,19 +42,21 @@ Language model methods use a model to propose candidates. EvoPrompting [@chen202
 
 # Software design
 
-`NNGPT` is designed so that a language model learns from the results of the networks it writes. Each round of writing, checking, training, and evaluation produces data that is used to fine-tune the language model, and the next round starts from the improved model. The language model, the prompt, the search strategy, and the fine-tuning method can each be replaced while the others stay fixed, so researchers can see which part changes the results. Training and evaluation are done by the LEMUR framework [@nndataset2026], so `NNGPT` focuses on writing programs and fine-tuning the language model.
+`NNGPT` is designed so that a language model learns from the results of the networks it writes. Each round of writing and checking produces programs whose scores are used to fine-tune the language model, and the next round starts from the improved model. The language model, the prompt, the search strategy, and the fine-tuning method can each be replaced while the others stay fixed, so researchers can see which part changes the results. The LEMUR framework [@nndataset2026] provides an API that trains and evaluates network code, and `NNGPT` uses it for the programs that pass its checks. `NNGPT` therefore focuses on writing programs and fine-tuning the language model, and another tool with the same API could be used instead. \autoref{fig:pipeline} shows one round.
 
-**Models and prompts.** Language models and prompts are set in JSON files that are loaded at the start of a run. A model file names any language model on Hugging Face, loaded through Transformers [@wolf2020transformers] or Unsloth [@unsloth2023]. A prompt file holds the instructions, the template, and the rules that pick database records for it, such as the task, the dataset, and the number of reference programs. A new model or prompt therefore needs a short file rather than new code, so researchers spend their time on experiments instead of changing the pipeline.
+![One round of the NNGPT pipeline. The language model, or a baseline, writes a program that NNGPT checks and repairs. LEMUR trains and evaluates the program. The results guide the search strategy and fine-tune the language model for the next round. Badges mark the packages that NNGPT calls.\label{fig:pipeline}](figures/nngpt_column.png)
 
-**Generation and editing.** The language model writes complete PyTorch [@paszke2019pytorch] programs that follow the LEMUR conventions, so each program goes straight to training and can use any layer that PyTorch offers. Writing from the beginning gives the most freedom for new designs. Editing a working program keeps most of it unchanged, so the result is more likely to run, and a diff is much shorter than a full program. A structured edit names only a few choices, such as width or pooling, and the package writes the code. A template built on pretrained TorchVision [@marcel2010torchvision] networks lets the model write only the parts that join them, so a new design starts from learned features. Blocks that `nn-rag` [@khalid2025nnrag] takes from public repositories add working code written by people and make the generated networks more diverse.
+**Models and prompts.** Language models and prompts are set in JSON files that are loaded at the start of a run. A model file names any language model on Hugging Face, loaded through Transformers [@wolf2020transformers] or Unsloth [@unsloth2023]. A prompt file holds the instructions, the template, and the rules that pick database records for it, such as the task, the dataset, and the number of reference programs. A new model or prompt therefore needs a short file rather than new code.
+
+**Generation and editing.** The language model writes complete PyTorch [@paszke2019pytorch] programs, so a network can use any layer that PyTorch offers. Writing from the beginning gives the most freedom for new designs. Editing a working program keeps most of it unchanged, so the result is more likely to run, and a diff is much shorter than a full program. A structured edit names only a few choices, such as width or pooling, and the package writes the code. A template built on pretrained TorchVision [@marcel2010torchvision] networks lets the model write only the parts that join them, so a new design starts from learned features. Blocks that `nn-rag` [@khalid2025nnrag] takes from public repositories add working code written by people and make the generated networks more diverse.
 
 **Checks, repair, and novelty.** Programs with small mistakes, such as a wrong class name, are repaired directly, which costs far less than asking the language model to write them again. Pipelines such as reinforcement learning and KTO run each new network once on random input to check its output shape, a quick test that keeps GPU time for programs that run. Error messages from edits go back to the language model so it can correct its output. To keep the language model moving toward new designs, pipelines such as KTO compare each new program with earlier programs and with the fine-tuning data, by its layer structure and its code. Only programs that are new become fine-tuning examples, so the language model learns from new designs rather than from copies of networks it already knows.
 
 **Search and fine-tuning.** Search strategies place the new examples in the prompt, for example by moving from similar to distant reference programs, by giving an edit that improved one network as a hint for another, or by rewriting the prompt from results. Fine-tuning learns from them directly, with supervised fine-tuning on successful programs by default, or with GRPO [@shao2024deepseekmath], PPO [@schulman2017ppo], DPO [@rafailov2023dpo], and KTO [@ethayarajh2024kto], which also learn from weaker programs. LoRA [@hu2021lora] and QLoRA [@dettmers2023qlora] let several runs share one base model.
 
-**Prediction and recommendation.** Full training is the most expensive step, because a network can need many epochs to reach its best accuracy. A fine-tuned language model reads the code of a network and its accuracy after two epochs, and predicts its best accuracy and the epoch at which it occurs. This gives the researcher the option to stop long runs early when the predicted accuracy is low, and to spend the compute on promising or efficient networks. The predictor is optional and switched on by a setting, so full training stays the default. A second fine-tuned model recommends training settings for a task and a target accuracy, which gives a starting point without a separate search. Both are published on Hugging Face, the predictor as [Accuracy-Prediction](https://huggingface.co/ABrain/Accuracy-Prediction) and the recommender in two sizes, [HPGPT 1.3B](https://huggingface.co/ABrain/HPGPT-DeepSeek-Coder-1.3b-Base-R) and [HPGPT 7B](https://huggingface.co/ABrain/HPGPT-DeepSeek-R1-Distill-Qwen-7B-R).
+**Prediction and recommendation.** Full training is the most expensive step, because a network can need many epochs to reach its best accuracy. A fine-tuned language model reads the code of a network and its accuracy after two epochs, and predicts its best accuracy and the epoch at which it occurs. Researchers can then stop runs early when the predicted accuracy is low. The predictor is optional and switched on by a setting, so full training stays the default. A second fine-tuned model recommends training settings for a task and a target accuracy, which gives a starting point without a separate search. Both are published on Hugging Face, the predictor as [Accuracy-Prediction](https://huggingface.co/ABrain/Accuracy-Prediction) and the recommender in two sizes, [HPGPT 1.3B](https://huggingface.co/ABrain/HPGPT-DeepSeek-Coder-1.3b-Base-R) and [HPGPT 7B](https://huggingface.co/ABrain/HPGPT-DeepSeek-R1-Distill-Qwen-7B-R).
 
-**Mobile deployment.** Phones and other small devices have limited memory, power, and response time, so a network must also be small and fast to be useful there. The mobile track asks for networks under a parameter limit, exports each network to the eight-bit TFLite format [@abadi2016tensorflow] used on phones, and ranks networks by accuracy divided by running time. Because accuracy after conversion and running time on a real phone can differ from desktop numbers, an optional step measures networks on a connected phone and keeps a new result only when its score is at least as high as the last accepted one.
+**Mobile deployment.** Phones have limited memory, power, and response time, so a network must also be small and fast. The mobile track asks for networks under a parameter limit, exports each network to the eight-bit TFLite format [@abadi2016tensorflow] used on phones, and ranks networks by accuracy divided by running time. Because accuracy after conversion and running time on a real phone can differ from desktop numbers, an optional step measures networks on a connected phone and keeps a new result only when its score is at least as high as the last accepted one.
 
 **Baselines.** The package also includes algorithmic generators, such as genetic search, syntax tree mutation, and pruning. Their programs pass through the same checks and evaluation, so a language model is compared with them on equal terms.
 
@@ -86,6 +72,6 @@ Generative AI tools assisted with software development and with writing this pap
 
 # Acknowledgements
 
-We thank the contributors to the `NNGPT` repository. This work was partially supported by the Alexander von Humboldt Foundation.
+We thank Roman Kochnev, Waleed Khalid, Xi Zhang, Yashkumar Sanjaybhai Dhameliya, Furui Qin, Chandini Vysyaraju, Raghuvir Duvvuri, Avi Goyal, and the other contributors to the `NNGPT` repository. This work was partially supported by the Alexander von Humboldt Foundation.
 
 # References
