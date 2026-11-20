@@ -10,6 +10,8 @@ from . import discovery
 from .contracts import (
     _DeepSeekV2Gate,
     _DeepSeekV2TeacherStudentGate,
+    _Glm4MoeGate,
+    _GraniteTopKGate,
     _HashScoreFnGate,
     _LogitsOnlyGate,
     _ScoreFnTopKGate,
@@ -20,6 +22,7 @@ from .contracts import (
     _copy_gate_attrs,
     _detect_post_processing,
     _get_gate_input_dim,
+    _granite_indices_first,
     _module_device_dtype,
 )
 from .datastructures import GateFactory, GateInstall, GateSite
@@ -79,7 +82,19 @@ def _wrap_gate_for_contract(
     new_gate: nn.Module,
     top_k: Optional[int],
 ) -> nn.Module:
+    indices_first = _granite_indices_first(site.gate)
+    if indices_first is not None:
+        return _GraniteTopKGate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+            indices_first=indices_first,
+        )
     post = _detect_post_processing(site.gate)
+    if post == "glm4_grouped_topk":
+        return _Glm4MoeGate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+        )
     if post == "softmax_topk":
         return _SoftmaxTopKGate(
             new_gate,
@@ -100,10 +115,11 @@ def _wrap_gate_for_contract(
             new_gate,
             top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
         )
-    if post == "deepseek_v2":
+    if post in {"deepseek_v2", "deepseek_v2_native"}:
         return _DeepSeekV2Gate(
             new_gate,
             top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+            native=post == "deepseek_v2_native",
         )
     if post == "logits_indices_weights":
         return _SoftmaxTopKGate(
@@ -129,12 +145,16 @@ def _new_gate_for_site(factory: GateFactory, site: GateSite) -> nn.Module:
     device, dtype = _module_device_dtype(site.gate)
     if device is not None:
         new_gate = new_gate.to(device=device)
+    post = _detect_post_processing(site.gate)
+    if post in {"glm4_grouped_topk", "deepseek_v2_native"}:
+        # These native routers evaluate their projections in float32 in bf16 models.
+        return new_gate.float()
     # DeepSeek-V2 computes its native router projection in float32 even when
     # router weights and hidden states are bfloat16. Preserve that behavior.
     if (
         dtype is not None
         and dtype.is_floating_point
-        and _detect_post_processing(site.gate) != "deepseek_v2"
+        and post != "deepseek_v2"
     ):
         new_gate = new_gate.to(dtype=dtype)
     return new_gate

@@ -8,7 +8,7 @@ dynamic = ['version', 'dependencies']
 description = 'LLM-Based Neural Network Generator'
 readme = { file = 'README.md', content-type = 'text/markdown' }
 license = { file = "LICENSE" }
-requires-python = '>=3.10'
+requires-python = '>=3.11'
 classifiers = [
     'Programming Language :: Python :: 3',
     'License :: OSI Approved :: MIT License',
@@ -28,7 +28,8 @@ Repository = 'https://github.com/ABrain-One/nn-gpt'
 
 [tool.setuptools.dynamic]
 version = { file = 'version' }
-dependencies = { file = ['requirements.txt', 'req-no-isolation.txt'] }
+# CUDA source builds and pip flags are installed separately via req-no-isolation.txt.
+dependencies = { file = ['requirements.txt'] }
 
 [tool.setuptools.packages.find]
 where = ['']

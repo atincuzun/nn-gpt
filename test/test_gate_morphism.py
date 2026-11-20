@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ab.gpt.util.llm.GenerationDType import align_generation_head_dtype, infer_generation_head_dtype
+from moe_cycle.generation_dtype import infer_generation_head_dtype_for_cycle
 from moe_gate_only.universal import (
     GateSite,
     _DeepSeekV2Gate,
@@ -73,6 +75,26 @@ def _native_site(weight: torch.Tensor) -> GateSite:
         pattern="parameter_gate",
         path="layers.0.mlp.gate",
     )
+
+
+@pytest.mark.parametrize("field", ["dtype", "torch_dtype"])
+def test_generation_dtype_keeps_the_config_field_used_by_the_model(field):
+    config = SimpleNamespace(**{field: "bfloat16"})
+    model = SimpleNamespace(config=config)
+    assert infer_generation_head_dtype(model) is torch.bfloat16
+    align_generation_head_dtype(model, torch.float16)
+    assert vars(config) == {field: torch.float16}
+
+
+def test_cycle_chatbot_ignores_inactive_4bit_dtype():
+    import ab.gpt.util.llm.Chatbot as chatbot
+
+    model = SimpleNamespace(config=SimpleNamespace(
+        torch_dtype="bfloat16",
+        quantization_config={"load_in_8bit": True, "bnb_4bit_compute_dtype": "float32"},
+    ))
+    assert chatbot.infer_generation_head_dtype is infer_generation_head_dtype_for_cycle
+    assert chatbot.infer_generation_head_dtype(model) is torch.bfloat16
 
 
 def test_signed_pair_activations_recover_identity() -> None:

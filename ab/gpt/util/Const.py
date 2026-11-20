@@ -12,8 +12,8 @@ new_out_file = 'full_output.txt'
 # pipeline. Used both for curation (building the SFT training corpus) and for
 # generation-seed selection (the in-context example models shown to the LLM),
 # so the two paths cannot silently drift apart.
-DEFAULT_DATASET = 'cifar-10'
-DEFAULT_NN_PREFIXES = ('ga-', 'GenFractalNet')
+DEFAULT_DATASET = None
+DEFAULT_NN_PREFIXES = []
 
 gpt = 'gpt'
 gpt_dir = ab_root_path / base_module / gpt
@@ -39,9 +39,16 @@ if _nngpt_override:
 acgpt_dir = out_dir / 'acgpt'
 nnrag_dir = out_dir / 'rag'
 
-new_dataset_dir = nngpt_dir / 'new_lemur'
+submission_dir_name = 'ab_LEMUR_submission'
+new_dataset_dir = nngpt_dir / submission_dir_name
 new_lemur_nn_dir = new_dataset_dir / 'nn'
 new_lemur_stat_dir = new_dataset_dir / 'train'
+# Generated input pipelines. A statistics row names its transform, so a
+# submission that carries nn/ and train/ but not transform/ points at a module
+# that is not in it -- the row cannot be reproduced from the submission alone.
+new_lemur_transform_dir = new_dataset_dir / 'transform'
+
+
 
 brute_dir = gpt_dir / 'brute'
 ast_dir = brute_dir / 'ast'

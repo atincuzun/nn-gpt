@@ -84,8 +84,8 @@ def _setup_run(args: Namespace) -> RunContext:
     """Load the model, discover gate sites, generate gate source, capture native behavior."""
     import torch
 
-    from ab.gpt.util.Chatbot import ChatBot
     from ab.gpt.util.Const import conf_test_dir, epoch_dir, nngpt_dir
+    from ab.gpt.util.llm.Chatbot import ChatBot
     from moe_gate_only import MoEGateSession
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

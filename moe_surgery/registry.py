@@ -245,7 +245,8 @@ def detect_model_info(model: PreTrainedModel) -> MoEModelInfo:
             conditional_moe=info.conditional_moe,
             decoder_attr=info.decoder_attr,
             num_experts=_resolve_num_experts(cfg),
-            top_k=_resolve_top_k(cfg),
+            # Legacy Switch configs expose generation top_k, not router top_k.
+            top_k=1 if info.pattern is RouterPattern.SWITCH_CAPACITY else _resolve_top_k(cfg),
         )
         _fill_classes_from_sample(model, result)
         return result

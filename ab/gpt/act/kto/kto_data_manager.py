@@ -30,13 +30,12 @@ Edge cases (no undesirables yet, extreme imbalance) are handled
 gracefully and reported in the stats dict.
 """
 
-import json
 import math
 import random
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
-from ab.gpt.act.iterative.training_data_manager import TrainingDataManager
+from ab.gpt.act.tune.iterative.training_data_manager import TrainingDataManager
 
 
 class KTODataManager(TrainingDataManager):

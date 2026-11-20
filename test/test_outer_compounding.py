@@ -226,11 +226,13 @@ def test_carry_propagates_architecture_weights_and_function(tmp_path: Path) -> N
                 )
             # The new branch is the only fresh capacity; its output layer is
             # zero-initialized so it contributes nothing at step zero.
+            # Newer Mixtral wraps the generated projection in a top-k router.
+            prefix = "" if "base.weight" in parent_state else "gate."
             fresh = {name for name in successor_state if name not in parent_state}
             assert fresh == {
-                "branch2.0.weight", "branch2.0.bias", "branch2.2.weight",
+                f"{prefix}{name}" for name in ("branch2.0.weight", "branch2.0.bias", "branch2.2.weight")
             }, f"unexpected fresh parameters: {fresh}"
-            assert torch.count_nonzero(successor_state["branch2.2.weight"]).item() == 0
+            assert torch.count_nonzero(successor_state[f"{prefix}branch2.2.weight"]).item() == 0
             site_report = next(
                 entry for entry in report["sites"]
                 if entry["path"] == install.site.path
@@ -349,7 +351,8 @@ def test_sft_batch_runs_under_best_gate_architecture_and_weights(
                 f"SFT ran under layer {layer} {name} without the best gate's "
                 "trained weights"
             )
-        assert not torch.equal(state["base.weight"], built.native_weights[layer])
+        base_weight = "base.weight" if "base.weight" in state else "gate.base.weight"
+        assert not torch.equal(state[base_weight], built.native_weights[layer])
     # Gate parameters stay frozen; only the proposer LoRA would train.
     assert all(not names for names in captured["trainable"].values())
     # The session is restored: no gates remain installed and the native

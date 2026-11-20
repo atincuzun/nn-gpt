@@ -1,10 +1,9 @@
 import argparse
 import inspect
-import sys
 import torch
 from peft import LoraConfig
 from trl import SFTConfig
-from ab.gpt.util.Tune import tune
+from ab.gpt.util.tune.Tune import tune
 from ab.gpt.util.Const import nngpt_dir, conf_train_dir
 
 

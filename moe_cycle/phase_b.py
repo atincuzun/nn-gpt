@@ -1,12 +1,8 @@
 """Outer-loop SFT: train the gate proposer itself on measured gate outcomes.
 
-Reuses the ORIGINAL LoRA path machinery from ``ab/gpt/util/LoRA.py`` rather
-than reimplementing it: adapter attachment goes through the same ``LoRA``
-class (``prepare_model_for_kbit_training``, gradient checkpointing,
-``get_peft_model``) with the same default config (``create_peft_config``:
-DoRA r=32, alpha=64, dropout=0.1 over all linear modules), and SFT training
-runs through the same ``LoRA.train`` (TRL SFTTrainer, completions-only
-masking, validation split, per-call adapter saving).
+Reuses ``ab.gpt.util.llm.LoRA`` for adapter attachment and training. Phase B
+supplies pre-tokenized rows with the prompt labels already masked, so
+``LoRA.train`` pads them for the standard Trainer without re-tokenizing.
 
 Deliberate deviations, each required by the gate cycle:
 - Router modules stay adapter-free: ``find_all_linear_names`` results exclude
@@ -25,9 +21,7 @@ Deliberate deviations, each required by the gate cycle:
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,104 +43,6 @@ PROPOSER_LORA_TARGETS = (
 )
 
 
-class _LegacyKwargsPaddingCollator:
-    """Bridge for the TRL collator ``LoRA.py`` tries to construct.
-
-    Upstream ``ab/gpt/util/LoRA.py`` (which this project must not modify)
-    always builds a data collator as
-
-        DataCollatorForLanguageModeling(pad_token_id=...,
-                                        completion_only_loss=True,
-                                        pad_to_multiple_of=8,
-                                        return_tensors="pt")
-
-    That signature belongs to TRL <= 0.11. The installed trl 0.12.2 removed
-    its custom collator and re-exports the plain transformers one, whose
-    ``__init__`` accepts none of those keyword arguments — so the call dies
-    with ``TypeError: unexpected keyword argument 'pad_token_id'`` before a
-    single training step.
-
-    Our outer-loop SFT datasets are PRE-TOKENIZED rows of
-    ``{"input_ids", "labels"}`` where prompt tokens are already masked to
-    -100 (see :func:`_tokenise_pair`). For such rows the collator's only
-    real job is padding: ``completion_only_loss`` is honoured by
-    construction (the masking lives in ``labels``) and ``pad_token_id`` only
-    pads ``input_ids``. This class therefore accepts the exact legacy
-    keyword set LoRA.py passes and does the padding itself.
-    """
-
-    def __init__(
-        self,
-        pad_token_id: int = 0,
-        completion_only_loss: bool = True,
-        pad_to_multiple_of: int | None = None,
-        return_tensors: str = "pt",
-        **legacy_ignored: Any,
-    ):
-        self.pad_token_id = int(pad_token_id)
-        self.completion_only_loss = bool(completion_only_loss)
-        self.pad_to_multiple_of = pad_to_multiple_of
-        self.return_tensors = return_tensors
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
-        import torch
-
-        def _pad(values: list[int], fill: int) -> list[int]:
-            return list(values) + [fill] * (target_length - len(values))
-
-        longest = max(len(feature["input_ids"]) for feature in features)
-        multiple = self.pad_to_multiple_of or 1
-        target_length = ((longest + multiple - 1) // multiple) * multiple
-        input_ids, labels, attention_mask = [], [], []
-        for feature in features:
-            ids = _pad(feature["input_ids"], self.pad_token_id)
-            lab = _pad(feature.get("labels", feature["input_ids"]), -100)
-            mask = [1] * len(feature["input_ids"]) + [0] * (
-                target_length - len(feature["input_ids"])
-            )
-            input_ids.append(ids)
-            labels.append(lab)
-            attention_mask.append(mask)
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        }
-
-
-@contextmanager
-def _legacy_trl_collator_compat():
-    """Swap in :class:`_LegacyKwargsPaddingCollator` only when needed.
-
-    Version-adaptive by design so the MoE cycle never overrides working
-    pipeline behavior: if the installed TRL collator still accepts the
-    legacy keyword arguments (older venv, or a future LoRA.py/trl fix on
-    the pipeline side), this context manager is a NO-OP and the original
-    class is used untouched. Only when the signature check proves the
-    legacy call would raise TypeError is the module-level name that
-    ``LoRA.py`` imported patched — and it is always restored afterwards.
-    """
-    import ab.gpt.util.LoRA as lora_module
-
-    real = lora_module.DataCollatorForLanguageModeling
-    try:
-        parameters = inspect.signature(real.__init__).parameters
-        legacy_supported = {"pad_token_id", "completion_only_loss"}.issubset(
-            parameters
-        )
-    except (TypeError, ValueError):
-        # Cannot introspect the constructor: never patch blindly.
-        legacy_supported = True
-    if legacy_supported:
-        yield
-        return
-    lora_module.DataCollatorForLanguageModeling = _LegacyKwargsPaddingCollator
-    try:
-        yield
-    finally:
-        lora_module.DataCollatorForLanguageModeling = real
-
-
 def wrap_proposer_with_lora(session: Any, args: Any, merge_from: Path | None = None) -> Any:
     """Attach the proposer LoRA using the original LoRA path machinery.
 
@@ -157,7 +53,8 @@ def wrap_proposer_with_lora(session: Any, args: Any, merge_from: Path | None = N
     model, which becomes ``session.model``; the tuner is stashed on
     ``session.proposer_tuner`` for the SFT batches.
     """
-    from ab.gpt.util.LoRA import LoRA as ProposerTuner, create_peft_config, find_all_linear_names
+    import torch
+    from ab.gpt.util.llm.LoRA import LoRA as ProposerTuner, create_peft_config, find_all_linear_names
     from trl import SFTConfig
 
     model = session.model
@@ -182,6 +79,7 @@ def wrap_proposer_with_lora(session: Any, args: Any, merge_from: Path | None = N
         gradient_accumulation_steps=4,
         gradient_checkpointing=True,
         bf16=True,
+        use_cpu=model.device.type == "cpu" and not torch.cuda.is_available(),
         save_strategy="no",
         logging_steps=5,
         report_to=[],
@@ -305,10 +203,9 @@ def train_proposer(
 ) -> dict[str, Any]:
     """One outer-loop SFT batch on the accumulated gate pairs.
 
-    SFT mode (default) delegates entirely to ``ab.gpt.util.LoRA.LoRA.train``:
-    TRL SFTTrainer, completions-only masking, validation split, adapter and
-    tokenizer saving — the same machinery the CV pipeline tunes with. DPO mode
-    keeps the manual contrastive loop (policy vs adapter-disabled reference).
+    SFT mode (default) delegates to ``ab.gpt.util.llm.LoRA.LoRA.train`` with
+    pre-tokenized completion labels. DPO mode keeps the manual contrastive
+    loop (policy vs adapter-disabled reference).
     Only LoRA parameters ever train; the backbone stays frozen.
     """
     import torch
@@ -391,47 +288,28 @@ def train_proposer(
             )
         from datasets import Dataset as HFDataset
 
-        # PRE-TOKENIZED rows: prompt tokens already masked to -100 in labels.
-        # The earlier {"prompt","completion"} string rows were abandoned
-        # (2026-09-23) for two reasons:
-        # 1. trl 0.12.2's SFTTrainer applies tokenizer.apply_chat_template to
-        #    prompt/completion STRING datasets itself — our prompts are
-        #    already chat-template-rendered, so strings would be templated
-        #    TWICE and the supervision boundary would blur.
-        # 2. LoRA.py's collator construction for such datasets uses TRL
-        #    <=0.11 kwargs removed in 0.12 (see _legacy_trl_collator_compat).
-        # {"input_ids","labels"} columns take LoRA.train's plain-Trainer
-        # branch: no re-tokenization, and the collator only has to pad.
-        # LoRA.train will warn "Cannot auto-detect response template ...
-        # Falling back to training on all tokens" — expected and wrong for
-        # us: completion-only masking already lives in the labels.
+        # The chat template and loss mask are already applied; LoRA.train
+        # only pads these rows, rather than rendering and masking them again.
         rows = []
         max_length = int(getattr(args, "max_length", 0) or 0)
-        for pair_batch in build_pair_batches(
-            pairs, tokenizer, shapes, include_lower=False,
-            inherit_reference=inherit_reference,
-        ):
+        for pair_batch in batches:
             ids, labels = pair_batch.higher_ids, pair_batch.higher_labels
             if max_length and len(ids) > max_length:
                 # Keep the tail: the completion is the supervision target and
                 # prompts are the long part (they embed the reference gate).
                 ids, labels = ids[-max_length:], labels[-max_length:]
             rows.append({"input_ids": ids, "labels": labels})
-        # LoRA.train splits off 10% for evaluation; with a single pair the
-        # split degrades or raises — the outer loop's batch guard records
-        # and survives either outcome.
-        with _legacy_trl_collator_compat():
-            tuner.train(
-                HFDataset.from_list(rows),
-                tokenizer,
-                str(Path(output_dir)),
-                train_on_completions_only=True,
-            )
+        tuner.train(
+            HFDataset.from_list(rows),
+            tokenizer,
+            str(Path(output_dir)),
+            train_on_completions_only=True,
+        )
         summary = {
             "mode": "sft",
             "steps": args.gate_sft_steps,
             "pairs": len(rows),
-            "trainer": "ab.gpt.util.LoRA.LoRA.train (plain Trainer on pre-tokenized rows)",
+            "trainer": "ab.gpt.util.llm.LoRA.LoRA.train (plain Trainer on pre-tokenized rows)",
         }
 
     for parameter in lora_parameters:

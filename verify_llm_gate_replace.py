@@ -46,7 +46,7 @@ from moe_cycle.generation_dtype import ensure_generation_dtype_policy
 
 ensure_generation_dtype_policy()
 
-from ab.gpt.util.Chatbot import ChatBot  # noqa: E402
+from ab.gpt.util.llm.Chatbot import ChatBot  # noqa: E402
 from moe_cycle.gate_prompt import gate_proposal_prompt  # noqa: E402
 from moe_cycle.gate_source import _generate_gate, _validate_gate_source  # noqa: E402
 from moe_cycle.morphism import (  # noqa: E402

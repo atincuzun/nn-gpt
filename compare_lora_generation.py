@@ -15,7 +15,6 @@ from peft import PeftConfig, PeftModel
 
 from ab.gpt.util.Util import extract_all_to_train
 from ab.gpt.util.nn_sftcodegen_rag import validate_code_for_nneval
-from ab.gpt.util.prompt.NNGenPrompt import NNGenPrompt
 from moe_gate_only.training import model_input_device
 
 
@@ -107,6 +106,8 @@ def main() -> None:
         raise ValueError("num-prompts must be positive and no larger than max-source-prompts")
     seed_all(args.seed)
 
+    # Importing NNGenPrompt opens the LEMUR corpus; --help does not need it.
+    from ab.gpt.util.prompt.NNGenPrompt import NNGenPrompt
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     peft_config = PeftConfig.from_pretrained(args.adapter, local_files_only=args.local_files_only)

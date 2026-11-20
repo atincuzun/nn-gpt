@@ -17,8 +17,8 @@ from transformers import (
 )
 
 from ab.gpt.util.Const import llm_tokenizer_out
-from ab.gpt.util.LLMUtil import quantization_config_4bit, tokenize
-from ab.gpt.util.lemur_dataset_preparation import DatasetPreparation
+from ab.gpt.util.llm.LLMUtil import quantization_config_4bit, tokenize
+from ab.gpt.util.data.lemur_dataset_preparation import DatasetPreparation
 
 device = torch.device("cuda" if torch.cuda.is_available()  else "cpu")
 
@@ -63,7 +63,7 @@ def main(tuned_model_version, hf_directory, dataset_path):
                                                  trust_remote_code=True,
                                                  device_map="auto",
                                                  quantization_config=quantization_config_4bit,
-                                                 torch_dtype=torch.float16
+                                                 dtype=torch.float16
                                                 )
 
     # trying to load mapped datasets

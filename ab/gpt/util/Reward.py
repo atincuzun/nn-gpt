@@ -19,7 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-import ab.gpt.util.DatasetSplit as DatasetSplit
+import ab.gpt.util.data.DatasetSplit as DatasetSplit
 import ab.gpt.act.rl.reward_payload as RewardPayload
 import torch.nn as nn
 import torch.nn.functional as F
@@ -897,7 +897,7 @@ class _PersistentEvalWorkerSession:
             sys.executable,
             "-u",
             "-m",
-            "ab.gpt.util.reward_worker_bootstrap",
+            "ab.gpt.util.eval.reward_worker_bootstrap",
             "--conn-fd",
             str(child_fd),
             "--assigned-gpu",
@@ -3496,7 +3496,7 @@ def _formal_eval_with_nn_dataset(
         )
         with tempfile.TemporaryDirectory(prefix="nngpt_reward_formal_") as temp_stats_dir:
             summary_path = (Path.cwd() / "out" / "training_summary.json").resolve()
-            _model_name, test_acc, _accuracy_to_time, _code_score = nn_api.check_nn(
+            _model_name, test_acc, _accuracy_to_time = nn_api.check_nn(
                 unique_code,
                 str(getattr(cfg, "formal_task", "img-classification")),
                 str(getattr(cfg, "formal_dataset", "cifar-10")),

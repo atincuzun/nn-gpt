@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import PreTrainedModel
 
-from .adapters import ADAPTERS
+from .adapters import ADAPTERS, _is_lfm2_topk_router
 from .registry import (
     _get_layers,
     _first_moe_layer,
@@ -54,6 +54,17 @@ class _InlineLinearRouter(nn.Module):
 
     def extra_repr(self) -> str:
         return f"model_dim={self.model_dim}, num_experts={self.num_experts}"
+
+
+def _replace_switch_projection(
+    classifier: nn.Linear, custom_gate: GateFn, model_dim: int, num_experts: int
+) -> None:
+    # Keep native capacity accounting and the router's version-specific tuple layout.
+    def forward(_: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        logits = custom_gate(x.reshape(-1, x.shape[-1]), model_dim, num_experts)
+        return logits.reshape(*x.shape[:-1], num_experts)
+
+    classifier.forward = types.MethodType(forward, classifier)
 
 
 def _get_model_dim(model: PreTrainedModel, info: MoEModelInfo) -> int:
@@ -276,17 +287,19 @@ def replace_router(
             )
             adapter_kwargs: Dict[str, Any] = {"top_k": top_k, **kwargs}
 
-            if info.pattern == RouterPattern.INLINE_LINEAR:
-                old_gate = router
-                if not isinstance(old_gate, nn.Linear):
-                    logger.warning(
-                        "Layer %d: expected nn.Linear at %s, got %s",
-                        layer_idx, router_path, type(old_gate).__name__,
-                    )
-                    continue
+            classifier = getattr(router, "classifier", None)
+            if info.model_type == "switch_transformers" and isinstance(classifier, nn.Linear):
+                _replace_switch_projection(classifier, custom_gate_fn, model_dim, num_experts)
+            elif info.pattern == RouterPattern.INLINE_LINEAR and isinstance(router, nn.Linear):
                 new_gate = _InlineLinearRouter(custom_gate_fn, model_dim, num_experts)
                 _set_child(router_owner, router_path, new_gate)
             else:
+                if info.pattern == RouterPattern.INLINE_LINEAR and not _is_lfm2_topk_router(router):
+                    logger.warning(
+                        "Layer %d: expected nn.Linear at %s, got %s",
+                        layer_idx, router_path, type(router).__name__,
+                    )
+                    continue
                 new_forward = adapter.create_forward(
                     custom_gate_fn,
                     model_dim,

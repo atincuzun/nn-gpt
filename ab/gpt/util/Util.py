@@ -7,9 +7,12 @@ import re
 import shutil
 from pathlib import Path
 
-from ab.gpt.util.Const import new_lemur_nn_dir, new_nn_file, new_lemur_stat_dir
+from ab.nn.util.Util import uuid4
+from ab.gpt.util.Const import (hp_file, new_lemur_nn_dir, new_lemur_stat_dir,
+                               new_lemur_transform_dir, new_nn_file,
+                               transformer_file)
 
-from ..util.Code import *
+from ab.gpt.util.nn.Code import *
 
 
 def nn_accepted(nn_dir):
@@ -133,8 +136,23 @@ def _is_real_code(cand) -> bool:
     return True
 
 
+_FENCE_OPEN = re.compile(r'\A\s*```[ \t]*(?:python|py|python3)?[ \t]*\r?\n')
+_FENCE_CLOSE = re.compile(r'\r?\n[ \t]*```[ \t]*\s*\Z')
+
+
+def _strip_code_fence(cand):
+    """Remove a markdown fence the model put inside its <nn> block (a leading
+    ```python / ``` line and a trailing ``` line); the fence made the saved code
+    fail to parse at line 1. Code without a fence is returned unchanged."""
+    if cand is None:
+        return None
+    stripped = _FENCE_CLOSE.sub('', _FENCE_OPEN.sub('', cand, count=1), count=1)
+    return stripped.strip() if stripped != cand else cand
+
+
 def _guarded(cand):
     """Apply the rejection guard to an already-extracted candidate."""
+    cand = _strip_code_fence(cand)
     if cand is None:
         return None
     if _is_real_code(cand):
@@ -221,6 +239,18 @@ def is_nn_model_code(s) -> bool:
 def extract_transform(txt):
     return extract_by_pattern('transform code', txt.replace('< tr >', '<tr>').replace('<.tr>', '<tr>').replace('</ tr >', '</tr>'),
                               (('<tr>', '</tr>'),))
+
+
+def extract_schedule(txt):
+    
+    txt = txt.replace('< sched >', '<sched>').replace('<.sched>', '<sched>').replace('</ sched >', '</sched>')
+    res = next(filter(None, map(lambda l: extract_str(txt, *l),
+                                (('<sched>', '</sched>'), ('```json', '```')))), None)
+    if res:
+        print(f'Found augmentation schedule: {len(res)} chars')
+    else:
+        print('No augmentation schedule found')
+    return res
 
 
 def extract_all_to_train(txt):
@@ -327,13 +357,193 @@ def extract_delta(txt):
     return None
 
 
-def copy_to_lemur(gen_nn_dir, name, task, dataset, metric):
+#: Generated transform names: "tr-<uid>".
+#:
+#: A hyphen, never an underscore. The dataset's own transforms are named this
+#: way -- bf-v1-CenterCrop_Pad and 223 others -- so the loader clearly resolves
+#: them by file and not by importing ab.nn.transform.<name>, where a hyphen
+#: would not be a legal module name. Not configurable: an underscore separator
+#: would produce exactly the name shape this avoids.
+TRANSFORM_NAME_SEP = "-"
+
+TRANSFORM_NAME_PREFIX = "tr"
+
+
+def normalise_transform_code(code) -> str:
+    """A transform's text with formatting that cannot change behaviour removed.
+
+    Blank lines and trailing whitespace only. Measured need: one cycle shipped
+    six generated transforms of which three were the same pipeline differing by
+    a blank line after the import, and two more were another such pair -- six
+    files, three transforms, and none of them checked against the ones the
+    dataset already holds.
+    """
+    return "\n".join(line.rstrip() for line in (code or "").strip().splitlines()
+                      if line.strip())
+
+
+def transform_uid(code) -> str:
+    """The project's standard uid, over the normalised transform text.
+
+    The same ab.nn.util.Util.uuid4 the dataset uses to name a model, so a
+    transform is identified the way everything else in the pipeline is. No
+    local fallback: a divergent uid would silently split one transform into
+    two, which is the bug this exists to fix.
+    """
+    return uuid4(normalise_transform_code(code))
+
+
+def known_transforms() -> dict:
+    """``{uid: name}`` for every transform already available by name.
+
+    Both sources that matter: the transforms the installed dataset ships, and
+    the ones earlier cycles of this run already generated and submitted. A
+    transform found here needs no new file and no new name -- the row simply
+    refers to the name that already exists.
+    """
+    index = {}
+    dirs = []
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("ab.nn")
+        roots = []
+        if spec is not None:
+            if spec.origin:
+                roots.append(Path(spec.origin).parent)
+            # A namespace package has no origin, only search locations.
+            for loc in (spec.submodule_search_locations or ()):
+                roots.append(Path(loc))
+        for root in roots:
+            d = root / "transform"
+            if d.is_dir() and d not in dirs:
+                dirs.append(d)
+    except Exception:
+        pass
+    dirs.append(Path(new_lemur_transform_dir))
+    for d in dirs:
+        try:
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.py")):
+                if f.name.startswith("_"):
+                    continue
+                try:
+                    code = f.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                if "def transform" not in code:
+                    continue
+                # First writer wins, and the dataset's own directory is first,
+                # so a dataset name is never shadowed by a generated one.
+                index.setdefault(transform_uid(code), f.stem)
+        except Exception:
+            continue
+    return index
+
+
+def resolve_transform_name(code):
+    """``(name, is_new)`` for a transform. Reuses an existing name when it can.
+
+    This is the check that was missing: a generated transform was named from a
+    hash of its raw text, so the same pipeline written with a different blank
+    line became a new transform, and one the dataset already had under
+    norm_32_flip became a second copy under a generated name.
+    """
+    uid = transform_uid(code)
+    existing = known_transforms().get(uid)
+    if existing:
+        return existing, False
+    return f"{TRANSFORM_NAME_PREFIX}{TRANSFORM_NAME_SEP}{uid}", True
+
+
+def generated_transform_name(code) -> str:
+    """The name a transform should be recorded under. Kept for callers."""
+    return resolve_transform_name(code)[0]
+
+
+def copy_generated_transform(gen_nn_dir, name=None):
+    """Put this model's transform module into the submission, next to nn/.
+
+    A statistics row records ``prm["transform"]`` by name. If the generated
+    module is not shipped alongside, the submitted row refers to a transform
+    that is not in the submission and cannot be reproduced from it. Returns the
+    name written, or None when the model used a dataset transform that the
+    LEMUR tree already holds.
+    """
+    tr_path = Path(gen_nn_dir) / transformer_file
+    if not tr_path.is_file():
+        return None
+    try:
+        code = tr_path.read_text(encoding='utf-8')
+    except Exception:
+        return None
+    if not code.strip():
+        return None
+    if not name:
+        # Prefer the name the evaluation actually trained under.
+        hp_path = Path(gen_nn_dir) / hp_file
+        if hp_path.is_file():
+            try:
+                import json as _json
+                prm = _json.loads(hp_path.read_text(encoding='utf-8'))
+                if isinstance(prm, dict) and isinstance(prm.get('transform'), str):
+                    name = prm['transform']
+            except Exception:
+                name = None
+    resolved, is_new = resolve_transform_name(code)
+    if not is_new:
+        # Already in the dataset under its own name. Shipping a second copy
+        # under a different name is exactly the duplication this avoids.
+        return resolved
+    if not name or name != resolved:
+        name = resolved
+    Path(new_lemur_transform_dir).mkdir(parents=True, exist_ok=True)
+    target = new_lemur_transform_dir / f'{name}.py'
+    if not target.exists():
+        target.write_text(code, encoding='utf-8')
+    return name
+
+
+def copy_to_lemur(gen_nn_dir, name, task, dataset, metric, stat_dir=None):
+    """Stage one trained network and its statistics for submission.
+
+    A submission is a network *and* the measurements behind it. This used to
+    create the statistics directory first and then copy whatever numbered JSON
+    it found, so a model whose statistics never reached gen_nn_dir -- the
+    trainer warns and carries on when save_path is unset -- was staged with an
+    empty directory beside it. The archive counted the directory, reported the
+    record, and the submission claimed a measurement it did not have.
+
+    So the statistics decide. No numbered JSON, nothing staged.
+
+    ``stat_dir`` holds the statistics when they were not written next to the code,
+    e.g. one folder per dataset when the same network is trained on several.
+    """
+    stat_dir = Path(stat_dir) if stat_dir else gen_nn_dir
+    try:
+        stats = sorted(f for f in os.listdir(stat_dir)
+                       if re.match(r'[0-9]+\.json$', f))
+    except OSError as exc:
+        print(f'[submission] {name} skipped: cannot read {stat_dir} ({exc})',
+              flush=True)
+        return
+    if not stats:
+        print(f'[submission] {name} skipped: no statistics in {stat_dir}; '
+              f'a network is not submitted without the measurement behind it',
+              flush=True)
+        return
     Path(new_lemur_nn_dir).mkdir(parents=True, exist_ok=True)
     shutil.copyfile(gen_nn_dir / new_nn_file, new_lemur_nn_dir / f'{name}.py')
     dr_nm = new_lemur_stat_dir / f"{task}_{dataset}_{metric}_{name}"
     Path(dr_nm).mkdir(parents=True, exist_ok=True)
-    for f_nm in [f for f in os.listdir(gen_nn_dir) if re.match(r'[0-9]+\.json', f)]:
-        shutil.copyfile(gen_nn_dir / f_nm, dr_nm / f_nm)
+    for f_nm in stats:
+        shutil.copyfile(stat_dir / f_nm, dr_nm / f_nm)
+    try:
+        written = copy_generated_transform(gen_nn_dir)
+        if written:
+            print(f'[submission] transform {written}.py copied for {name}', flush=True)
+    except Exception as exc:
+        print(f'[submission] could not copy the transform for {name}: {exc}', flush=True)
 
 
 # ========== FORMULA EVALUATION FUNCTION ==========
@@ -384,4 +594,85 @@ def evaluate_delimited_formulas(text: str, para_dict: dict) -> str:
 
     return re.sub(pattern, replace_match, text)
 # =================================================
+
+def submit_transform_code(code):
+    """Stage a transform's source in the submission and return the name it goes by.
+
+    The name comes from resolve_transform_name, so a transform the dataset (or
+    an earlier cycle) already holds keeps its existing name and is not copied
+    again.
+    """
+    name, is_new = resolve_transform_name(code)
+    if is_new:
+        Path(new_lemur_transform_dir).mkdir(parents=True, exist_ok=True)
+        target = new_lemur_transform_dir / f'{name}.py'
+        if not target.exists():
+            target.write_text(code, encoding='utf-8')
+    return name
+
+
+def stage_stats_for_submission(stats_dir, nn_name, task, dataset, metric, overrides=None, suffix=''):
+    """Stage statistics measured by TransformEval / AugEval in the submission's train/ folder.
+    """
+    import json as _json
+    try:
+        stats = sorted((f for f in os.listdir(stats_dir) if re.match(r'[0-9]+\.json$', f)),
+                       key=lambda f: int(f[:-5]))
+    except OSError as exc:
+        print(f'[submission] {nn_name} skipped: cannot read {stats_dir} ({exc})', flush=True)
+        return None
+    if not stats:
+        print(f'[submission] {nn_name} skipped: no statistics in {stats_dir}', flush=True)
+        return None
+    dr_nm = Path(new_lemur_stat_dir) / f"{task}_{dataset}_{metric}_{nn_name}_{suffix}"
+    dr_nm.mkdir(parents=True, exist_ok=True)
+    taken = [int(f[:-5]) for f in os.listdir(dr_nm) if re.match(r'[0-9]+\.json$', f)]
+    nxt = max(taken, default=0) + 1
+    for f in stats:
+        record = _json.loads((Path(stats_dir) / f).read_text(encoding='utf-8'))
+        for rec in (record if isinstance(record, list) else [record]):
+            if isinstance(rec, dict):
+                rec.update(overrides or {})
+        (dr_nm / f'{nxt}.json').write_text(_json.dumps(record, indent=2), encoding='utf-8')
+        nxt += 1
+    return dr_nm
+
+def install_into_lemur_package(kind, name, source):
+    """Write a transform or schedule into the installed LEMUR package.
+
+     'transform' -> ab/nn/transform/<name>.py
+     'schedule'  -> ab/nn/transform/schedules/<name>.py
+    Returns the path written, or None when ab.nn cannot be located.
+    """
+    import importlib.util
+    spec = importlib.util.find_spec("ab.nn")
+    roots = []
+    if spec is not None:
+        if spec.origin:
+            roots.append(Path(spec.origin).parent)
+        roots.extend(Path(loc) for loc in (spec.submodule_search_locations or ()))
+    if not roots:
+        print(f'[lemur] ab.nn not found; {kind} {name} not installed', flush=True)
+        return None
+    target_dir = roots[0] / "transform"
+    if kind == "schedule":
+        target_dir = target_dir / "schedules"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "schedule" and not (target_dir / "__init__.py").exists():
+        (target_dir / "__init__.py").write_text("", encoding="utf-8")
+    target = target_dir / f"{name}.py"
+    if not target.exists():
+        target.write_text(source, encoding="utf-8")
+    print(f'[lemur] {kind} {name} installed at {target}', flush=True)
+    return target
+
+
+def archive_evaluator_submission():
+    """Archive what TransformEval / AugEval staged,
+
+    """
+    from ab.gpt.util.Const import nngpt_dir
+    from ab.gpt.util.data.LemurSubmission import SUBMISSION_PARTS, archive_submission
+    return archive_submission(nngpt_dir, parts=tuple(SUBMISSION_PARTS) + ("transform",))
+
 

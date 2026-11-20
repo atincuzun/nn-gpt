@@ -1,6 +1,6 @@
 """MoE-cycle-scoped fix for generation-head dtype inference under bnb quantization.
 
-``ab.gpt.util.GenerationDType.infer_generation_head_dtype`` reads
+``ab.gpt.util.llm.GenerationDType.infer_generation_head_dtype`` reads
 ``bnb_4bit_compute_dtype`` unconditionally. ``BitsAndBytesConfig(load_in_8bit=True)``
 materializes that attribute with its default (``float32``) even when running in
 8-bit mode, so ChatBot casts ``lm_head`` to fp32 and rewrites
@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 def infer_generation_head_dtype_for_cycle(model: Any, fallback: Optional[Any] = None):
     """Active-mode-aware variant of GenerationDType.infer_generation_head_dtype."""
-    from ab.gpt.util.GenerationDType import normalize_torch_dtype, _value_from
+    from ab.gpt.util.llm.GenerationDType import normalize_torch_dtype, _value_from
 
     config = getattr(model, "config", None)
     quantization_configs = []
@@ -64,7 +64,7 @@ def ensure_generation_dtype_policy() -> None:
     Idempotent; records the applied state on the function so repeated calls
     (entry point + main()) are cheap no-ops.
     """
-    import ab.gpt.util.Chatbot as chatbot_module
+    import ab.gpt.util.llm.Chatbot as chatbot_module
 
     if getattr(chatbot_module.infer_generation_head_dtype, "_moe_cycle_policy", False):
         return

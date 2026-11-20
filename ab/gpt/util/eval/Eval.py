@@ -1,0 +1,245 @@
+import os
+import re
+import ast
+import shutil
+import sys
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+import ab.nn.api as api
+from ab.nn.util.Util import uuid4
+from ab.gpt.util.Util import read_py_file_as_string
+import ab.nn.api as nn_dataset
+
+
+class Eval:
+    def __init__(self, model_source_package: str, task='img-classification', dataset='cifar-10', metric='acc', prm=None, save_to_db=False, prefix=None, save_path=None, use_ast_validation=None, allow_existing=False):
+        """
+        Evaluates a given model on a specified dataset for classification
+        :param model_source_package: The package name of the model to evaluate
+        :param task: The task to evaluate the model on
+        :param dataset: The dataset to evaluate the model on
+        :param metric: The metric to evaluate the model on
+        :param prm: The parameters to evaluate the model on
+        :param save_to_db: Whether to save the results to the database
+        :param use_ast_validation: None = auto-detect from prefix; True = AST; False = legacy string counting
+        :param allow_existing: Train even if the architecture is already in the database (e.g. to evaluate
+            one network on several datasets); also skips the full-database load done for that check
+        """
+        if prm is None:
+            prm = {'lr': 0.01, 'batch': 10, 'dropout': 0.2, 'momentum': 0.9,
+                   'transform': 'norm_256_flip', 'epoch': 1}
+        self.model_package = model_source_package
+        self.task = task
+        self.dataset = dataset
+        self.metric = metric
+        self.prm = prm
+        self.save_to_db = save_to_db
+        self.prefix = prefix
+        self.save_path = save_path
+        self.allow_existing = allow_existing
+        
+        if use_ast_validation is None:
+            self.use_ast_validation = prefix is not None and 'delta' in str(prefix).lower()
+        else:
+            self.use_ast_validation = use_ast_validation
+
+    def evaluate(self, nn_file, checkpoint_path=None, layer_analysis=False):
+        if layer_analysis and (checkpoint_path or not self.save_to_db):
+            raise ValueError("Layer analysis requires save_to_db=True and no eval checkpoint")
+        os.listdir(self.model_package)
+        code = read_py_file_as_string(nn_file)
+        if not code or not code.strip():
+            raise Exception(f'Code is missing.')
+        sup_prm = 'supported_hyperparameters'
+        for fn in {sup_prm, 'train_setup', 'learn'}:
+            if not re.match(r'[\s\S]*\s+def\s' + re.escape(fn) + r'\(.*', code):
+                raise Exception(f'The NN code lacks the required function \'{fn}\'.')
+
+        tree = ast.parse(code)
+        prm_keys = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == sup_prm:
+                if isinstance(node.body[0], ast.Return):
+                    return_node = node.body[0].value
+                    prm_keys = ast.literal_eval(return_node)
+        
+        # batch_size is controlled by the training framework (Train.py), not by
+        # generated model code — skip it to avoid false "declared-but-unused" failures.
+        _SKIP_PARAM_VALIDATION = {'batch_size'}
+        prm_keys = [k for k in prm_keys if k not in _SKIP_PARAM_VALIDATION]
+
+        if self.use_ast_validation:
+            for prm_key in prm_keys:
+                param_used = False
+                for node in ast.walk(tree):
+                    # Check for prm['key'] pattern (subscript)
+                    if isinstance(node, ast.Subscript):
+                        if isinstance(node.value, ast.Name) and node.value.id == 'prm':
+                            if isinstance(node.slice, ast.Constant) and node.slice.value == prm_key:
+                                param_used = True
+                                break
+                    # Check for prm.get('key') pattern (method call)
+                    if isinstance(node, ast.Call):
+                        if isinstance(node.func, ast.Attribute) and node.func.attr == 'get':
+                            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'prm':
+                                if len(node.args) > 0 and isinstance(node.args[0], ast.Constant) and node.args[0].value == prm_key:
+                                    param_used = True
+                                    break
+                if not param_used:
+                    raise Exception(f'The param \'{prm_key}\' is not used in the code.')
+        else:
+            for prm_key in prm_keys:
+                if code.count('"' + prm_key + '"') + code.count("'" + prm_key + "'") < 2:
+                    raise Exception(f'The param \'{prm_key}\' is not used in the code.')
+
+        new_checksum = uuid4(code)
+        allow_retrain = bool(checkpoint_path) or not self.save_to_db or self.allow_existing
+        if not allow_retrain:
+            nn_dataset.data.cache_clear()
+            df = nn_dataset.data()
+            ids_list = df["nn_id"].unique().tolist() if "nn_id" in df.columns else []
+        if allow_retrain or new_checksum not in ids_list:
+            with _isolated_eval_tmp_modules():
+                if layer_analysis:
+                    from ab.nn.util import LayerAnalysis, Train
+                    previous = LayerAnalysis.ACTIVE_LAYER_FEATURES
+                    LayerAnalysis.ACTIVE_LAYER_FEATURES = ("taylor_imp",)
+                    try:
+                        return Train.train_new(
+                            code, self.task, self.dataset, self.metric, self.prm,
+                            save_to_db=self.save_to_db, prefix=self.prefix,
+                            save_path=self.save_path, layer_analysis=True,
+                            **({"epoch_limit_minutes": self.epoch_limit_minutes}
+                               if getattr(self, "epoch_limit_minutes", None) is not None else {}),
+                        )
+                    finally:
+                        LayerAnalysis.ACTIVE_LAYER_FEATURES = previous
+                if checkpoint_path:
+                    from ab.gpt.util.eval.eval_checkpoint import train_and_eval_with_checkpoint
+
+                    return train_and_eval_with_checkpoint(
+                        code,
+                        self.task,
+                        self.dataset,
+                        self.metric,
+                        self.prm,
+                        checkpoint_path,
+                        save_to_db=self.save_to_db,
+                        prefix=self.prefix,
+                        save_path=self.save_path,
+                    )
+                return api.check_nn(
+                    code,
+                    self.task,
+                    self.dataset,
+                    self.metric,
+                    self.prm,
+                    self.save_to_db,
+                    self.prefix,
+                    self.save_path,
+                )
+        else:
+            raise Exception(f'NN already exists (checksum: {new_checksum}). Skipping API call.')
+
+    def get_args(self):
+        return {
+            'model_package': self.model_package,
+            'task': self.task,
+            'dataset': self.dataset,
+            'metric': self.metric,
+            'prm': self.prm,
+        }
+
+
+#: How old a leftover scratch directory must be before it is swept, in
+#: seconds. A live worker's directory is minutes old at most while it trains,
+#: so an hour is far beyond anything in use.
+STALE_EVAL_TMP_SECONDS = 3600
+
+
+def _sweep_stale_eval_tmp(ab_root_path, original_out) -> int:
+    """Delete scratch directories left behind by workers that were killed.
+
+    The context manager below removes its own directory, but an evaluation
+    worker is the kernel's preferred OOM victim by design (oom_score_adj 800),
+    and a killed process runs no finally block. So they accumulate -- which is
+    how the repository root came to hold a pile of
+    out_nneval_tmp_pid_*. Swept here rather than at startup because this is the
+    one place that knows what they are called.
+    """
+    import time
+    root = Path(ab_root_path)
+    cutoff = time.time() - STALE_EVAL_TMP_SECONDS
+    removed = 0
+    candidates = list(root.glob(f"{original_out}_nneval_tmp_pid_*"))
+    for parent in (os.environ.get("NNGPT_EVAL_TMP_PARENT", "tmp").strip() or "tmp",):
+        candidates += list((root / original_out / parent).glob("nneval_*"))
+    for d in candidates:
+        try:
+            if not d.is_dir() or d.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+        except Exception:
+            continue
+    if removed:
+        print(f"  Swept {removed} stale evaluation scratch "
+              f"director{'y' if removed == 1 else 'ies'}", flush=True)
+    return removed
+
+
+@contextmanager
+def _isolated_eval_tmp_modules():
+    """
+    Give each evaluator process its own temporary Python package root.
+
+    The underlying nn-dataset trainer writes transient modules under
+    ``<ab_root_path>/<out>/nn/tmp``. Real multi-worker NNEval runs would race on
+    that shared location, so we remap only the trainer's ``out`` root per
+    process while the evaluation request is active.
+    """
+    try:
+        import ab.nn.util.Train as train_runtime
+        from ab.nn.util.Const import ab_root_path
+    except Exception:
+        yield
+        return
+
+    original_out = getattr(train_runtime, 'out', None)
+    if not isinstance(original_out, str) or not original_out:
+        yield
+        return
+
+    # ``out`` is both a directory and the head of a Python module path -- the
+    # trainer turns it into a path by replacing "." with "/" -- so appending a
+    # suffix to it put every worker's scratch directory in the repository root
+    # as out_nneval_tmp_pid_1709510_6982062d. Extending it with dotted
+    # components instead keeps the module path valid and puts the directory
+    # where it belongs: out/tmp/nneval_<pid>_<hex>.
+    #
+    # Set NNGPT_EVAL_TMP_LEGACY=1 to go back to the root-level name. The dotted
+    # form depends on how the installed nn-dataset resolves this string, and a
+    # pipeline that cannot evaluate is worse than one with untidy directories.
+    legacy = os.environ.get("NNGPT_EVAL_TMP_LEGACY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    tag = f"nneval_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    if legacy:
+        isolated_out = f"{original_out}_nneval_tmp_pid_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        isolated_root = Path(ab_root_path) / isolated_out
+    else:
+        parent = os.environ.get("NNGPT_EVAL_TMP_PARENT", "tmp").strip() or "tmp"
+        isolated_out = f"{original_out}.{parent}.{tag}"
+        isolated_root = Path(ab_root_path) / isolated_out.replace(".", os.sep)
+    _sweep_stale_eval_tmp(ab_root_path, original_out)
+    train_runtime.out = isolated_out
+    try:
+        yield
+    finally:
+        train_runtime.out = original_out
+        stale_prefix = f"{isolated_out}."
+        for module_name in tuple(sys.modules):
+            if module_name == isolated_out or module_name.startswith(stale_prefix):
+                sys.modules.pop(module_name, None)
+        shutil.rmtree(isolated_root, ignore_errors=True)

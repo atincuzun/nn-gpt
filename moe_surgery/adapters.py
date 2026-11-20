@@ -7,6 +7,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from moe_gate_only.contracts import (
+    _glm4_route_from_logits,
+    _granite_indices_first,
+    _is_modern_glm4_router,
+    _topk_softmax_from_logits,
+)
+
 from .types import GateFn, MoEModelInfo, RouterPattern
 
 
@@ -100,7 +107,8 @@ class SoftmaxTopKAdapter(PatternAdapter):
 class RawLogitsAdapter(PatternAdapter):
     """Router returns raw logits; the MoE block owns the routing logic.
 
-    Applicable: deepseek_v3, exaone_moe, glm4_moe, glm4_moe_lite,
+    GLM4's newer native router does grouped top-k itself.
+    Also applicable: deepseek_v3, exaone_moe, glm4_moe_lite,
     glm_moe_dsa, nemotron_h, mistral4, solar_open, hunyuan_v1_moe.
     """
 
@@ -111,11 +119,16 @@ class RawLogitsAdapter(PatternAdapter):
         num_experts: int,
         *,
         original_router: Optional[nn.Module] = None,
+        top_k: int = 2,
         **kwargs: Any,
-    ) -> Callable[..., torch.Tensor]:
+    ) -> Callable[..., torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        grouped_glm4 = _is_modern_glm4_router(original_router)
 
-        def forward(router: nn.Module, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-            return custom_gate(_flatten_tokens(x), model_dim, num_experts)
+        def forward(router: nn.Module, x: torch.Tensor, *args: Any, **kwargs: Any):
+            logits = custom_gate(_flatten_tokens(x), model_dim, num_experts)
+            if grouped_glm4:
+                return _glm4_route_from_logits(router, logits, top_k)
+            return logits
 
         return forward
 
@@ -124,10 +137,10 @@ class RawLogitsAdapter(PatternAdapter):
 
 
 class SparseDispatchAdapter(PatternAdapter):
-    """Sparse-dispatch routing based on sigmoid-gates + top-K.
+    """Top-k routing with a softmax over selected logits.
 
-    The router returns a 5-tuple used by the MoE block for sparse
-    scatter/gather dispatch.
+    Legacy routers return a sparse scatter/gather dispatch tuple. Newer
+    Granite routers let experts dispatch and vary the order of the triple.
 
     Applicable: jetmoe, granitemoe, granitemoehybrid, granitemoeshared.
     """
@@ -141,17 +154,17 @@ class SparseDispatchAdapter(PatternAdapter):
         original_router: Optional[nn.Module] = None,
         top_k: int = 2,
         **kwargs: Any,
-    ) -> Callable[..., Tuple[torch.Tensor, ...]]:
+    ) -> Callable[..., Tuple[Any, ...]]:
+        indices_first = _granite_indices_first(original_router)
 
-        def forward(
-            router: nn.Module, x: torch.Tensor
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        def forward(router: nn.Module, x: torch.Tensor) -> Tuple[Any, ...]:
             x_flat = _flatten_tokens(x)
-            logits = custom_gate(x_flat, model_dim, num_experts)
-            top_logits, top_indices = torch.topk(logits.float(), top_k, dim=-1)
-            top_gates = torch.softmax(top_logits, dim=-1).type_as(x_flat)
+            logits, top_gates, top_indices = _topk_softmax_from_logits(
+                custom_gate(x_flat, model_dim, num_experts), top_k, x.dtype,
+            )
+            if indices_first is not None:
+                return (top_indices, top_gates, logits) if indices_first else (logits, top_gates, top_indices)
 
-            num_tokens = x_flat.shape[0]
             flat_indices = top_indices.reshape(-1)
             flat_gates = top_gates.reshape(-1)
 
@@ -174,7 +187,7 @@ class SparseDispatchAdapter(PatternAdapter):
 class SwitchCapacityAdapter(PatternAdapter):
     """Top-1 routing with expert capacity, used by SwitchTransformers.
 
-    Returns (router_probs, expert_index, router_logits).
+    Returns (capacity-masked one-hot selections, top-1 weights, logits).
     """
 
     def create_forward(
@@ -190,16 +203,16 @@ class SwitchCapacityAdapter(PatternAdapter):
         def forward(
             router: nn.Module, x: torch.Tensor
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            x_flat = _flatten_tokens(x)
-            router_logits = custom_gate(x_flat, model_dim, num_experts)
-            router_probs_full = F.softmax(router_logits, dim=-1, dtype=torch.float).to(x.dtype)
-            routing_weights, expert_index = torch.max(router_probs_full, dim=-1, keepdim=True)
+            router_logits = custom_gate(_flatten_tokens(x), model_dim, num_experts)
+            router_logits = router_logits.reshape(*x.shape[:-1], num_experts)
+            router_probs = F.softmax(router_logits, dim=-1, dtype=getattr(router, "dtype", torch.float)).to(x.dtype)
+            routing_weights, expert_index = router_probs.max(dim=-1)
             selected_experts = F.one_hot(expert_index, num_classes=num_experts)
             expert_capacity = getattr(router, "expert_capacity", None)
             if expert_capacity is not None:
                 token_priority = torch.cumsum(selected_experts, dim=-2)
                 selected_experts = selected_experts * (token_priority <= expert_capacity)
-            return routing_weights, selected_experts, routing_weights
+            return selected_experts, routing_weights.unsqueeze(-1), router_logits
 
         return forward
 
@@ -557,8 +570,16 @@ class ErnieTopKAdapter(PatternAdapter):
 # -- Pattern 13: inline nn.Linear (no dedicated router) -------------------
 
 
+def _is_lfm2_topk_router(router: nn.Module | None) -> bool:
+    cls = type(router)
+    return (
+        cls.__module__ == "transformers.models.lfm2_moe.modeling_lfm2_moe"
+        and cls.__name__ == "Lfm2MoeTopKRouter"
+    )
+
+
 class InlineLinearAdapter(PatternAdapter):
-    """No dedicated router class - the gate is an nn.Linear used inline.
+    """Replace the inline projection or the dedicated router in newer LFM2.
 
     Applicable: lfm2_moe.
     """
@@ -570,8 +591,20 @@ class InlineLinearAdapter(PatternAdapter):
         num_experts: int,
         *,
         original_router: Optional[nn.Module] = None,
+        top_k: int = 2,
         **kwargs: Any,
-    ) -> Callable[..., torch.Tensor]:
+    ) -> Callable[..., torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if _is_lfm2_topk_router(original_router):
+            def lfm2_forward(router: nn.Module, x: torch.Tensor, expert_bias: Optional[torch.Tensor] = None):
+                logits = custom_gate(_flatten_tokens(x), model_dim, num_experts)
+                scores = logits.sigmoid()
+                choices = scores + expert_bias if router.use_expert_bias else scores
+                indices = choices.topk(top_k, dim=-1).indices
+                weights = scores.gather(1, indices)
+                weights = _maybe_normalize_topk(weights, router.norm_topk_prob, eps=1e-6)
+                return logits, weights * router.routed_scaling_factor, indices
+
+            return lfm2_forward
 
         def forward(router: nn.Module, x: torch.Tensor) -> torch.Tensor:
             return custom_gate(x, model_dim, num_experts)

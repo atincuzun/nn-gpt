@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import functools
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -76,9 +78,11 @@ def _wrap_evaluate_epoch(original: Callable[..., Any]) -> Callable[..., Any]:
         trans_mode,
         classification_mode=False,
         custom_synth_dir=None,
-        prm_json=None,
+        trainer_model=None,
+        aug_mode=False,
+        **kwargs,
     ):
-        if not trans_mode and not classification_mode:
+        if not (trans_mode or classification_mode or aug_mode):
             if custom_synth_dir is not None:
                 models_dir = Path(custom_synth_dir)
             else:
@@ -95,7 +99,9 @@ def _wrap_evaluate_epoch(original: Callable[..., Any]) -> Callable[..., Any]:
             trans_mode,
             classification_mode=classification_mode,
             custom_synth_dir=custom_synth_dir,
-            prm_json=prm_json,
+            trainer_model=trainer_model,
+            aug_mode=aug_mode,
+            **kwargs,
         )
 
     guarded_evaluate_epoch._moe_eval_safety = True  # type: ignore[attr-defined]
@@ -103,8 +109,24 @@ def _wrap_evaluate_epoch(original: Callable[..., Any]) -> Callable[..., Any]:
     return guarded_evaluate_epoch
 
 
+@contextmanager
+def _moe_cv_eval_environment():
+    """Retain the fork's parameter precedence and fixed-batch scoring in MoE."""
+    overrides = {"NNGPT_EVAL_PRM_MODE": "seed", "NNGPT_OOM_RETRY": "0"}
+    previous = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def ensure_moe_eval_safety() -> None:
     """Install the safety wrapper only in a process running the MoE cycle."""
-    import ab.gpt.util.Tune as tune_module
+    import ab.gpt.util.tune.Tune as tune_module
 
     tune_module._evaluate_epoch = _wrap_evaluate_epoch(tune_module._evaluate_epoch)

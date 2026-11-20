@@ -208,14 +208,15 @@ def test_feedback_summary_reports_candidate_accuracy_delta(tmp_path: Path) -> No
     assert "delta=+0.1200" in feedback["summary"]
 
 
+@pytest.mark.parametrize("min_accuracy", [None, 0.0, 0.35])
 def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
-    monkeypatch,
+    monkeypatch, tmp_path, min_accuracy,
 ) -> None:
     module = importlib.import_module("ab.gpt.util.prompt.NNGenPrompt")
     captured = {}
 
-    def fake_data(**kwargs):
-        captured.update(kwargs)
+    def legacy_data(*, only_best_accuracy, task, dataset, epoch, nn_prefixes, max_rows, sql):
+        captured.update(dataset=dataset, nn_prefixes=nn_prefixes, sql=sql)
         return pd.DataFrame([{
             "nn": "ga-source",
             "nn_code": "class Net: pass",
@@ -233,6 +234,10 @@ def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
             "prm_2": '{"batch": 128}',
         }])
 
+    def modern_data(*, min_accuracy, **kwargs):
+        captured["min_accuracy"] = min_accuracy
+        return legacy_data(**kwargs)
+
     class FakeTokenizer:
         def apply_chat_template(self, messages, tokenize=False):
             assert tokenize is False
@@ -240,7 +245,7 @@ def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
                 f"{message['role']}: {message['content']}" for message in messages
             )
 
-    monkeypatch.setattr(module.lemur, "data", fake_data)
+    monkeypatch.setattr(module.lemur, "data", legacy_data if min_accuracy is None else modern_data)
     monkeypatch.setattr(module, "patch_join_nn_query", lambda: None)
     monkeypatch.setattr(module, "enrich_dataframe", lambda data: None)
 
@@ -248,6 +253,13 @@ def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
         Path(__file__).resolve().parents[1]
         / "ab/gpt/conf/prompt/train/NN_gen.json"
     )
+    if min_accuracy is not None:
+        prompts = json.loads(config.read_text(encoding="utf-8"))
+        for prompt in prompts.values():
+            prompt["min_accuracy"] = min_accuracy
+        config = tmp_path / config.name
+        config.write_text(json.dumps(prompts), encoding="utf-8")
+
     with _runtime_prompt_config(
         config,
         dataset_name="cifar-10",
@@ -260,3 +272,8 @@ def test_train_prompt_uses_paired_upstream_config_and_generated_prefixes(
     assert "class Net: improved = True" in raw.iloc[0]["response"]
     assert captured["dataset"] == "cifar-10"
     assert captured["nn_prefixes"] == ("ga-", "GenFractalNet", "moe-gate-cycle")
+    assert captured["sql"].num_joint_nns == 2
+    if min_accuracy is None:
+        assert "min_accuracy" not in captured
+    else:
+        assert captured["min_accuracy"] == min_accuracy

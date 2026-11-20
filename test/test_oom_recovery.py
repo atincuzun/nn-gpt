@@ -9,6 +9,7 @@ verification" records.
 from __future__ import annotations
 
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ import torch
 import torch.nn as nn
 
 import ab.gpt.util.Const as Const
-import ab.gpt.util.Tune as Tune
+import ab.gpt.util.tune.Tune as Tune
 import moe_gate_only
 from moe_cycle.context import _release_cuda_memory
 from moe_cycle.epochs import _run_epochs
@@ -130,10 +131,19 @@ def test_run_epochs_harvests_partial_measurements_on_oom(
     monkeypatch.setattr(Const, "conf_train_dir", train_conf)
     monkeypatch.setattr(Const, "synth_dir", lambda epoch_path: Path(epoch_path) / "synth")
 
-    def fake_nn_gen(*args, **kwargs):
-        return None
+    monkeypatch.setenv("NNGPT_EVAL_PRM_MODE", "fixed")
+    monkeypatch.delenv("NNGPT_OOM_RETRY", raising=False)
+    fixed_prm = {"lr": 0.125, "batch": 16}
 
-    def fake_evaluate_epoch(epoch, epoch_path, *args, **kwargs):
+    def fake_nn_gen(*args, legacy_prompt_selection):
+        assert legacy_prompt_selection is True
+
+    def fake_evaluate_epoch(epoch, epoch_path, *args, custom_synth_dir, prm_json, batch):
+        assert custom_synth_dir == epoch_path / "synth"
+        assert prm_json == fixed_prm
+        assert batch == 64
+        assert os.environ["NNGPT_EVAL_PRM_MODE"] == "seed"
+        assert os.environ["NNGPT_OOM_RETRY"] == "0"
         (nngpt / "cycle_results.json").write_text(
             json.dumps({"success": True, "evaluation": {"models_trained": 2}}),
             encoding="utf-8",
@@ -161,7 +171,7 @@ def test_run_epochs_harvests_partial_measurements_on_oom(
         epochs=3,
         seed=42,
         progressive_unfreeze_descending=False,
-        fixed_eval_hyperparameters=None,
+        fixed_eval_hyperparameters=fixed_prm,
         nn_train_epochs=1,
         conf_keys=["improve_classification_only"],
         dataset="cifar-10",
@@ -207,6 +217,8 @@ def test_run_epochs_harvests_partial_measurements_on_oom(
 
     epoch_paths = _run_epochs(ctx)
 
+    assert os.environ["NNGPT_EVAL_PRM_MODE"] == "fixed"
+    assert "NNGPT_OOM_RETRY" not in os.environ
     # Epoch 0 trained normally; epoch 1 OOM'd and the loop stopped there —
     # epoch 2 never ran.
     assert training_calls["count"] == 2

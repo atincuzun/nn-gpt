@@ -1,17 +1,84 @@
+# ============================
 # Python
+# ============================
 __pycache__/
 *.pyc
 .venv/
 
-# Local Experiment Artifacts
-ga_fractal_arch/
-stats/
+# ============================
+# General Artifacts
+# ============================
 out/
-fine_tuned_adapter/
-ga_history_backup/
-# Agent Skills & Metadata
-# .agent/
-.agents/
-# Checkpoints
-fractal_ga_ckpt.pkl
-visualizations/
+out_nneval_tmp_pid_*/
+out_cifar10_*/
+out_cifar100_*/
+out_imagenet100_*/
+logs/
+*.jsonl
+# visualizations/
+
+# ============================
+# Checkpoints (all .pkl files)
+# ============================
+*.pkl
+
+# ============================
+# Stats & Model Directories
+# (wildcard covers cifar10, cifar100, and legacy suffixes like 1, 1001)
+# ============================
+stats*/
+baseline_stats*/
+best_*stats*/
+ga_fractal_arch*/
+baseline_ga_fractal_arch*/
+
+# ============================
+# Training Adapters & History
+# ============================
+fine_tuned_adapter*/
+ga_history_backup*/
+imagenet100_data/
+
+# ============================
+# Experiment Output Directories
+# ============================
+# logs_cifar*/
+modified_GA_cifar*/
+stats_plain_GA/
+
+# Ignore generated benchmark outputs and stats
+*.pkl
+*.jsonl
+__pycache__/
+
+
+stats*/
+baseline_stats*/
+best_*_stats*/
+ga_fractal_arch*/
+baseline_ga_fractal_arch*/
+# visualizations/
+# logs*/
+modified_GA_*/
+
+# ============================
+# Pipeline Directories
+# ============================
+# Ignore all dynamically generated output (logs, stats, architectures, history)
+#*_pipeline/*
+*_pipeline/stats/
+*_pipeline/logs*/
+*_pipeline/visualizations/
+*_pipeline/ga_history_backup/
+*_pipeline/fine_tuned_adapter/
+*_pipeline/architectures/
+*_pipeline/*.json
+*_pipeline/*.py
+*_pipeline/modified_GA/
+*_pipeline/*_adapter/
+# But preserve the manual model configuration file inside each pipeline!
+!*_pipeline/model_config.json
+
+# Generated artifacts in individual experiment runs
+cifar*_pipeline/*/runs/*/stats/
+cifar*_pipeline/*/runs/*/architectures/

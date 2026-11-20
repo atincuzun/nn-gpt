@@ -112,6 +112,39 @@ class _SoftmaxTopKGate(nn.Module):
         return logits, weights, indices
 
 
+def _granite_indices_first(router: nn.Module | None) -> bool | None:
+    """Probe the newer Granite router's tuple order; None for other routers."""
+    cls = type(router)
+    if (
+        cls.__module__ != "transformers.models.granitemoe.modeling_granitemoe"
+        or cls.__name__ != "GraniteMoeTopKRouter"
+    ):
+        return None
+    weight = router.weight
+    with torch.no_grad():
+        first, _, _ = router(weight.new_zeros((1, weight.shape[-1])))
+    return first.dtype == torch.long
+
+
+def _topk_softmax_from_logits(logits: torch.Tensor, top_k: int, dtype: torch.dtype):
+    logits = logits.float()
+    top_logits, indices = logits.topk(top_k, dim=-1)
+    return logits, top_logits.softmax(dim=-1).to(dtype), indices
+
+
+class _GraniteTopKGate(nn.Module):
+    def __init__(self, new_gate: nn.Module, top_k: int, indices_first: bool):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+        self.indices_first = indices_first
+
+    def forward(self, x: torch.Tensor):
+        logits = self.gate(_prepare_gate_input(self.gate, x))
+        logits, weights, indices = _topk_softmax_from_logits(logits, self.top_k, x.dtype)
+        return (indices, weights, logits) if self.indices_first else (logits, weights, indices)
+
+
 class _TopKWeightsIndicesGate(nn.Module):
     """Wraps a new gate for routers that return only (weights, indices)."""
 
@@ -136,13 +169,50 @@ class _TopKWeightsIndicesGate(nn.Module):
         return weights.to(x.dtype), indices
 
 
-class _DeepSeekV2Gate(nn.Module):
-    """Preserve the remote-code DeepSeek-V2 ``MoEGate`` return contract."""
+def _is_modern_glm4_router(gate: nn.Module | None) -> bool:
+    cls = type(gate)
+    return (
+        cls.__module__ == "transformers.models.glm4_moe.modeling_glm4_moe"
+        and cls.__name__ == "Glm4MoeTopkRouter"
+        and hasattr(gate, "num_group")  # Older native routers use n_group and return a pair.
+    )
 
+
+def _glm4_route_from_logits(router: nn.Module, logits: torch.Tensor, top_k: int):
+    scores = logits.sigmoid()
+    # Correction bias changes selection, not the weights used to mix experts.
+    choices = (scores + router.e_score_correction_bias).unflatten(1, (router.num_group, -1))
+    group_scores = choices.topk(2, dim=-1).values.sum(dim=-1)
+    group_indices = group_scores.topk(router.topk_group, dim=-1, sorted=False).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(1, group_indices, True)
+    choices = choices.masked_fill(~group_mask.unsqueeze(-1), float("-inf")).flatten(1)
+    indices = choices.topk(top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    if router.norm_topk_prob:
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return logits, weights * router.routed_scaling_factor, indices
+
+
+class _Glm4MoeGate(nn.Module):
     def __init__(self, new_gate: nn.Module, top_k: int):
         super().__init__()
         self.gate = new_gate
         self.top_k = top_k
+
+    def forward(self, x: torch.Tensor):
+        flat = x.reshape(-1, x.shape[-1])
+        logits = self.gate(_prepare_gate_input(self.gate, flat))
+        return _glm4_route_from_logits(self, logits, self.top_k)
+
+
+class _DeepSeekV2Gate(nn.Module):
+    """Preserve DeepSeek-V2 routing for remote and built-in HF models."""
+
+    def __init__(self, new_gate: nn.Module, top_k: int, *, native: bool = False):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+        self._native = native
         self._last_topk_idx: Optional[torch.Tensor] = None
         self._last_topk_weight: Optional[torch.Tensor] = None
         self._last_aux_loss: Optional[torch.Tensor] = None
@@ -156,8 +226,6 @@ class _DeepSeekV2Gate(nn.Module):
         return self._route_from_logits(hidden_states, logits)
 
     def _route_from_logits(self, hidden_states: torch.Tensor, logits: torch.Tensor):
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        flat = hidden_states.reshape(-1, hidden_dim)
         self._last_gate_logits = logits
         scoring_func = getattr(self, "scoring_func", "softmax")
         if scoring_func != "softmax":
@@ -168,15 +236,15 @@ class _DeepSeekV2Gate(nn.Module):
         if topk_method == "greedy":
             topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1, sorted=False)
         elif topk_method == "group_limited_greedy":
-            n_group = int(getattr(self, "n_group"))
+            n_group = self.num_group if self._native else self.n_group
             topk_group = int(getattr(self, "topk_group"))
-            group_scores = scores.view(flat.shape[0], n_group, -1).max(dim=-1).values
+            group_scores = scores.view(scores.shape[0], n_group, -1).max(dim=-1).values
             group_idx = torch.topk(group_scores, topk_group, dim=-1, sorted=False).indices
             group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
             group_mask.scatter_(1, group_idx, True)
             score_mask = group_mask.unsqueeze(-1).expand(
-                flat.shape[0], n_group, scores.shape[-1] // n_group
-            ).reshape(flat.shape[0], -1)
+                scores.shape[0], n_group, scores.shape[-1] // n_group
+            ).reshape(scores.shape[0], -1)
             choice_scores = scores.masked_fill(~score_mask, 0.0)
             topk_weight, topk_idx = torch.topk(
                 choice_scores, self.top_k, dim=-1, sorted=False
@@ -184,7 +252,7 @@ class _DeepSeekV2Gate(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported DeepSeek-V2 top-k method: {topk_method}")
 
-        if self.top_k > 1 and bool(getattr(self, "norm_topk_prob", False)):
+        if not self._native and self.top_k > 1 and bool(getattr(self, "norm_topk_prob", False)):
             topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             topk_weight = topk_weight * float(getattr(self, "routed_scaling_factor", 1.0))
@@ -192,6 +260,7 @@ class _DeepSeekV2Gate(nn.Module):
         alpha = float(getattr(self, "alpha", 0.0))
         aux_loss = None
         if self.training and alpha > 0.0:
+            batch_size, sequence_length, _ = hidden_states.shape
             topk_idx_by_batch = topk_idx.view(batch_size, -1)
             if bool(getattr(self, "seq_aux", False)):
                 scores_by_sequence = scores.view(batch_size, sequence_length, -1)
@@ -218,6 +287,8 @@ class _DeepSeekV2Gate(nn.Module):
         self._last_topk_idx = topk_idx.detach()
         self._last_topk_weight = topk_weight.detach()
         self._last_aux_loss = aux_loss.detach() if aux_loss is not None else None
+        if self._native:
+            return logits, topk_weight, topk_idx
         return topk_idx, topk_weight, aux_loss
 
 
@@ -450,7 +521,16 @@ def _detect_post_processing(gate: nn.Module) -> str:
     Returns ``"logits_only"``, ``"softmax_topk"``, ``"logits_indices_weights"``,
     ``"sigmoid_topk"``, ``"sparse_sigmoid"``, or ``"topk_weights_indices"``.
     """
+    # Its scatter selects expert groups, not the output tensor's layout.
+    if _is_modern_glm4_router(gate):
+        return "glm4_grouped_topk"
+
     cls = type(gate)
+    if (
+        cls.__module__ == "transformers.models.deepseek_v2.modeling_deepseek_v2"
+        and cls.__name__ == "DeepseekV2TopkRouter"
+    ):
+        return "deepseek_v2_native"
     key = id(cls)
     cached = _POST_PROCESSING_CACHE.get(key)
     if cached is not None:

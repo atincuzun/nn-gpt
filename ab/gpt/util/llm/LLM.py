@@ -1,0 +1,291 @@
+# ab/gpt/util/LLM.py
+from ab.nn.util.Const import out_dir
+from ab.gpt.util.Const import conf_chat_template_dir, llm_dir, llm_tokenizer_dir
+from ab.gpt.util.llm.LLMUtil import (
+    quantization_config_4bit,
+    quantization_config_4bit_for,
+    prepare_text_tokenizer,
+    drop_vision_tower,
+    vram_report,
+)
+from ab.gpt.util.Util import exists
+
+import gc
+import os
+import json
+import tempfile
+import shutil
+from pathlib import Path
+import torch
+import torch.cuda
+from packaging.version import Version
+from transformers import (
+    BitsAndBytesConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoConfig,
+    PreTrainedTokenizer,
+    PreTrainedModel,
+    __version__ as transformers_version,
+)
+
+
+class LLM:
+    def __init__(self,
+                 model_path: str,
+                 bnb_config: BitsAndBytesConfig = None,
+                 local_path=None,
+                 max_memory: str = "24000MB",
+                 access_token=None,
+                 use_deepspeed=False,
+                 base_path=out_dir,
+                 context_length=None,
+                 gguf_file=None,
+                 training_args=None,
+                 use_unsloth=False,
+                 load_in_4bit=True,
+                 chat_template_path=None):
+        self.context_length = context_length
+        self._use_unsloth = use_unsloth
+        self.chat_template_path = chat_template_path
+
+        # ===== Unsloth Fast Path =====
+        if use_unsloth:
+            from unsloth import FastLanguageModel
+            unsloth_kwargs = dict(
+                model_name=model_path,
+                dtype=None,
+                max_seq_length=context_length or 4096,
+                load_in_4bit=load_in_4bit,
+                token=access_token,
+                full_finetuning=False,
+            )
+            # This branch used to ignore bnb_config completely, so the canonical
+            # QLoRA recipe (nf4 + double quant, and optionally a quantized
+            # lm_head) never reached the model: only load_in_4bit was forwarded
+            # and unsloth picked its own defaults. Forward the config when the
+            # installed unsloth accepts it, and fall back silently when it does
+            # not, so older unsloth versions keep working unchanged.
+            if load_in_4bit:
+                quant_cfg = bnb_config or quantization_config_4bit_for()
+                # quantization_config carries load_in_4bit itself, and passing
+                # both raises ValueError ("you can't pass both"), so the explicit
+                # flag is dropped for this attempt. TypeError means the installed
+                # unsloth has no such kwarg; ValueError covers transformers
+                # rejecting the combination. Either way fall back to the plain
+                # load_in_4bit call that worked before.
+                cfg_kwargs = {k: v for k, v in unsloth_kwargs.items()
+                              if k != "load_in_4bit"}
+                try:
+                    self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                        quantization_config=quant_cfg, **cfg_kwargs)
+                    print("[Unsloth] loaded with explicit BitsAndBytesConfig "
+                          f"(double_quant={quant_cfg.bnb_4bit_use_double_quant}, "
+                          f"skip_modules={quant_cfg.llm_int8_skip_modules}).",
+                          flush=True)
+                except (TypeError, ValueError) as e:
+                    print(f"[Unsloth] explicit quantization_config rejected "
+                          f"({type(e).__name__}: {e}); falling back to unsloth's "
+                          f"built-in 4-bit defaults. lm_head stays unquantized.",
+                          flush=True)
+                    # A partially built model may already hold VRAM.
+                    self.model = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                        **unsloth_kwargs)
+            else:
+                self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                    **unsloth_kwargs)
+
+            # Free the ViT of VL checkpoints (Qwen3.8-27B) before the trainer
+            # allocates: this pipeline is text-only and never sends pixel_values.
+            drop_vision_tower(self.model, log_prefix="[Unsloth]")
+            vram_report(self.model, log_prefix="[Unsloth]")
+
+            # A VL checkpoint hands back a processor, whose __call__ reads its
+            # first positional argument as IMAGES. Every downstream consumer
+            # (Prompt/SFT, ChatBot, vLLM, the trainer, the collator) treats
+            # self.tokenizer as a tokenizer, so the processor is removed here,
+            # once, instead of being worked around in each of them.
+            self.processor = self.tokenizer
+            self.tokenizer = prepare_text_tokenizer(
+                self.tokenizer, context_length=self.context_length,
+                log_prefix="[Unsloth]")
+
+            if self.tokenizer.pad_token_id is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.padding_side = "right"
+            self._apply_chat_template_override()
+            print(f"[Unsloth] Loaded {model_path}, 4bit={load_in_4bit}")
+            return
+
+        # ===== Original HuggingFace Path =====
+        # --- Tokenizer ---
+        tok_fl_nm = llm_tokenizer_dir(base_path, model_path)
+
+        raw_fl_nm = llm_dir(base_path, model_path)
+        tokenizer_exists = exists(tok_fl_nm)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tok_fl_nm if tokenizer_exists else model_path,
+            trust_remote_code=True, token=access_token, gguf_file=gguf_file
+        )
+        self.tokenizer.add_eos_token = True
+        if self.tokenizer.pad_token_id is None:
+            # Map pad_token to eos_token to avoid accidental masking or unk-id behavior
+            # This is safer for LLaMA-like models (e.g., DeepSeek-Coder)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+        # Respect the config's context_length so downstream generation (ChatBot)
+        # computes a correct input budget: max_input_len = model_max_length - max_new_tokens.
+        # Without this the tokenizer's default model_max_length (e.g. 4096 for DeepSeek)
+        # can equal max_new_tokens and starve the prompt to ~1 token -> newline-only output.
+        # Only RAISE model_max_length, never lower it: forcing it down (e.g. OlympicCoder
+        # 32768 -> 8192) combined with the max_new_tokens cap truncates the prompt to
+        # almost nothing, so the model ignores the NN task. Raising still fixes DeepSeek.
+        if self.context_length and int(self.context_length) > self.tokenizer.model_max_length:
+            self.tokenizer.model_max_length = int(self.context_length)
+        self._apply_chat_template_override()
+
+        if tokenizer_exists:
+            print("Loading Tokenizer from local files:", tok_fl_nm)
+        else:
+            print("Downloading Tokenizer...")
+            self.tokenizer.save_pretrained(tok_fl_nm, access_token=access_token)
+            print("Tokenizer saved to: ", tok_fl_nm)
+
+        # --- Determine source dir for local model files (if any) ---
+        src_dir = None
+        if exists(local_path):
+            src_dir = local_path
+        elif exists(raw_fl_nm):
+            src_dir = raw_fl_nm
+
+        # --- Build a safe config without relying on from_dict/get_config_dict ---
+        config = None
+        if src_dir is not None and os.path.exists(os.path.join(src_dir, "config.json")):
+            # Read local config, sanitize if needed, and load via a temporary folder
+            with open(os.path.join(src_dir, "config.json"), "r") as f:
+                cfg_dict = json.load(f)
+            if cfg_dict.get("quantization_config", "absent") is None:
+                # Remove null to prevent HF internals from calling .to_dict() on None
+                del cfg_dict["quantization_config"]
+
+            # Write sanitized config into a small temp dir and load from there
+            tmp_cfg_dir = tempfile.mkdtemp(prefix="sanitized_cfg_")
+            try:
+                with open(os.path.join(tmp_cfg_dir, "config.json"), "w") as f:
+                    json.dump(cfg_dict, f)
+                config = AutoConfig.from_pretrained(
+                    tmp_cfg_dir, trust_remote_code=True, token=access_token
+                )
+            finally:
+                # We can keep or clean; keeping is usually fine, but we’ll clean to avoid clutter.
+                shutil.rmtree(tmp_cfg_dir, ignore_errors=True)
+
+        if config is None:
+            # Remote (or no local config found) → normal path
+            config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True, token=access_token
+            )
+
+        # --- Model ---
+        # Figure out if ZeRO-3 is enabled (deepspeed arg can be dict or path)
+        # Check training_args.deepspeed first if available, otherwise use use_deepspeed boolean
+        use_zero3 = False
+        if training_args is not None:
+            deepspeed_cfg = getattr(training_args, "deepspeed", None)
+            use_zero3 = bool(deepspeed_cfg)
+        elif use_deepspeed:
+            # Fallback: if use_deepspeed is True, assume ZeRO-3 might be used
+            use_zero3 = True
+
+        # Build model kwargs (sanitize for ZeRO-3)
+        deepspeed_specific_prm = {} if use_zero3 else {"device_map": "auto"}
+        # Older Transformers forwards `dtype` to the model constructor.
+        dtype_kwarg = "dtype" if Version(transformers_version) >= Version("4.56") else "torch_dtype"
+        model_kwargs = dict(
+            trust_remote_code=True,
+            token=access_token,
+            gguf_file=gguf_file,
+            config=config,
+            **{dtype_kwarg: torch.bfloat16},  # QLoRA compute
+            **deepspeed_specific_prm
+        )
+        if not use_zero3 and (cuda_count := torch.cuda.device_count()):
+            # An empty map excludes CPU from Accelerate's device placement.
+            model_kwargs["max_memory"] = {i: max_memory for i in range(cuda_count)}
+
+        if bnb_config is not None:
+            model_kwargs["quantization_config"] = bnb_config
+
+        # --- ZeRO-3 guard: strip incompatible args ---
+        # NOTE: Other files using device_map (RAG_AlterNN.py, TuneRL.py, MergeLLM.py, etc.)
+        # are safe because they don't use DeepSpeed/ZeRO-3. Only this LLM class needs sanitization
+        # when training_args.deepspeed is set.
+        if use_zero3:
+            # Absolutely no device_map / low_cpu_mem_usage on ZeRO-3
+            model_kwargs.pop("device_map", None)
+            model_kwargs.pop("low_cpu_mem_usage", None)
+            model_kwargs.pop("offload_folder", None)
+
+        # Debug: verify nothing slipped through
+        print("[DEBUG from_pretrained kwargs]", {k: ("***" if k == "token" else v) for k, v in model_kwargs.items()})
+
+        base_model = local_path if exists(local_path) else raw_fl_nm if exists(raw_fl_nm) else model_path
+        self.model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            **model_kwargs
+        )
+
+        # Same trim as the unsloth path: a VL checkpoint keeps its ViT resident
+        # even though this pipeline is text-only. No-op on text-only models.
+        drop_vision_tower(self.model, log_prefix="[LLM]")
+        vram_report(self.model, log_prefix="[LLM]")
+
+        # Same unwrap as the unsloth path. AutoTokenizer usually returns a real
+        # tokenizer here, so this is normally a no-op; it costs nothing and
+        # keeps the two load paths from differing in what self.tokenizer is.
+        _tok = getattr(self, "tokenizer", None)
+        if _tok is not None:
+            self.processor = _tok
+            self.tokenizer = prepare_text_tokenizer(
+                _tok, context_length=self.context_length, log_prefix="[LLM]")
+
+        if exists(local_path):
+            print("Loading Model from local files:", "'" + local_path + "'")
+        elif exists(raw_fl_nm):
+            print(f"Loading Raw Model from local files: '{raw_fl_nm}'")
+        else:
+            self.model.save_pretrained(raw_fl_nm, access_token=access_token)
+            print("Model saved to: ", raw_fl_nm)
+
+    def _apply_chat_template_override(self) -> None:
+        if not self.chat_template_path:
+            return
+        template_path = Path(str(self.chat_template_path)).expanduser()
+        if not template_path.is_absolute():
+            template_path = conf_chat_template_dir / template_path
+        if not template_path.exists():
+            raise FileNotFoundError(f"chat_template_path not found: {template_path}")
+        self.tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+        print(f"[LLM] Applied chat template override: {template_path}")
+
+    def get_model(self) -> PreTrainedModel:
+        return self.model
+
+    def get_tokenizer(self) -> PreTrainedTokenizer:
+        return self.tokenizer
+
+    def get_max_length(self) -> int:
+        if self.context_length:
+            return self.context_length
+        for length_setting in ["n_positions", "max_position_embeddings", "seq_length"]:
+            max_length = getattr(self.model.config, length_setting, None)
+            if max_length:
+                break
+        if not max_length:
+            max_length = 4096
+        return max_length

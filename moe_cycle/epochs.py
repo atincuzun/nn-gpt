@@ -17,6 +17,7 @@ from .context import (
     _release_cuda_memory,
     _ts,
 )
+from .eval_safety import _moe_cv_eval_environment
 from .feedback import _build_gate_feedback_summary, feedback_record
 from .morphism import _seed_all
 from .records import _harvest_epoch_metrics, _write_gate_record
@@ -27,7 +28,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
     import torch
 
     from ab.gpt.util.Const import conf_train_dir, nngpt_dir, synth_dir
-    from ab.gpt.util.Tune import _evaluate_epoch, nn_gen
+    from ab.gpt.util.tune.Tune import _evaluate_epoch, nn_gen
     from moe_gate_only import (
         build_nngenprompt_dataloaders,
         evaluate_language_model_loss,
@@ -103,16 +104,19 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             args.nn_name_prefix,
             args.generation_max_input_length,
             1,
+            legacy_prompt_selection=True,
         )
-        _evaluate_epoch(
-            epoch,
-            epoch_path,
-            args.nn_name_prefix,
-            args.nn_train_epochs,
-            False,
-            custom_synth_dir=synth_dir(epoch_path),
-            prm_json=args.fixed_eval_hyperparameters,
-        )
+        with _moe_cv_eval_environment():
+            _evaluate_epoch(
+                epoch,
+                epoch_path,
+                args.nn_name_prefix,
+                args.nn_train_epochs,
+                False,
+                custom_synth_dir=synth_dir(epoch_path),
+                prm_json=args.fixed_eval_hyperparameters,
+                batch=64,  # Fork fallback; seed and explicit overrides still win.
+            )
 
         # Preserve cycle results written by NNEval.
         cycle_src = nngpt_dir / "cycle_results.json"
