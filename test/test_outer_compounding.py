@@ -37,8 +37,8 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import moe_cycle.cycle as cycle_module  # noqa: E402
-from moe_cycle.cycle import _run_sft_batch_under_best_gate  # noqa: E402
+import moe_cycle.phase_b_runner as phase_b_runner_module  # noqa: E402
+from moe_cycle.phase_b_runner import _run_sft_batch_under_best_gate  # noqa: E402
 from moe_cycle.gate_seeds import seed_gate_source  # noqa: E402
 from moe_cycle.morphism import (  # noqa: E402
     _model_logits,
@@ -334,7 +334,7 @@ def test_sft_batch_runs_under_best_gate_architecture_and_weights(
         }
         return "proposer-v-next"
 
-    monkeypatch.setattr(cycle_module, "_run_phase_b_batch", spy_phase_b_batch)
+    monkeypatch.setattr(phase_b_runner_module, "_run_phase_b_batch", spy_phase_b_batch)
     version = _run_sft_batch_under_best_gate(ctx, 1)
 
     assert version == "proposer-v-next"
@@ -374,7 +374,7 @@ def test_sft_batch_falls_back_to_native_without_scored_gate(
         assert ctx.session.installs == [], "batch must run under native routing"
         return "proposer-v-native"
 
-    monkeypatch.setattr(cycle_module, "_run_phase_b_batch", spy_phase_b_batch)
+    monkeypatch.setattr(phase_b_runner_module, "_run_phase_b_batch", spy_phase_b_batch)
     assert _run_sft_batch_under_best_gate(ctx, 1) == "proposer-v-native"
 
 
@@ -393,5 +393,5 @@ def test_sft_batch_falls_back_when_best_gate_source_is_corrupt(
         assert ctx.session.installs == [], "broken incumbent must not block SFT"
         return "proposer-v-native"
 
-    monkeypatch.setattr(cycle_module, "_run_phase_b_batch", spy_phase_b_batch)
+    monkeypatch.setattr(phase_b_runner_module, "_run_phase_b_batch", spy_phase_b_batch)
     assert _run_sft_batch_under_best_gate(ctx, 1) == "proposer-v-native"

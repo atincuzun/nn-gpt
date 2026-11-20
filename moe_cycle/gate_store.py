@@ -32,6 +32,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,7 @@ GATE_TRANSFORM = "moe-gate"
 GATE_NN_PREFIX = "moe-gate-"
 WEIGHTS_DIR = "weights"
 SYNTH_DIR = "synth_nn"
+GATE_ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "gate_archive"
 
 
 def canonical_json(value: Any) -> str:
@@ -168,11 +170,11 @@ def _is_checkpoint(path: Path) -> bool:
     return (path / "metadata.json").is_file() and (path / "gate_weights.pt").is_file()
 
 
-def _latest_trained_checkpoint(gate_path: Path) -> str | None:
+def _checkpoint_path(gate_path: Path) -> Path | None:
     """Newest trained checkpoint: new ``weights/`` first, legacy epochs after."""
     weights = gate_path / WEIGHTS_DIR
     if _is_checkpoint(weights):
-        return WEIGHTS_DIR
+        return weights
     checkpoints = [
         path for path in (gate_path / "epochs").glob("A*/gate_post_train")
         if _is_checkpoint(path)
@@ -184,8 +186,17 @@ def _latest_trained_checkpoint(gate_path: Path) -> str | None:
         name = path.parent.name
         return int(name[1:]) if name.startswith("A") and name[1:].isdigit() else -1
 
-    latest = max(checkpoints, key=epoch_number)
-    return str(latest.relative_to(gate_path))
+    return max(checkpoints, key=epoch_number)
+
+
+def latest_trained_checkpoint(root: Path, gate_id: int) -> Path | None:
+    """Public path lookup used by carry-forward and author-gate modes."""
+    return _checkpoint_path(gate_dir(root, gate_id))
+
+
+def _latest_trained_checkpoint(gate_path: Path) -> str | None:
+    path = _checkpoint_path(gate_path)
+    return str(path.relative_to(gate_path)) if path is not None else None
 
 
 def _nn_name(digest: str | None) -> str | None:
@@ -473,3 +484,81 @@ def best_gate(root: Path) -> dict | None:
     if not eligible:
         return None
     return max(eligible, key=lambda summary: summary["score"]["accuracy"])
+
+
+def _slug(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or fallback)
+    slug = "".join(
+        character if character.isalnum() or character in "-_." else "-"
+        for character in text
+    ).strip("-")
+    return slug or fallback
+
+
+def archive_gate(
+    record: dict,
+    *,
+    candidate_root: Path | None,
+    gate_id: int,
+    run_root: Path | None,
+    model: str | None,
+    archive_dir: Path | None = None,
+) -> Path | None:
+    """Copy a measured gate's code + LEMUR-shaped record into the archive.
+
+    Copy-only: the live store remains the source of truth, a failed archive
+    write never fails the candidate, and only gates with a measured CV
+    accuracy are archived.
+    """
+    accuracy = (record.get("score") or {}).get("accuracy")
+    if not isinstance(accuracy, (int, float)) or candidate_root is None:
+        return None
+    source = candidate_root / "gate.py"
+    record_path = candidate_root / "record.json"
+    if not source.is_file() or not record_path.is_file():
+        return None
+    archive_root = Path(archive_dir).resolve() if archive_dir is not None else GATE_ARCHIVE_DIR
+    run_name = run_root.name if run_root is not None else "run"
+    target = (
+        archive_root
+        / _slug(model, "model")
+        / _slug(run_name, "run")
+        / f"gate_{gate_id:03d}"
+    )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target / "gate.py")
+        shutil.copy2(record_path, target / "record.json")
+    except OSError as exc:
+        print(f"[GATE ARCHIVE] gate {gate_id:03d} archive skipped: {exc}")
+        return None
+    print(f"[GATE ARCHIVE] gate {gate_id:03d} -> {target}")
+    return target
+
+
+def protocol_metadata(args: Any) -> dict:
+    """Measurement conditions stored with every gate and in the archive."""
+    protocol = {
+        "model": getattr(args, "model", None),
+        "seed": getattr(args, "seed", None),
+        "dataset": getattr(args, "dataset", None),
+        "task": "img-classification",
+        "metric": "accuracy",
+        "layers": getattr(args, "layers", None),
+        "router_top_k": getattr(args, "router_top_k", None),
+        "epochs": getattr(args, "epochs", None),
+        "nn_train_epochs": getattr(args, "nn_train_epochs", None),
+        "test_nn": getattr(args, "test_nn", None),
+        "fixed_eval_hyperparameters": getattr(args, "fixed_eval_hyperparameters", None),
+        "gate_train_steps": getattr(args, "gate_train_steps", None),
+        "gate_learning_rate": getattr(args, "gate_learning_rate", None),
+        "gate_init_noise_scale": getattr(args, "gate_init_noise_scale", None),
+        "progressive_unfreeze_descending": getattr(
+            args, "progressive_unfreeze_descending", None,
+        ),
+        "initialize_from_original": not getattr(args, "gate_random_init", False),
+        "train_prompt_config": getattr(args, "train_prompt_config", None),
+        "test_prompt_config": getattr(args, "test_prompt_config", None),
+    }
+    protocol["fingerprint"] = fingerprint(protocol)
+    return protocol

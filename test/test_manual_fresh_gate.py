@@ -7,9 +7,10 @@ import pytest
 import torch
 
 from manual_fresh_gate import LLMGeneratedGate
+from moe_cycle.candidates import _install_and_verify
 from moe_cycle.cli import parse_args
-from moe_cycle import cycle
 from moe_cycle.gate_source import _validate_gate_source
+from moe_cycle.setup import _validate_args
 
 
 class _ModelStub:
@@ -58,13 +59,13 @@ def test_random_init_cli_constraints(monkeypatch):
     assert not args.gate_random_init
     args.gate_random_init = True
     with pytest.raises(ValueError, match="requires --gate-source"):
-        cycle._validate_args(args)
+        _validate_args(args)
     args.gate_source = Path("manual_fresh_gate.py")
     args.gate_init_noise_scale = 0.01
     with pytest.raises(ValueError, match="requires --gate-init-noise-scale 0"):
-        cycle._validate_args(args)
+        _validate_args(args)
     args.gate_init_noise_scale = 0
-    cycle._validate_args(args)
+    _validate_args(args)
 
 
 @pytest.mark.parametrize("random_init", [True, False])
@@ -89,19 +90,19 @@ def test_install_copy_and_equivalence_policy(monkeypatch, tmp_path, random_init)
         assert not random_init, "Fresh mode must not perturb or access a native base"
         return []
 
-    monkeypatch.setattr(cycle, "_perturb_gate_weights", perturb)
-    monkeypatch.setattr(cycle, "_model_logits", lambda *args: torch.ones(2))
+    monkeypatch.setattr("moe_cycle.candidates._perturb_gate_weights", perturb)
+    monkeypatch.setattr("moe_cycle.candidates._model_logits", lambda *args: torch.ones(2))
     ctx = SimpleNamespace(
         args=args, session=Session(), gate_dir=tmp_path, gate_source="SOURCE",
         sample_input=None, native_logits=torch.zeros(2),
         native_repeatable=True, native_repeat_max_abs_difference=0,
     )
     if random_init:
-        cycle._install_and_verify(ctx)
+        _install_and_verify(ctx)
         assert recorded["frozen"]
     else:
         with pytest.raises(RuntimeError, match="do not reproduce native"):
-            cycle._install_and_verify(ctx)
+            _install_and_verify(ctx)
     assert recorded["initialize_from_original"] is (not random_init)
     assert recorded["verify"] is True
     metrics = ctx.install_metrics["step_zero"]
@@ -117,6 +118,6 @@ def test_fresh_mode_still_rejects_nonfinite_model_logits(monkeypatch, tmp_path):
             replace_source=lambda *args, **kwargs: None, model=_ModelStub(),
         ),
     )
-    monkeypatch.setattr(cycle, "_model_logits", lambda *args: torch.tensor([float("nan")]))
+    monkeypatch.setattr("moe_cycle.candidates._model_logits", lambda *args: torch.tensor([float("nan")]))
     with pytest.raises(RuntimeError, match="non-finite"):
-        cycle._install_and_verify(ctx)
+        _install_and_verify(ctx)

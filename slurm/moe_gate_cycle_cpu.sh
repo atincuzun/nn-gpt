@@ -59,8 +59,6 @@ CYCLE_CMD=(
     --output "${OUTPUT_DIR}"
     --device-map none
     --dtype "${DTYPE:-bfloat16}"
-    --gate-mode "${GATE_MODE:-direct}"
-    --gate-implementation "${GATE_IMPLEMENTATION:-llm_generated}"
     --epochs "${EPOCHS:-1}"
     --test-nn "${TEST_NN:-1}"
     --nn-train-epochs "${NN_TRAIN_EPOCHS:-1}"

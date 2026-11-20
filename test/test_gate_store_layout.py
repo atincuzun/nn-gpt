@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from moe_cycle.cycle import _write_gate_record
+from moe_cycle.records import _write_gate_record
 from moe_cycle.gate_store import (
     load_gate_summaries,
     write_gate_record,

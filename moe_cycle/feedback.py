@@ -11,6 +11,32 @@ from pathlib import Path
 from typing import Any
 
 
+def feedback_record(feedback: dict) -> dict:
+    """Compact per-epoch feedback kept in the record for improvement analysis."""
+    keys = (
+        "summary", "n_generated", "n_trained", "n_measured",
+        "mean_accuracy", "std_accuracy", "best_accuracy", "mean_accuracy_delta",
+        "improved_candidates", "datasets", "tasks",
+        "candidate_outcomes", "failure_reasons",
+    )
+    return {key: feedback.get(key) for key in keys}
+
+
+def candidate_feedback(epoch_metrics: list[dict], candidate_index: int) -> str:
+    """Summarize one completed candidate for the next outer-loop proposal."""
+    entries = [
+        {
+            key: (metrics.get("feedback") or {}).get(key)
+            for key in (
+                "n_generated", "n_trained", "best_accuracy",
+                "mean_accuracy_delta", "improved_candidates",
+            )
+        }
+        for metrics in epoch_metrics
+    ]
+    return f"Independent gate candidate {candidate_index} results: {json.dumps(entries)}"
+
+
 def _candidate_index(path: Path) -> int:
     try:
         return int(path.name.removeprefix("B"))

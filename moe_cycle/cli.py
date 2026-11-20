@@ -67,13 +67,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-train-steps", type=int, default=50)
     parser.add_argument("--gate-learning-rate", type=float, default=1e-4)
     parser.add_argument(
-        "--gate-implementation",
-        choices=("llm_generated",),
-        default="llm_generated",
-        help="Gate source mechanism: llm_generated asks the model to write the gate. "
-        "An externally supplied gate file takes precedence when --gate-source is given",
-    )
-    parser.add_argument(
         "--gate-source",
         type=Path,
         help="Python file defining the replacement gate class (external gate; "
@@ -83,12 +76,6 @@ def parse_args() -> argparse.Namespace:
         "--gate-class",
         default="LLMGeneratedGate",
         help="Class name to load from --gate-source",
-    )
-    parser.add_argument(
-        "--gate-mode",
-        choices=("direct",),
-        default="direct",
-        help="Deprecated compatibility option; the current cycle always trains the direct replacement gate",
     )
     parser.add_argument(
         "--gate-init-noise-scale",
@@ -267,13 +254,6 @@ def parse_args() -> argparse.Namespace:
         "and its trained weights seed the successor's training (parameters matched by "
         "name; parameters the parent never had keep their constructor initialization). "
         "'best' is elitist: the incumbent only changes when a successor scores higher.",
-    )
-    parser.add_argument(
-        "--gate-phase-b",
-        action="store_true",
-        help="Reserved Phase B switch: train the LLM on accumulated (lower -> higher) "
-        "gate pairs so it authors better gate code directly. The training mechanism "
-        "is undecided, so this currently fails fast instead of silently doing nothing.",
     )
     parser.add_argument(
         "--gate-store",

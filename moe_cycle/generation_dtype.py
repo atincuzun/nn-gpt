@@ -19,8 +19,6 @@ from typing import Any, Optional
 
 def infer_generation_head_dtype_for_cycle(model: Any, fallback: Optional[Any] = None):
     """Active-mode-aware variant of GenerationDType.infer_generation_head_dtype."""
-    import torch
-
     from ab.gpt.util.GenerationDType import normalize_torch_dtype, _value_from
 
     config = getattr(model, "config", None)

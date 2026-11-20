@@ -19,11 +19,9 @@ import torch.nn as nn
 import ab.gpt.util.Const as Const
 import ab.gpt.util.Tune as Tune
 import moe_gate_only
-from moe_cycle.cycle import (
-    _record_failed_candidate,
-    _release_cuda_memory,
-    _run_epochs,
-)
+from moe_cycle.context import _release_cuda_memory
+from moe_cycle.epochs import _run_epochs
+from moe_cycle.records import _record_failed_candidate
 from moe_gate_only.verify import _verify_forward
 
 
@@ -163,7 +161,6 @@ def test_run_epochs_harvests_partial_measurements_on_oom(
         epochs=3,
         seed=42,
         progressive_unfreeze_descending=False,
-        gate_implementation="llm_generated",
         fixed_eval_hyperparameters=None,
         nn_train_epochs=1,
         conf_keys=["improve_classification_only"],

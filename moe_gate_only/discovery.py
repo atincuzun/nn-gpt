@@ -21,7 +21,7 @@ from .sniff import (
     _guess_hidden_size,
     _guess_vocab_size,
 )
-from .tree import _extract_layer_index, _resolve_parent_attr
+from .tree import _extract_layer_index, _find_parent_block, _resolve_parent_attr
 from .verify import _forward_with_sample, _move_sample_to_device, _rollback, _verify_forward
 
 _LAST_CANDIDATE_REPORT: List[GateCandidateReport] = []
@@ -43,7 +43,6 @@ def _discover_num_experts(model: nn.Module,
     that appears consistently as the last dimension of ``nn.Linear``-like
     module outputs across layers.  That dimension is ``num_experts``.
     """
-    device = next(model.parameters()).device
     output_dims: dict[int, int] = {}  # last_dim -> count of modules
 
     hooks = []

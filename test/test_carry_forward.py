@@ -11,7 +11,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from moe_cycle.cycle import _latest_trained_checkpoint, _validate_args
+from moe_cycle.gate_store import latest_trained_checkpoint as _latest_trained_checkpoint
+from moe_cycle.setup import _validate_args
 from moe_cycle.gate_prompt import gate_proposal_prompt, gate_sft_examples
 from moe_cycle.morphism import carry_gate_weights, verify_parent_function_carry
 
@@ -53,7 +54,6 @@ def _args(**overrides) -> Namespace:
         gate_outer_search=True,
         gate_author="native",
         gate_carry_forward=None,
-        gate_phase_b=False,
         gate_outer_sft=False,
         gate_sft_every=10,
         gate_sft_steps=30,

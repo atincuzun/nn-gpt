@@ -56,8 +56,6 @@ cd "${PROJECT_DIR}"
     --device-map none \
     --dtype bfloat16 \
     --local-files-only \
-    --gate-mode direct \
-    --gate-implementation exact_residual_mlp \
     --layers 23 \
     --epochs "${EPOCHS:-4}" \
     --test-nn "${TEST_NN:-20}" \

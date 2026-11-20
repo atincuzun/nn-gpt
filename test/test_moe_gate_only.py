@@ -22,7 +22,6 @@ from moe_gate_only import (  # noqa: E402
     teacher_student_distillation_loss,
     trainable_parameter_names,
 )
-from ab.gpt.util.Chatbot import _validate_input_ids  # noqa: E402
 from moe_gate_only.universal import (  # noqa: E402
     GateSite,
     _DeepSeekV2Gate,
@@ -279,19 +278,6 @@ def test_sparse_sigmoid_extractor_prefers_logits():
     logits = torch.randn(1, 4, requires_grad=True)
     extracted = _extract_logits_from_gate_output((scores, logits), num_experts=4)
     assert extracted is logits
-
-
-def test_input_validation_accepts_added_special_tokens_within_model_vocab():
-    class Tokenizer:
-        vocab_size = 100000
-
-        def __len__(self):
-            return 100002
-
-    model = _ToyMoeModel(vocab_size=102400)
-    inputs = {"input_ids": torch.tensor([[100000, 100001]])}
-    _validate_input_ids(inputs, model, Tokenizer())
-    assert inputs["input_ids"].tolist() == [[100000, 100001]]
 
 
 def test_deepseek_replacement_preserves_float32_native_routing():

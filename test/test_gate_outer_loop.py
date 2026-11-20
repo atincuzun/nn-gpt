@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from moe_cycle.cli import parse_args
-from moe_cycle.cycle import _validate_args
+from moe_cycle.setup import _validate_args
 from moe_cycle.gate_prompt import (
     BASELINE_GATE_CODE,
     GATE_SYSTEM_PROMPT,
@@ -550,6 +550,7 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
     """--gate-random-init must not copy the native router into the gate."""
     import torch
 
+    from moe_cycle import candidates as candidates_module
     from moe_cycle import cycle as cycle_module
 
     recorded = {}
@@ -594,11 +595,11 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
         candidate_index = 0
 
     monkeypatch.setattr(
-        cycle_module, "_model_logits",
+        candidates_module, "_model_logits",
         lambda model, sample_input: torch.zeros(1),
     )
     monkeypatch.setattr(
-        cycle_module, "_perturb_gate_weights", lambda installs, scale, seed: []
+        candidates_module, "_perturb_gate_weights", lambda installs, scale, seed: []
     )
 
     cycle_module._install_and_verify(_FakeContext())
@@ -689,7 +690,7 @@ def test_cli_gate_author_rejects_unknown_choice(monkeypatch):
 
 
 def test_author_gate_id_selection(tmp_path: Path):
-    from moe_cycle.cycle import _select_author_gate_id
+    from moe_cycle.candidates import _select_author_gate_id
 
     # native mode and round 0 never install an author gate
     assert _select_author_gate_id("native", 3, tmp_path) is None
@@ -711,7 +712,7 @@ def test_author_gate_id_selection(tmp_path: Path):
 
 
 def test_gate_record_stores_author_state(tmp_path: Path):
-    from moe_cycle.cycle import _write_gate_record
+    from moe_cycle.records import _write_gate_record
 
     ctx = SimpleNamespace(
         args=SimpleNamespace(gate_author="best"),
@@ -773,14 +774,6 @@ def test_phase_b_rejects_negative_gap(tmp_path: Path):
         build_gate_pairs(tmp_path, min_accuracy_gap=-0.1)
 
 
-def test_phase_b_cli_flag_fails_fast(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py", "--gate-phase-b"])
-    args = parse_args()
-    assert args.gate_phase_b is True
-    with pytest.raises(NotImplementedError, match="Phase B"):
-        _validate_args(args)
-
-
 # ── cold-start bootstrap seeds ────────────────────────────────────────────────
 
 def test_seed_gates_satisfy_the_llm_proposal_validator():
@@ -822,14 +815,14 @@ def test_seed_candidates_prepare_without_llm(tmp_path: Path, monkeypatch):
     """_prepare_seed_candidate writes a valid gate with no chatbot involved."""
     import torch
 
-    from moe_cycle.cycle import _prepare_seed_candidate
+    from moe_cycle.candidates import _prepare_seed_candidate
 
     ctx = SimpleNamespace(
         gate_root=tmp_path, shapes=[(2048, 64)], gate_source=None,
         used_prompts=[], seeded=None,
     )
     monkeypatch.setattr(
-        "moe_cycle.cycle._initial_feedback_summary", lambda source: ""
+        "moe_cycle.candidates._initial_feedback_summary", lambda source: ""
     )
     _prepare_seed_candidate(ctx, 1)
     assert (tmp_path / "gate_001" / "gate.py").is_file()

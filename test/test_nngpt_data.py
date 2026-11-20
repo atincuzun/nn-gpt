@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from moe_cycle.cli import parse_args
-from moe_cycle.cycle import _generation_prefixes, _nas_prefixes, _pinned_prompt_dict
+from moe_cycle.context import _generation_prefixes, _nas_prefixes, _pinned_prompt_dict
 from moe_cycle.feedback import _build_gate_feedback_summary
 from moe_gate_only.nngpt_data import (
     _completion_only_dataset,
