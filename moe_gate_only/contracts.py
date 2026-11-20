@@ -241,6 +241,61 @@ class _Lfm2TopKGate(nn.Module):
         return logits, weights, indices
 
 
+def _is_norm_softmax_router(gate: nn.Module | None) -> bool:
+    cls = type(gate)
+    return (cls.__module__, cls.__name__) in {
+        ("transformers.models.olmoe.modeling_olmoe", "OlmoeTopKRouter"),
+        ("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeTopKRouter"),
+    }
+
+
+class _NormSoftmaxTopKGate(nn.Module):
+    """OLMoE/Qwen3-MoE routing: float32 softmax, then optional top-k renorm."""
+
+    def __init__(self, new_gate: nn.Module, top_k: int):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+
+    def forward(self, x: torch.Tensor, *args, **kwargs):
+        flat = x.reshape(-1, x.shape[-1])
+        logits = self.gate(_prepare_gate_input(self.gate, flat))
+        probs = F.softmax(logits, dtype=torch.float, dim=-1)
+        weights, indices = torch.topk(probs, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        return logits, weights.to(logits.dtype), indices
+
+
+def _is_phimoe_router(gate: nn.Module | None) -> bool:
+    cls = type(gate)
+    return (cls.__module__, cls.__name__) == (
+        "transformers.models.phimoe.modeling_phimoe", "PhimoeTopKRouter",
+    )
+
+
+class _PhimoeMixerGate(nn.Module):
+    """PhiMoE uses its own sparse mixer (thresholded top-k) rather than softmax-topk."""
+
+    def __init__(self, new_gate: nn.Module, top_k: int):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+
+    def forward(self, x: torch.Tensor, *args, **kwargs):
+        from transformers.models.phimoe.modeling_phimoe import sparsemixer
+
+        flat = x.reshape(-1, x.shape[-1])
+        logits = self.gate(_prepare_gate_input(self.gate, flat))
+        weights, indices = sparsemixer(
+            logits,
+            jitter_eps=self.router_jitter_noise,
+            training=self.training,
+            top_k=self.top_k,
+        )
+        return logits, weights, indices
+
+
 class _DeepSeekV2Gate(nn.Module):
     """Preserve DeepSeek-V2 routing for remote and built-in HF models."""
 
@@ -564,6 +619,10 @@ def _detect_post_processing(gate: nn.Module) -> str:
     # sigmoid weighting behind the (logits, weights, indices) triple.
     if _is_lfm2_router(gate):
         return "lfm2_topk"
+    if _is_norm_softmax_router(gate):
+        return "norm_softmax_topk"
+    if _is_phimoe_router(gate):
+        return "phimoe_mixer"
 
     cls = type(gate)
     if (

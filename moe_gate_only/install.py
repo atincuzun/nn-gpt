@@ -15,6 +15,8 @@ from .contracts import (
     _HashScoreFnGate,
     _Lfm2TopKGate,
     _LogitsOnlyGate,
+    _NormSoftmaxTopKGate,
+    _PhimoeMixerGate,
     _ScoreFnTopKGate,
     _SigmoidTopKGate,
     _SoftmaxTopKGate,
@@ -98,6 +100,16 @@ def _wrap_gate_for_contract(
         )
     if post == "lfm2_topk":
         return _Lfm2TopKGate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+        )
+    if post == "norm_softmax_topk":
+        return _NormSoftmaxTopKGate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+        )
+    if post == "phimoe_mixer":
+        return _PhimoeMixerGate(
             new_gate,
             top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
         )

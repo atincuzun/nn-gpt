@@ -177,6 +177,41 @@ def _tiny_granite():
     return GraniteMoeForCausalLM(cfg)
 
 
+def _tiny_phimoe():
+    from transformers import PhimoeConfig, PhimoeForCausalLM
+    cfg = PhimoeConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_local_experts=4, num_experts_per_tok=2,
+        pad_token_id=0, bos_token_id=1, eos_token_id=2, use_cache=False,
+    )
+    return PhimoeForCausalLM(cfg)
+
+
+def _tiny_olmoe(norm_topk_prob: bool = False):
+    from transformers import OlmoeConfig, OlmoeForCausalLM
+    cfg = OlmoeConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_experts=4, num_experts_per_tok=2, norm_topk_prob=norm_topk_prob,
+        decoder_sparse_step=1, mlp_only_layers=[],
+        pad_token_id=0, bos_token_id=1, eos_token_id=2, use_cache=False,
+    )
+    return OlmoeForCausalLM(cfg)
+
+
+def _tiny_qwen3(norm_topk_prob: bool = False):
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+    cfg = Qwen3MoeConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_experts=4, num_experts_per_tok=2, norm_topk_prob=norm_topk_prob,
+        decoder_sparse_step=1, mlp_only_layers=[],
+        pad_token_id=0, bos_token_id=1, eos_token_id=2, use_cache=False,
+    )
+    return Qwen3MoeForCausalLM(cfg)
+
+
 def _tiny_cohere2():
     from transformers import Cohere2MoeConfig, Cohere2MoeForCausalLM
     cfg = Cohere2MoeConfig(
@@ -576,6 +611,48 @@ def test_deepseek_v4_discovery():
 def test_lfm_install_forward():
     print("LFM install + forward:")
     _check_install_and_forward("lfm2_moe", _tiny_lfm())
+
+
+def _assert_step_zero_exact(model):
+    from moe_cycle.gate_seeds import seed_gate_source
+    from moe_gate_only import MoEGateSession
+
+    torch.manual_seed(42)
+    model = model.eval()
+    session = MoEGateSession(model)
+    sample = {"input_ids": torch.randint(3, 32, (1, 8))}
+    with torch.no_grad():
+        native = model(**sample).logits.clone()
+    assert len(session.inspect()) > 0
+    with session:
+        session.replace_source(
+            seed_gate_source(0),
+            sample_input=sample,
+            verify=True,
+            dynamic_discovery=False,
+            initialize_from_original=True,
+        )
+        with torch.no_grad():
+            assert torch.equal(native, model(**sample).logits)
+    with torch.no_grad():
+        assert torch.equal(model(**sample).logits, native)
+
+
+def test_phimoe_replacement_preserves_native_logits():
+    _assert_step_zero_exact(_tiny_phimoe())
+    print("  phimoe: step-zero logits exactly equal native")
+
+
+def test_olmoe_replacement_preserves_native_logits():
+    for norm in (False, True):
+        _assert_step_zero_exact(_tiny_olmoe(norm_topk_prob=norm))
+    print("  olmoe: step-zero logits exactly equal native (both norm modes)")
+
+
+def test_qwen3_moe_replacement_preserves_native_logits():
+    for norm in (False, True):
+        _assert_step_zero_exact(_tiny_qwen3(norm_topk_prob=norm))
+    print("  qwen3_moe: step-zero logits exactly equal native (both norm modes)")
 
 
 def test_lfm_replacement_preserves_native_logits():
