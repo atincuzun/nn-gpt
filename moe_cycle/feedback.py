@@ -60,7 +60,7 @@ def _build_gate_feedback_summary(
     """
     gate_code = session.gate_source
     if not gate_code:
-        gate_file = epoch_path / "gate" / "gate.py"
+        gate_file = epoch_path.parent.parent / "gate.py"
         gate_code = gate_file.read_text(encoding="utf-8") if gate_file.is_file() else None
     if gate_code and len(gate_code) > 2000:
         gate_code = gate_code[:2000] + "\n# ... (truncated)"

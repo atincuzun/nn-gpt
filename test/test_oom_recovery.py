@@ -112,8 +112,9 @@ def test_record_failed_candidate_keeps_partial_epochs(tmp_path: Path):
 
     _record_failed_candidate(ctx, 7, RuntimeError("late pipeline failure"))
 
-    record = json.loads((tmp_path / "gate_007" / "summary.json").read_text())
+    record = json.loads((tmp_path / "gate_007" / "record.json").read_text())
     assert "late pipeline failure" in record["failure"]
+    assert record["status"] == "failed"
     assert record["score"]["eligible"] is False
     assert record["epochs"] == [partial]
 
@@ -217,9 +218,10 @@ def test_run_epochs_harvests_partial_measurements_on_oom(
     assert ctx.gate_epoch_metrics[0]["train_loss"] == 0.5
     assert ctx.gate_epoch_metrics[1]["train_loss"] is None
 
-    oom_metrics = json.loads(
-        (epoch_paths[1] / "gate_training_metrics.json").read_text()
-    )
+    oom_metrics = ctx.gate_epoch_metrics[1]["training"]
     assert oom_metrics["oom_recovered"] is True
     assert oom_metrics["mean_train_loss"] is None
-    assert (tmp_path / "store" / "gate_000" / "epoch_01" / "metrics.json").is_file()
+    assert not (epoch_paths[1] / "gate_training_metrics.json").exists()
+    assert not (epoch_paths[1] / "metrics.json").exists()
+    record = json.loads((ctx.gate_root / "gate_000" / "record.json").read_text())
+    assert [row["epoch"] for row in record["epochs"]] == [0, 1]

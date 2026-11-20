@@ -184,16 +184,31 @@ def test_carry_gate_weights_casts_dtype(tmp_path: Path) -> None:
     )
 
 
+def _make_checkpoint(path: Path) -> None:
+    path.mkdir(parents=True)
+    (path / "metadata.json").write_text("{}", encoding="utf-8")
+    (path / "gate_weights.pt").write_bytes(b"")
+
+
 def test_latest_trained_checkpoint_picks_highest_epoch(tmp_path: Path) -> None:
     gate_root = tmp_path / "gates"
     for epoch in (0, 2):
-        (gate_root / "gate_003" / "epochs" / f"A{epoch}" / "gate_post_train").mkdir(parents=True)
-    (gate_root / "gate_003" / "epochs" / "A2" / "metrics.json").write_text("{}", encoding="utf-8")
+        _make_checkpoint(
+            gate_root / "gate_003" / "epochs" / f"A{epoch}" / "gate_post_train"
+        )
     (gate_root / "gate_003" / "epochs" / "A5").mkdir(parents=True)  # ran out before saving
 
     checkpoint = _latest_trained_checkpoint(gate_root, 3)
     assert checkpoint == gate_root / "gate_003" / "epochs" / "A2" / "gate_post_train"
     assert _latest_trained_checkpoint(gate_root, 4) is None
+
+
+def test_latest_trained_checkpoint_prefers_weights_dir(tmp_path: Path) -> None:
+    gate_root = tmp_path / "gates"
+    _make_checkpoint(gate_root / "gate_003" / "epochs" / "A2" / "gate_post_train")
+    _make_checkpoint(gate_root / "gate_003" / "weights")
+
+    assert _latest_trained_checkpoint(gate_root, 3) == gate_root / "gate_003" / "weights"
 
 
 def test_validate_args_carry_forward_requires_outer_search() -> None:

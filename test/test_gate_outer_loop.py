@@ -22,12 +22,15 @@ from moe_cycle.gate_source import _generate_gate
 from moe_cycle.gate_pairs import build_gate_pairs, describe_pairs, eligible_gates
 from moe_cycle.gate_store import (
     SCORE_OBJECTIVE,
+    backfill_gate_records,
     best_gate,
     epoch_dir,
     gate_dir,
+    lemur_id,
     load_gate_summaries,
     structural_hash,
     summarize_epoch_metrics,
+    write_gate_record,
     summarize_gate,
     write_gate_summary,
 )
@@ -152,7 +155,126 @@ def _write_gate(root, gate_id, accuracy, *, eligible=True, source=None,
 
 def test_store_layout_matches_expected_paths(tmp_path: Path):
     assert gate_dir(tmp_path, 3) == tmp_path / "gate_003"
-    assert epoch_dir(tmp_path, 3, 7) == tmp_path / "gate_003" / "epoch_07"
+    assert epoch_dir(tmp_path, 3, 7) == tmp_path / "gate_003" / "epochs" / "A7"
+
+
+def test_record_json_is_canonical_and_nn_dataset_ready(tmp_path: Path):
+    root = tmp_path / "store"
+    gate_path = gate_dir(root, 4)
+    gate_path.mkdir(parents=True)
+    source = (
+        "import torch\nimport torch.nn as nn\n\n"
+        "class LLMGeneratedGate(nn.Module):\n"
+        "    def __init__(self, model_dim, num_experts):\n"
+        "        super().__init__()\n"
+        "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
+        "    def forward(self, x):\n"
+        "        return self.base(x)\n"
+    )
+    (gate_path / "gate.py").write_text(source, encoding="utf-8")
+    weights = gate_path / "weights"
+    weights.mkdir(parents=True)
+    (weights / "metadata.json").write_text("{}", encoding="utf-8")
+    (weights / "gate_weights.pt").write_bytes(b"")
+    record = {
+        "gate_id": 4,
+        "gate_code": source.rstrip("\n"),
+        "structural_hash": "a" * 64,
+        "reference_gate_id": 2,
+        "author_mode": "native",
+        "author_gate_id": None,
+        "carry_source_gate_id": None,
+        "rematch_for": None,
+        "llm_version": "lora-test",
+        "seeded": False,
+        "task": "img-classification",
+        "dataset": "cifar-10",
+        "metric": "accuracy",
+        "score": {
+            "objective": SCORE_OBJECTIVE, "accuracy": 0.5, "eligible": True,
+            "n_measured": 2, "n_attempted": 4, "success_rate": 0.5,
+        },
+        "epochs": [
+            {
+                "epoch": 0, "cv_accuracy_mean": 0.4, "cv_accuracy_best": 0.5,
+                "n_measured": 1, "n_attempted": 2, "n_trained": 1,
+                "n_generated": 2, "train_loss": 0.1, "validation_loss": 0.2,
+                "epoch_path": str(gate_path / "epochs" / "A0"),
+            },
+            {
+                "epoch": 1, "cv_accuracy_mean": 0.6, "cv_accuracy_best": 0.6,
+                "n_measured": 1, "n_attempted": 2, "n_trained": 1,
+                "n_generated": 2, "train_loss": 0.05, "validation_loss": 0.1,
+                "epoch_path": str(gate_path / "epochs" / "A1"),
+            },
+        ],
+    }
+
+    write_gate_record(
+        root, 4, record, run_root=tmp_path / "run", model="deepseek-v2-lite",
+    )
+
+    canonical = json.loads((gate_path / "record.json").read_text(encoding="utf-8"))
+    assert canonical["schema_version"] == 2
+    assert canonical["status"] == "success"
+    assert "gate_code" not in canonical
+    assert canonical["nn"] == {
+        "name": "moe-gate-" + "a" * 16,
+        "code": source,
+        "id": lemur_id(source),
+        "code_file": "gate.py",
+        "structural_hash": "a" * 64,
+    }
+    assert canonical["artifacts"]["latest_checkpoint"] == "weights"
+    assert canonical["artifacts"]["weights"] == "weights"
+    assert canonical["dedup"]["status"] == "accepted"
+    assert [stat["epoch"] for stat in canonical["stats"]] == [0, 1]
+    assert canonical["stats"][0]["task"] == "moe-gate"
+    assert canonical["stats"][0]["metric"] == "cv_accuracy"
+    assert canonical["stats"][0]["accuracy"] == 0.4
+    assert canonical["stats"][0]["model"] == "moe-gate-" + "a" * 16
+    assert canonical["stats"][0]["train_stat"]["train_accuracy"] == 0.4
+
+    assert not (gate_path / "summary.json").exists()
+    loaded = load_gate_summaries(root)
+    assert loaded[0]["gate_code"] == source.rstrip("\n")
+    assert loaded[0]["score"]["accuracy"] == 0.5
+
+
+def test_seed_and_rematch_records_declare_dedup_bypass(tmp_path: Path):
+    root = tmp_path / "store"
+    gate_path = gate_dir(root, 5)
+    gate_path.mkdir(parents=True)
+    (gate_path / "gate.py").write_text("source\n", encoding="utf-8")
+    base = {
+        "gate_id": 5, "gate_code": "source", "structural_hash": "b" * 64,
+        "score": {"eligible": False, "accuracy": None}, "epochs": [],
+    }
+    write_gate_record(root, 5, {**base, "seeded": True})
+    seeded = json.loads((gate_path / "record.json").read_text(encoding="utf-8"))
+    assert seeded["dedup"] == {
+        "structural_hash": "b" * 64, "status": "bypass", "reason": "seed",
+    }
+
+    write_gate_record(root, 5, {**base, "seeded": False, "rematch_for": 2})
+    rematch = json.loads((gate_path / "record.json").read_text(encoding="utf-8"))
+    assert rematch["dedup"]["status"] == "bypass"
+    assert rematch["dedup"]["reason"] == "rematch"
+
+
+def test_backfill_upgrades_legacy_summaries_without_overwriting(tmp_path: Path):
+    record = _write_gate(tmp_path, 3, 0.7)
+    gate_path = gate_dir(tmp_path, 3)
+    (gate_path / "gate.py").write_text(record["gate_code"], encoding="utf-8")
+    assert not (gate_path / "record.json").exists()
+
+    written = backfill_gate_records(tmp_path, model="deepseek-v2-lite")
+    assert written == [gate_path / "record.json"]
+    canonical = json.loads((gate_path / "record.json").read_text(encoding="utf-8"))
+    assert canonical["status"] == "success"
+    assert canonical["nn"]["code_file"] == "gate.py"
+    assert "gate_code" not in canonical
+    assert backfill_gate_records(tmp_path) == []
 
 
 def test_store_roundtrip_and_ordering(tmp_path: Path):
@@ -348,6 +470,19 @@ def test_generator_accepts_valid_gate_and_records_prompt(tmp_path: Path):
     assert GATE_SOURCE.strip() in chatbot_holder.prompts[0]
 
 
+def test_generator_uses_prompt_override(tmp_path: Path):
+    chatbot = _ScriptedChatBot([f"<gate>\n{GATE_SOURCE}\n</gate>"])
+    prompts: list[str] = []
+    sources = _generate_gate(
+        chatbot, [(8, 4)], 1, 64, tmp_path,
+        prompt_override="OVERRIDE PROMPT",
+        prompt_out=prompts,
+    )
+    assert len(sources) == 1
+    assert prompts == ["OVERRIDE PROMPT"]
+    assert chatbot.prompts[0].startswith("OVERRIDE PROMPT")
+
+
 def test_generator_harvests_all_valid_gates_from_one_response(tmp_path: Path):
     """Nothing usable is discarded: multiple valid distinct gates in one
     response are all returned, order preserved."""
@@ -456,6 +591,7 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
         native_repeatable = True
         native_repeat_max_abs_difference = 0.0
         gate_source = "class LLMGeneratedGate: pass"
+        candidate_index = 0
 
     monkeypatch.setattr(
         cycle_module, "_model_logits",
@@ -590,7 +726,7 @@ def test_gate_record_stores_author_state(tmp_path: Path):
     assert record["author_mode"] == "best"
     assert record["author_gate_id"] == 1
     stored = json.loads(
-        (tmp_path / "gate_002" / "summary.json").read_text(encoding="utf-8")
+        (tmp_path / "gate_002" / "record.json").read_text(encoding="utf-8")
     )
     assert stored["author_mode"] == "best"
     assert stored["author_gate_id"] == 1
@@ -649,6 +785,8 @@ def test_phase_b_cli_flag_fails_fast(monkeypatch):
 
 def test_seed_gates_satisfy_the_llm_proposal_validator():
     """Seeds must pass the SAME contract/degenerate checks as LLM proposals."""
+    import torch
+
     from moe_cycle.gate_seeds import SEED_GATES
     from moe_cycle.gate_source import _validate_gate_source
 
@@ -656,6 +794,16 @@ def test_seed_gates_satisfy_the_llm_proposal_validator():
     for name, source in SEED_GATES:
         _validate_gate_source(source, [(2048, 64), (512, 8)])
         hashes.add(structural_hash(source))
+        namespace: dict = {}
+        exec(compile(source, "<seed>", "exec"), namespace)
+        gate_cls = namespace["LLMGeneratedGate"]
+        for model_dim, num_experts in ((2048, 64), (512, 8)):
+            gate = gate_cls(model_dim, num_experts).float().eval()
+            sample = torch.randn(2, 3, model_dim)
+            with torch.no_grad():
+                expected = gate.base(sample)
+                actual = gate(sample)
+            assert torch.equal(expected, actual), f"{name} is not silent at step zero"
     assert len(hashes) == len(SEED_GATES), "seed mechanisms must be distinct"
 
 

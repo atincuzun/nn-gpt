@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Install the proposed gate even when its step-zero model logits diverge "
         "from the native model instead of raising the max_abs_difference RuntimeError. "
-        "The measured difference is still recorded in step_zero_equivalence.json; the "
+        "The measured difference is still recorded in record.json under install; the "
         "non-finite-logits guard stays active.",
     )
     parser.add_argument("--gate-generation-attempts", type=int, default=100)
@@ -116,9 +116,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Cold-start bootstrap: the first N outer candidates install built-in "
-        "compliant seed gates (additive MLP, gated two-branch, multiplicative "
-        "modulation) instead of LLM proposals, so the store accumulates scored "
-        "valid references before the proposer generates its own. 0 disables seeding.",
+        "compliant seed gates (50 distinct mechanisms available) instead of LLM "
+        "proposals, so the store accumulates scored, valid references before the "
+        "proposer generates its own. Use 50 for the full catalog; 0 disables seeding.",
     )
     parser.add_argument(
         "--gate-candidates",
@@ -282,6 +282,13 @@ def parse_args() -> argparse.Namespace:
         "store inside this run's output directory, so nothing survives the run; a "
         "shared directory lets later runs continue gate ids, dedup history, best-gate "
         "reference, and Phase B pairs from earlier runs.",
+    )
+    parser.add_argument(
+        "--gate-archive-dir",
+        type=Path,
+        help="Project-level archive for measured gate code and LEMUR-shaped records. "
+        "Copies (never moves) gate.py and record.json per measured gate. Default: "
+        "nn-gpt/gate_archive.",
     )
     parser.add_argument(
         "--gate-outer-sft",

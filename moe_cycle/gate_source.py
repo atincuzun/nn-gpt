@@ -121,6 +121,9 @@ def _generate_gate(
     seen_hashes: set[str] | None = None,
     max_attempts_per_duplicate: int = 3,
     inherit_reference: bool = False,
+    write_artifacts: bool = True,
+    prompt_out: list[str] | None = None,
+    prompt_override: str | None = None,
 ) -> list[str]:
     """Ask the LLM for replacement gate sources; HARVEST every valid distinct one.
 
@@ -137,7 +140,7 @@ def _generate_gate(
     Its base weight is copied from the native router, so the replaced model
     stays bit-identical at step zero before training begins.
     """
-    prompt = gate_proposal_prompt(
+    prompt = prompt_override if prompt_override is not None else gate_proposal_prompt(
         shapes,
         reference_source=reference_source,
         reference_accuracy=reference_accuracy,
@@ -146,8 +149,11 @@ def _generate_gate(
         inherit_reference=inherit_reference,
     )
     seen = seen_hashes if seen_hashes is not None else set()
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    (artifact_dir / "proposal_prompt.txt").write_text(prompt, encoding="utf-8")
+    if prompt_out is not None:
+        prompt_out.append(prompt)
+    if write_artifacts:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "proposal_prompt.txt").write_text(prompt, encoding="utf-8")
     previous_error = ""
     duplicate_attempts = 0
     harvested: list[str] = []
@@ -159,7 +165,8 @@ def _generate_gate(
             _, _, _, raw = chat_bot.chat(
                 current_prompt, engineer_prompt=False, max_new_tokens=max_new_tokens,
             )
-        (artifact_dir / f"generation_attempt_{attempt}.txt").write_text(raw, encoding="utf-8")
+        if write_artifacts:
+            (artifact_dir / f"generation_attempt_{attempt}.txt").write_text(raw, encoding="utf-8")
         errors: list[str] = []
         new_this_attempt = 0
         # A single generation can yield several parseable strings; every valid
@@ -190,7 +197,8 @@ def _generate_gate(
         previous_error = "; ".join(errors) or "No usable <gate> source was found"
     if not harvested:
         raise RuntimeError(f"LLM did not generate a valid gate after {attempts} attempts: {previous_error}")
-    (artifact_dir / "gate.py").write_text(harvested[0].rstrip() + "\n", encoding="utf-8")
+    if write_artifacts:
+        (artifact_dir / "gate.py").write_text(harvested[0].rstrip() + "\n", encoding="utf-8")
     if len(harvested) > 1:
         print(
             f"[GATE SEARCH] proposal round harvested {len(harvested)} valid "

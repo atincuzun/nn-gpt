@@ -12,6 +12,20 @@ from moe_cycle import cycle
 from moe_cycle.gate_source import _validate_gate_source
 
 
+class _ModelStub:
+    def __init__(self):
+        self.config = SimpleNamespace(use_cache=False)
+
+    def eval(self):
+        return self
+
+    def train(self):
+        return self
+
+    def gradient_checkpointing_disable(self):
+        pass
+
+
 def test_fresh_source_needs_explicit_mode():
     source = (Path(__file__).resolve().parents[1] / "manual_fresh_gate.py").read_text()
     with pytest.raises(ValueError, match="must define base"):
@@ -62,7 +76,7 @@ def test_install_copy_and_equivalence_policy(monkeypatch, tmp_path, random_init)
     recorded = {}
 
     class Session:
-        model = object()
+        model = _ModelStub()
         installs = []
 
         def replace_source(self, source, **kwargs):
@@ -90,7 +104,7 @@ def test_install_copy_and_equivalence_policy(monkeypatch, tmp_path, random_init)
             cycle._install_and_verify(ctx)
     assert recorded["initialize_from_original"] is (not random_init)
     assert recorded["verify"] is True
-    metrics = json.loads((tmp_path / "step_zero_equivalence.json").read_text())
+    metrics = ctx.install_metrics["step_zero"]
     assert metrics["initialize_from_original"] is (not random_init)
     assert metrics["equivalent"] is False
 
@@ -99,7 +113,9 @@ def test_fresh_mode_still_rejects_nonfinite_model_logits(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["run_moe_gate_cycle.py", "--gate-random-init"])
     ctx = SimpleNamespace(
         args=parse_args(), gate_dir=tmp_path, gate_source="SOURCE", sample_input=None,
-        session=SimpleNamespace(replace_source=lambda *args, **kwargs: None, model=None),
+        session=SimpleNamespace(
+            replace_source=lambda *args, **kwargs: None, model=_ModelStub(),
+        ),
     )
     monkeypatch.setattr(cycle, "_model_logits", lambda *args: torch.tensor([float("nan")]))
     with pytest.raises(RuntimeError, match="non-finite"):

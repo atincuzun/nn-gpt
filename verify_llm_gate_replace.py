@@ -23,6 +23,25 @@ from pathlib import Path
 
 import torch
 
+
+class _LastTokenLogits(torch.nn.Module):
+    """Compute vocabulary logits for the final position only.
+
+    The stock DeepSeek forward materializes [batch, prompt_len, 102400] float32
+    logits during generation, which needs >256 MiB for the gate prompt. The
+    smoke test only needs the next-token distribution, so slicing the hidden
+    states before lm_head keeps the same routing/step-zero semantics at a tiny
+    fraction of the memory.
+    """
+
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.inner(hidden_states[:, -1:, :])
+
+
 from moe_cycle.generation_dtype import ensure_generation_dtype_policy
 
 ensure_generation_dtype_policy()
@@ -55,6 +74,29 @@ def main() -> None:
     parser.add_argument("--load-in-4bit", action="store_true", default=True)
     parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false")
     parser.add_argument(
+        "--device-map",
+        default="cuda:0",
+        help="Transformers device map; use 'cpu' for a CPU-only run",
+    )
+    parser.add_argument(
+        "--max-position-embeddings",
+        type=int,
+        default=None,
+        help="Override the rotary cache size (DeepSeek defaults to a 20 MiB "
+        "cache for 163840 positions; 8192 is enough for this smoke test)",
+    )
+    parser.add_argument(
+        "--last-token-logits",
+        action="store_true",
+        help="Compute vocabulary logits only for the final position (saves "
+        "prompt_len * vocab * 4 bytes; step-zero check uses the same slice)",
+    )
+    parser.add_argument(
+        "--compact-prompt",
+        action="store_true",
+        help="Use a shorter contract prompt to reduce generation attention memory",
+    )
+    parser.add_argument(
         "--gate-source",
         type=Path,
         help="Skip LLM generation and use this gate Python file instead",
@@ -73,8 +115,18 @@ def main() -> None:
     model_kwargs: dict = {
         "torch_dtype": torch.bfloat16,
         "local_files_only": args.local_files_only,
-        "device_map": "cuda:0",
+        "device_map": args.device_map,
     }
+    if args.max_position_embeddings is not None:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            args.model,
+            trust_remote_code=True,
+            local_files_only=args.local_files_only,
+        )
+        config.max_position_embeddings = args.max_position_embeddings
+        model_kwargs["config"] = config
     if args.load_in_4bit:
         from transformers import BitsAndBytesConfig
 
@@ -95,6 +147,9 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"Loaded. dtype={torch.bfloat16}, 4bit={args.load_in_4bit}")
+    if args.last_token_logits:
+        session.model.lm_head = _LastTokenLogits(session.model.lm_head)
+        print("LM head restricted to the final position (memory-saving)")
 
     # ------------------------------------------------------- discover gates
     _section("DISCOVERING NATIVE ROUTER GATES")
@@ -133,20 +188,44 @@ def main() -> None:
             temperature=args.temperature,
             top_p=args.top_p,
         )
-        prompt = gate_proposal_prompt(shapes)
+        if args.compact_prompt:
+            prompt = (
+                "Write a PyTorch Mixture-of-Experts router gate.\n"
+                "Contract:\n"
+                "* Start the module with `import torch` and `import torch.nn as nn`.\n"
+                "* Define class LLMGeneratedGate(nn.Module) with "
+                "__init__(self, model_dim: int, num_experts: int) and "
+                "forward(self, x: torch.Tensor) -> torch.Tensor.\n"
+                "* Expose exactly self.base = nn.Linear(model_dim, num_experts, "
+                "bias=False); the native router weights are copied into self.base.\n"
+                "* Immediately after init the complete gate must reproduce "
+                "self.base(x) exactly.\n"
+                "* It must add trainable parameters beyond self.base connected "
+                "to the output (for example a zero-initialized residual branch), "
+                "so training can change routing.\n"
+                "* Token-independent; output finite raw logits with shape "
+                "(..., num_experts); deterministic; only PyTorch; no softmax, "
+                "top-k, dropout, batch norm, or randomness.\n"
+                f"* Shapes: (model_dim, num_experts) = {shapes}.\n"
+                "Return only the complete Python module between <gate> and </gate>."
+            )
+        else:
+            prompt = gate_proposal_prompt(shapes)
         (gate_dir).mkdir(parents=True, exist_ok=True)
         (gate_dir / "rendered_prompt.txt").write_text(prompt, encoding="utf-8")
         print(f"Prompt length: {len(prompt)} chars")
-        source = _generate_gate(
+        torch.cuda.empty_cache()
+        sources = _generate_gate(
             chat_bot,
             shapes,
             args.attempts,
             args.max_new_tokens,
             gate_dir,
-            feedback_summary="",
             reference_source="",
             seen_hashes=set(),
+            prompt_override=prompt if args.compact_prompt else None,
         )
+        source = sources[0]
     print(f"\nGenerated gate source ({len(source)} chars):\n{'-' * 70}")
     print(source)
     print("-" * 70)

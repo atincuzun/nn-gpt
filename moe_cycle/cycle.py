@@ -13,16 +13,17 @@ import copy
 import json
 import os
 import shutil
+import time
 from argparse import Namespace
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .cli import parse_args
 from .feedback import _build_gate_feedback_summary
 from .gate_source import _generate_gate, _validate_gate_source
-from .gate_store import structural_hash
+from .gate_store import fingerprint, structural_hash
 from .morphism import (
     _capture_native_gate_inputs,
     _dtype,
@@ -54,12 +55,18 @@ class RunContext:
     native_repeatable: bool
     native_repeat_max_abs_difference: float
     previous_feedback_summary: str
+    proposal_prompt: str | None = None
+    proposal_attempts: list = field(default_factory=list)
+    install_metrics: dict | None = None
+    created_at: str | None = None
     used_prompts: list = field(default_factory=list)
     candidate_index: int = 0
     candidate_root: Path | None = None
     gate_root: Path | None = None
     gate_epoch_metrics: list = field(default_factory=list)
     reference_gate_id: int | None = None
+    reference_accuracy: float | None = None
+    goal_accuracy: float | None = None
     outer_summary: dict | None = None
     author_gate_id: int | None = None
     llm_version: str = "base"
@@ -95,6 +102,16 @@ def _log_cuda_memory(label: str) -> dict[str, float] | None:
         f"{status['device_total_gib']:.2f} GiB"
     )
     return status
+
+
+def _ts() -> str:
+    """Wall-clock tag for milestone prints.
+
+    nohup logs carry no timestamps on plain print() output, which made
+    post-run forensics ("which gate ran when, for how long") needless file
+    archaeology; every [CYCLE] milestone line below is anchored in time.
+    """
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def _release_cuda_memory() -> None:
@@ -424,7 +441,7 @@ def _setup_run(args: Namespace) -> RunContext:
         chat_bot=chat_bot,
         sites=sites,
         shapes=shapes,
-        gate_dir=gate_root / "gate_000" / "gate_source",
+        gate_dir=gate_root / "gate_000",
         gate_source=None,
         sample_input=sample_input,
         prompt_dict=prompt_dict,
@@ -457,8 +474,10 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
     args = ctx.args
     ctx.candidate_index = candidate_index
     ctx.candidate_root = gate_dir(ctx.gate_root, candidate_index)
-    ctx.gate_dir = ctx.candidate_root / "gate_source"
-    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    ctx.gate_dir = ctx.candidate_root
+    ctx.candidate_root.mkdir(parents=True, exist_ok=True)
+    ctx.proposal_prompt = None
+    ctx.proposal_attempts = []
     if args.gate_source is not None:
         if not args.gate_source.is_file():
             raise FileNotFoundError(f"Gate source file does not exist: {args.gate_source}")
@@ -467,24 +486,32 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             source, ctx.shapes, class_name=args.gate_class,
             require_base=not args.gate_random_init,
         )
+        ctx.proposal_prompt = f"[external gate source] {args.gate_source}"
     elif source is None:
         sources = _generate_gate(
             proposal_chat or ctx.chat_bot, ctx.shapes, args.gate_generation_attempts,
-            args.gate_max_new_tokens, ctx.gate_dir,
+            args.gate_max_new_tokens, ctx.candidate_root,
             reference_source=reference_source,
             reference_accuracy=reference_accuracy,
             goal_accuracy=goal_accuracy,
             dataset=dataset,
             seen_hashes=seen_hashes,
             inherit_reference=getattr(args, "gate_carry_forward", None) is not None,
+            write_artifacts=False,
+            prompt_out=ctx.proposal_attempts,
         )
         source = sources[0]
+        ctx.proposal_prompt = (
+            ctx.proposal_attempts[-1] if ctx.proposal_attempts else None
+        )
         if len(sources) > 1:
             ctx.gate_pool.extend(sources[1:])
             print(
                 f"[GATE SEARCH] {len(sources) - 1} extra valid gate(s) -> "
                 f"proposal pool ({len(ctx.gate_pool)} waiting)"
             )
+    else:
+        ctx.proposal_prompt = "[pooled valid gate from an earlier proposal round]"
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
@@ -521,14 +548,15 @@ def _select_author_gate_id(mode: str, gate_id: int, gate_root) -> int | None:
 
 
 def _latest_trained_checkpoint(gate_root: Path, gate_id: int) -> Path | None:
-    """Newest ``gate_post_train`` checkpoint recorded for a store entry.
-
-    Scans every ``epochs/A*`` directory so a candidate that stopped mid-run
-    still carries its most recently trained weights.
-    """
+    """Newest trained checkpoint: ``weights/`` first, legacy epochs after."""
+    from .gate_store import WEIGHTS_DIR
     from .gate_store import gate_dir as store_gate_dir
 
-    epochs_root = store_gate_dir(gate_root, gate_id) / "epochs"
+    entry = store_gate_dir(gate_root, gate_id)
+    weights = entry / WEIGHTS_DIR
+    if (weights / "metadata.json").is_file() and (weights / "gate_weights.pt").is_file():
+        return weights
+    epochs_root = entry / "epochs"
     if not epochs_root.is_dir():
         return None
     best: tuple[int, Path] | None = None
@@ -537,7 +565,9 @@ def _latest_trained_checkpoint(gate_root: Path, gate_id: int) -> Path | None:
         if not (name.startswith("A") and name[1:].isdigit()):
             continue
         checkpoint = directory / "gate_post_train"
-        if not checkpoint.is_dir():
+        if not (checkpoint / "metadata.json").is_file() or not (
+            checkpoint / "gate_weights.pt"
+        ).is_file():
             continue
         epoch = int(name[1:])
         if best is None or epoch > best[0]:
@@ -600,7 +630,6 @@ def _install_and_verify(ctx: RunContext) -> None:
 
     args = ctx.args
     session = ctx.session
-    gate_dir = ctx.gate_dir
 
     # A previous candidate's gate training leaves the model in train mode
     # with use_cache disabled and stale flags on detached native gates; every
@@ -641,9 +670,6 @@ def _install_and_verify(ctx: RunContext) -> None:
                 "source_gate_id": carry_source_id,
                 "target_gate_id": ctx.candidate_index,
             })
-            (gate_dir / "carry_forward.json").write_text(
-                json.dumps(ctx.carry_forward_metrics, indent=2), encoding="utf-8",
-            )
             carried = True
             print(
                 f"[GATE CARRY] trained weights of gate {carry_source_id:03d} -> "
@@ -653,9 +679,6 @@ def _install_and_verify(ctx: RunContext) -> None:
             )
     initialization_metrics = [] if args.gate_random_init else _perturb_gate_weights(
         session.installs, args.gate_init_noise_scale, args.seed
-    )
-    (gate_dir / "initialization_metrics.json").write_text(
-        json.dumps(initialization_metrics, indent=2), encoding="utf-8",
     )
     replacement_logits = _model_logits(session.model, ctx.sample_input)
     if not torch.isfinite(replacement_logits).all():
@@ -684,8 +707,19 @@ def _install_and_verify(ctx: RunContext) -> None:
             parent_check["max_abs_difference"] if parent_check else None
         ),
     }
-    (gate_dir / "step_zero_equivalence.json").write_text(
-        json.dumps(equivalence, indent=2), encoding="utf-8",
+    ctx.install_metrics = {
+        "step_zero": equivalence,
+        "initialization": initialization_metrics,
+        "carry_forward": getattr(ctx, "carry_forward_metrics", None),
+    }
+    # Compact install receipt: the full metrics live in record.json; this
+    # line makes the install auditable straight from the log (native-copy
+    # vs carried, divergence size).
+    print(
+        f"[{_ts()}] [CYCLE] gate_{getattr(ctx, 'candidate_index', 0):03d} INSTALLED: "
+        f"init={'gate_%03d-weights' % carry_source_id if carried else 'native-copy'}, "
+        f"step-zero max_abs_diff={max_abs_diff:.3g}, equivalent={equivalent}, "
+        f"parent-check={'n/a' if parent_check is None else parent_check['equivalent']}"
     )
     if parent_check is not None and not parent_check["equivalent"]:
         # Reject-and-continue: the candidate is recorded as failed by the
@@ -730,12 +764,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
     from ab.gpt.util.Tune import _evaluate_epoch, nn_gen
     from moe_gate_only import (
         build_nngenprompt_dataloaders,
-        collect_gate_metrics,
         evaluate_language_model_loss,
         train_gates,
     )
-
-    from .gate_store import epoch_dir, write_json
 
     args = ctx.args
     outer_mode = args.gate_outer_search
@@ -751,10 +782,14 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         raise FileNotFoundError(f"Train prompt config does not exist: {train_prompt_path}")
 
     for epoch in range(args.epochs):
-        print(f"\n{'='*60}\n  EPOCH {epoch} / {args.epochs}\n{'='*60}\n")
+        print(
+            f"\n{'='*60}\n  [{_ts()}] gate_{ctx.candidate_index:03d} "
+            f"EPOCH {epoch} / {args.epochs}\n{'='*60}\n"
+        )
         _seed_all(args.seed + epoch)
         if ctx.candidate_root is None:
             raise RuntimeError("Gate candidate was not prepared")
+        epoch_started = time.monotonic()
         epoch_path = ctx.candidate_root / "epochs" / f"A{epoch}"
         epoch_path.mkdir(parents=True, exist_ok=True)
         epoch_paths.append(epoch_path)
@@ -774,32 +809,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             active_layers = {
                 install.site.layer_index for install in session.installs
             }
-        (epoch_path / "active_gate_layers.json").write_text(
-            json.dumps({
-                "epoch": epoch,
-                "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
-                "active_layers": sorted(active_layers),
-            }, indent=2),
-            encoding="utf-8",
-        )
-        (epoch_path / "routing_mode.json").write_text(
-            json.dumps({
-                "gate_implementation": args.gate_implementation,
-                "initialize_from_original": not args.gate_random_init,
-            }, indent=2),
-            encoding="utf-8",
-        )
-        (epoch_path / "evaluation_config.json").write_text(
-            json.dumps({
-                "fixed_hyperparameter_overrides": args.fixed_eval_hyperparameters,
-                "nn_train_epochs": args.nn_train_epochs,
-            }, indent=2),
-            encoding="utf-8",
-        )
 
         # ── 1. Generate NN architectures + evaluate (like nn_gen in tune()) ──
 
-        session.save(epoch_path / "gate_pre_generation")
         _prepare_model_for_generation(ctx)
 
         # Candidates are compared on CV accuracy, so a candidate's own gate
@@ -811,10 +823,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             args.conf_keys,
             dataset=args.dataset,
             nn_prefixes=generation_prefixes,
-        )
-        (epoch_path / "generation_prompt_feedback.txt").write_text(
-            ctx.previous_feedback_summary.rstrip() + "\n",
-            encoding="utf-8",
         )
         nn_gen(
             epoch,
@@ -843,7 +851,6 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         # Preserve cycle results written by NNEval.
         cycle_src = nngpt_dir / "cycle_results.json"
         if cycle_src.is_file():
-            shutil.copy2(cycle_src, epoch_path / "cycle_results.json")
             shutil.copy2(cycle_src, nngpt_dir / f"cycle_results_A{epoch}.json")
             cycle_results = json.loads(cycle_src.read_text(encoding="utf-8"))
             cycle_models_trained = int(
@@ -863,22 +870,21 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         gate_feedback = _build_gate_feedback_summary(
             epoch_path, used_prompts, cycle_results, session
         )
-        (epoch_path / "nas_feedback.json").write_text(
-            json.dumps(gate_feedback, indent=2),
-            encoding="utf-8",
-        )
-        (epoch_path / "training_prompt_feedback.txt").write_text(
-            gate_feedback["summary"].rstrip() + "\n",
-            encoding="utf-8",
+        # Per-epoch CV receipt: without this line the measured accuracies
+        # live only in the record and every post-run question
+        # ("did this gate measure anything?") means file digging.
+        _mean = gate_feedback["mean_accuracy"]
+        _best = gate_feedback["best_accuracy"]
+        print(
+            f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
+            f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
+            f"measured={gate_feedback['n_measured']}, "
+            f"mean={_mean:.4f} best={_best:.4f}" if _mean is not None else
+            f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
+            f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
+            f"measured=0, mean=n/a best=n/a"
         )
         ctx.previous_feedback_summary = gate_feedback["summary"]
-
-        # Save gate checkpoint + routing stats
-        session.save(epoch_path / "gate")
-        (epoch_path / "routing_stats.json").write_text(
-            json.dumps(collect_gate_metrics(session.installs), indent=2),
-            encoding="utf-8",
-        )
 
         # ── 2. Build training data from real evaluated LEMUR results ──
 
@@ -902,9 +908,15 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 f"[epoch={epoch}] Gate training skipped: {exc}. "
                 "Continuing to the next generation cycle."
             )
-            session.save(epoch_path / "gate_post_train")
-            (epoch_path / "gate_training_metrics.json").write_text(
-                json.dumps({
+            epoch_metrics = _harvest_epoch_metrics(
+                epoch, epoch_path, gate_feedback, cycle_results,
+                cycle_models_trained, None, None, active_layers,
+                duration_ns=int((time.monotonic() - epoch_started) * 1e9),
+            )
+            epoch_metrics.update({
+                "training_skipped": True,
+                "skip_reason": str(exc),
+                "training": {
                     "epoch": epoch,
                     "active_gate_layers": sorted(active_layers),
                     "training_skipped": True,
@@ -914,24 +926,13 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                     "prompt_feedback_injected": True,
                     "train_prompt_config": args.train_prompt_config,
                     "training_nn_prefixes": list(training_prefixes),
-                    "cycle_feedback": {
-                        key: gate_feedback[key]
-                        for key in (
-                            "n_generated",
-                            "n_trained",
-                            "n_measured",
-                            "mean_accuracy",
-                            "std_accuracy",
-                            "best_accuracy",
-                            "mean_accuracy_delta",
-                            "improved_candidates",
-                            "datasets",
-                            "tasks",
-                        )
-                    },
-                }, indent=2),
-                encoding="utf-8",
-            )
+                },
+                "feedback": _feedback_record(gate_feedback),
+                "cv": cycle_results,
+                "config": _epoch_config(args),
+            })
+            ctx.gate_epoch_metrics.append(epoch_metrics)
+            _write_gate_record(ctx, finalize=False)
             continue
 
         train_lengths = [len(row["input_ids"]) for row in train_dataset]
@@ -1019,8 +1020,8 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             if hasattr(session.model, "gradient_checkpointing_disable"):
                 session.model.gradient_checkpointing_disable()
 
-        # Save post-training checkpoint + metrics
-        session.save(epoch_path / "gate_post_train", optimizer=optimizer)
+        # Save the single latest trained checkpoint + metrics.
+        _save_latest_weights(ctx)
         training_metrics = {
             "epoch": epoch,
             "active_gate_layers": sorted(active_layers),
@@ -1053,41 +1054,38 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 "tasks": gate_feedback["tasks"],
             },
         }
-        (epoch_path / "gate_training_metrics.json").write_text(
-            json.dumps(training_metrics, indent=2), encoding="utf-8",
-        )
-        (epoch_path / "routing_stats_post_train.json").write_text(
-            json.dumps(collect_gate_metrics(session.installs), indent=2),
-            encoding="utf-8",
-        )
-
         # ── Record this inner epoch for the outer gate score ──
         # Placed after training so the gate's own training loss is included.
-        if outer_mode:
-            epoch_metrics = _harvest_epoch_metrics(
-                epoch, epoch_path, gate_feedback, cycle_results,
-                cycle_models_trained,
-                result.mean_train_loss if result is not None else None,
-                validation_loss,
-                active_layers,
-            )
-            ctx.gate_epoch_metrics.append(epoch_metrics)
-            write_json(
-                epoch_dir(ctx.gate_root, ctx.candidate_index, epoch) / "metrics.json",
-                epoch_metrics,
-            )
+        epoch_metrics = _harvest_epoch_metrics(
+            epoch, epoch_path, gate_feedback, cycle_results,
+            cycle_models_trained,
+            result.mean_train_loss if result is not None else None,
+            validation_loss,
+            active_layers,
+            duration_ns=int((time.monotonic() - epoch_started) * 1e9),
+        )
+        epoch_metrics.update({
+            "training": training_metrics,
+            "feedback": _feedback_record(gate_feedback),
+            "cv": cycle_results,
+            "config": _epoch_config(args),
+        })
+        ctx.gate_epoch_metrics.append(epoch_metrics)
+        _write_gate_record(ctx, finalize=False)
 
         if oom_recovered:
             # The candidate keeps the epochs it already measured; a truncated
             # protocol beats discarding a working gate (its score averages the
             # epochs that completed).
             print(
-                f"[epoch={epoch}] gate training OOM recovered: stopping candidate "
-                f"early with {len(ctx.gate_epoch_metrics)} harvested epoch(s)"
+                f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} "
+                f"gate-training OOM recovered: stopping candidate early with "
+                f"{len(ctx.gate_epoch_metrics)} harvested epoch(s)"
             )
             break
         print(
-            f"[epoch={epoch}] train_loss={result.mean_train_loss:.6f} "
+            f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} "
+            f"gate-training: train_loss={result.mean_train_loss:.6f} "
             f"val_loss={validation_loss}"
         )
 
@@ -1103,6 +1101,7 @@ def _harvest_epoch_metrics(
     train_loss: float | None,
     validation_loss: float | None,
     active_layers: set[int],
+    duration_ns: int = 0,
 ) -> dict:
     """Collect one inner epoch's measurements for the outer gate score.
 
@@ -1130,27 +1129,169 @@ def _harvest_epoch_metrics(
         "validation_loss": validation_loss,
         "active_gate_layers": sorted(active_layers),
         "cycle_success": bool(cycle_results.get("success")),
-        "epoch_path": str(epoch_path),
+        "duration": duration_ns,
+        "synth_nn": f"epochs/A{epoch}/synth_nn",
     }
 
 
-def _write_gate_record(ctx: RunContext) -> dict:
-    """Finalize one gate candidate: summarize, persist, and return the record."""
-    from .gate_store import summarize_epoch_metrics, write_gate_summary
+def _feedback_record(feedback: dict) -> dict:
+    """Compact per-epoch feedback kept in the record for improvement analysis."""
+    keys = (
+        "summary", "n_generated", "n_trained", "n_measured",
+        "mean_accuracy", "std_accuracy", "best_accuracy", "mean_accuracy_delta",
+        "improved_candidates", "datasets", "tasks",
+        "candidate_outcomes", "failure_reasons",
+    )
+    return {key: feedback.get(key) for key in keys}
+
+
+def _epoch_config(args: Namespace) -> dict:
+    return {
+        "progressive_unfreeze_descending": args.progressive_unfreeze_descending,
+        "gate_implementation": args.gate_implementation,
+        "initialize_from_original": not args.gate_random_init,
+        "fixed_hyperparameter_overrides": args.fixed_eval_hyperparameters,
+        "nn_train_epochs": args.nn_train_epochs,
+    }
+
+
+def _save_latest_weights(ctx: RunContext) -> Path | None:
+    """Atomically replace ``<gate>/weights`` with the current trained gate."""
+    from .gate_store import WEIGHTS_DIR
+
+    if ctx.candidate_root is None:
+        return None
+    target = ctx.candidate_root / WEIGHTS_DIR
+    temporary = ctx.candidate_root / f".{WEIGHTS_DIR}.tmp"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    try:
+        ctx.session.save(temporary)
+        if not temporary.exists():
+            return None
+        if target.exists():
+            shutil.rmtree(target)
+        temporary.rename(target)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return target
+
+
+def _protocol(args: Namespace) -> dict:
+    """Measurement conditions stored with every gate and in the archive."""
+    protocol = {
+        "model": getattr(args, "model", None),
+        "seed": getattr(args, "seed", None),
+        "dataset": getattr(args, "dataset", None),
+        "task": "img-classification",
+        "metric": "accuracy",
+        "layers": getattr(args, "layers", None),
+        "router_top_k": getattr(args, "router_top_k", None),
+        "epochs": getattr(args, "epochs", None),
+        "nn_train_epochs": getattr(args, "nn_train_epochs", None),
+        "test_nn": getattr(args, "test_nn", None),
+        "fixed_eval_hyperparameters": getattr(args, "fixed_eval_hyperparameters", None),
+        "gate_train_steps": getattr(args, "gate_train_steps", None),
+        "gate_learning_rate": getattr(args, "gate_learning_rate", None),
+        "gate_init_noise_scale": getattr(args, "gate_init_noise_scale", None),
+        "train_prompt_config": getattr(args, "train_prompt_config", None),
+        "test_prompt_config": getattr(args, "test_prompt_config", None),
+    }
+    protocol["fingerprint"] = fingerprint(protocol)
+    return protocol
+
+
+def _gate_archive_root(args: Namespace) -> Path:
+    configured = getattr(args, "gate_archive_dir", None)
+    if configured is not None:
+        return Path(configured).resolve()
+    return Path(__file__).resolve().parents[1] / "gate_archive"
+
+
+def _slug(value: Any, fallback: str = "unknown") -> str:
+    text = str(value or fallback)
+    slug = "".join(
+        character if character.isalnum() or character in "-_." else "-"
+        for character in text
+    ).strip("-")
+    return slug or fallback
+
+
+def _archive_measured_gate(ctx: RunContext, record: dict) -> Path | None:
+    """Copy a measured gate's code + LEMUR-shaped record into the archive.
+
+    The archive is a data directory under ``nn-gpt`` (``gate_archive`` by
+    default). It is copy-only: the live store remains the source of truth, a
+    failed archive write never fails the candidate, and only gates with a
+    measured CV accuracy are archived.
+    """
+    accuracy = (record.get("score") or {}).get("accuracy")
+    if not isinstance(accuracy, (int, float)):
+        return None
+    candidate_root = getattr(ctx, "candidate_root", None)
+    if candidate_root is None:
+        return None
+    source = candidate_root / "gate.py"
+    record_path = candidate_root / "record.json"
+    if not source.is_file() or not record_path.is_file():
+        return None
+    archive_root = _gate_archive_root(ctx.args)
+    run_name = ctx.run_root.name if ctx.run_root is not None else "run"
+    target = (
+        archive_root
+        / _slug(getattr(ctx.args, "model", None), "model")
+        / _slug(run_name, "run")
+        / f"gate_{ctx.candidate_index:03d}"
+    )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target / "gate.py")
+        shutil.copy2(record_path, target / "record.json")
+    except OSError as exc:
+        print(f"[GATE ARCHIVE] gate {ctx.candidate_index:03d} archive skipped: {exc}")
+        return None
+    print(f"[GATE ARCHIVE] gate {ctx.candidate_index:03d} -> {target}")
+    return target
+
+
+def _write_gate_record(ctx: RunContext, *, finalize: bool = True) -> dict:
+    """Persist one gate candidate, incrementally and at completion.
+
+    ``finalize=False`` writes a ``running`` record after each inner epoch so a
+    killed run still leaves usable measurements. The final write sets the
+    terminal status and archives measured gates.
+    """
+    from .gate_store import summarize_epoch_metrics, write_gate_record
 
     score = summarize_epoch_metrics(ctx.gate_epoch_metrics)
+    gate_source = getattr(ctx, "gate_source", None)
     record = {
         "gate_id": ctx.candidate_index,
-        "gate_code": ctx.gate_source,
-        "structural_hash": structural_hash(ctx.gate_source),
-        "reference_gate_id": ctx.reference_gate_id,
-        "author_mode": getattr(ctx.args, "gate_carry_forward", None) or ctx.args.gate_author,
-        "author_gate_id": ctx.author_gate_id,
+        "gate_code": gate_source,
+        "structural_hash": structural_hash(gate_source) if gate_source else None,
+        "reference_gate_id": getattr(ctx, "reference_gate_id", None),
+        "author_mode": (
+            getattr(ctx.args, "gate_carry_forward", None)
+            or getattr(ctx.args, "gate_author", None)
+        ),
+        "author_gate_id": getattr(ctx, "author_gate_id", None),
         "carry_source_gate_id": getattr(ctx, "carry_source_id", None),
         "carry_forward": getattr(ctx, "carry_forward_metrics", None),
         "rematch_for": getattr(ctx, "rematch_for", None),
         "llm_version": getattr(ctx, "llm_version", "base"),
         "seeded": getattr(ctx, "seeded", False),
+        "created_at": getattr(ctx, "created_at", None),
+        "running": not finalize,
+        "install": getattr(ctx, "install_metrics", None),
+        "proposal": {
+            "prompt": getattr(ctx, "proposal_prompt", None),
+            "reference_gate_id": getattr(ctx, "reference_gate_id", None),
+            "reference_accuracy": getattr(ctx, "reference_accuracy", None),
+            "goal_accuracy": getattr(ctx, "goal_accuracy", None),
+            "attempts": len(getattr(ctx, "proposal_attempts", [])),
+        },
+        "protocol": _protocol(ctx.args),
         # gate_pairs.build_gate_pairs groups comparable records on exactly
         # these three keys; without them no Phase B pairs can ever form.
         "task": "img-classification",
@@ -1159,27 +1300,37 @@ def _write_gate_record(ctx: RunContext) -> dict:
         "score": score,
         "epochs": ctx.gate_epoch_metrics,
     }
-    write_gate_summary(ctx.gate_root, ctx.candidate_index, record)
+    write_gate_record(
+        ctx.gate_root,
+        ctx.candidate_index,
+        record,
+        run_root=getattr(ctx, "run_root", None),
+        model=getattr(ctx.args, "model", None),
+    )
+    if finalize:
+        _archive_measured_gate(ctx, record)
     return record
 
 
-def _candidate_feedback(epoch_paths: list[Path], candidate_index: int) -> str:
+def _candidate_feedback(epoch_metrics: list[dict], candidate_index: int) -> str:
     """Summarize one completed candidate for the next outer-loop proposal."""
-    entries = []
-    for epoch_path in epoch_paths:
-        path = epoch_path / "nas_feedback.json"
-        if path.is_file():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            entries.append({key: data.get(key) for key in (
-                "n_generated", "n_trained", "best_accuracy", "mean_accuracy_delta",
-                "improved_candidates",
-            )})
+    entries = [
+        {
+            key: (metrics.get("feedback") or {}).get(key)
+            for key in (
+                "n_generated", "n_trained", "best_accuracy",
+                "mean_accuracy_delta", "improved_candidates",
+            )
+        }
+        for metrics in epoch_metrics
+    ]
     return f"Independent gate candidate {candidate_index} results: {json.dumps(entries)}"
 
 
-def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) -> None:
-    """Write the aggregated per-epoch summary next to the run artifacts."""
+def _write_final_summary(ctx: RunContext) -> None:
+    """Write the run-level summary from the canonical gate records."""
     from ab.gpt.util.Const import nngpt_dir
+    from .gate_store import load_gate_summaries
 
     args = ctx.args
     summary = {
@@ -1196,7 +1347,10 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         "nn_train_epochs": args.nn_train_epochs,
         "training_nn_prefixes": list(_nas_prefixes(args)),
         "generation_nn_prefixes": list(_generation_prefixes(args)),
-        "gate_source": str(ctx.gate_dir / "gate.py") if ctx.gate_source is not None else None,
+        "gate_source": (
+            str((ctx.candidate_root or ctx.gate_dir) / "gate.py")
+            if ctx.gate_source is not None else None
+        ),
         "gate_shapes": ctx.shapes,
         "replaced_gates": len(
             ctx.sites
@@ -1210,24 +1364,20 @@ def _write_final_summary(ctx: RunContext, candidate_epochs: list[list[Path]]) ->
         "gate_outer_search": ctx.outer_summary,
         "run_root": str(ctx.run_root),
     }
-    for candidate_index, epoch_paths in enumerate(candidate_epochs):
-        candidate_root = nngpt_dir / "gate_candidates" / f"candidate_{candidate_index:03d}"
-        candidate: dict[str, Any] = {
-            "gate_source": str(candidate_root / "gate_source" / "gate.py"),
-            "independent_native_initialization": (
-                getattr(args, "gate_carry_forward", None) is None
-            ),
+    for record in load_gate_summaries(ctx.gate_root):
+        provenance = record.get("provenance") or {}
+        if provenance.get("run_root") not in (None, str(ctx.run_root)):
+            continue
+        gate_id = record.get("gate_id")
+        if not isinstance(gate_id, int):
+            continue
+        summary[f"candidate_{gate_id:03d}"] = {
+            "gate_source": (record.get("artifacts") or {}).get("source"),
+            "status": record.get("status"),
+            "score": record.get("score"),
+            "protocol": record.get("protocol"),
+            "epochs": record.get("epochs"),
         }
-        for epoch, epoch_path in enumerate(epoch_paths):
-            training_path = epoch_path / "gate_training_metrics.json"
-            cycle_path = epoch_path / "cycle_results.json"
-            entry: dict[str, Any] = {"epoch": epoch}
-            if training_path.is_file():
-                entry["gate_training"] = json.loads(training_path.read_text(encoding="utf-8"))
-            if cycle_path.is_file():
-                entry["cv_results"] = json.loads(cycle_path.read_text(encoding="utf-8"))
-            candidate[f"A{epoch}"] = entry
-        summary[f"candidate_{candidate_index:03d}"] = candidate
 
     (nngpt_dir / "one_cycle_results.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8",
@@ -1266,6 +1416,8 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str],
         # No eligible prior gate yet: fall back to the baseline contract so the
         # model still has an explicit reference to diverge from.
         reference_source = BASELINE_GATE_CODE
+    ctx.reference_accuracy = reference_accuracy
+    ctx.goal_accuracy = goal_accuracy
 
     _prepare_gate_candidate(
         ctx,
@@ -1297,16 +1449,16 @@ def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
 
     ctx.candidate_index = gate_id
     ctx.candidate_root = gate_dir(ctx.gate_root, gate_id)
-    ctx.gate_dir = ctx.candidate_root / "gate_source"
-    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    ctx.gate_dir = ctx.candidate_root
+    ctx.candidate_root.mkdir(parents=True, exist_ok=True)
     source = seed_gate_source(gate_id)
     _validate_gate_source(source, ctx.shapes)
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
-    (ctx.gate_dir / "proposal_prompt.txt").write_text(
+    ctx.proposal_prompt = (
         f"[cold-start bootstrap] built-in seed gate '{seed_gate_name(gate_id)}' "
-        "installed without an LLM proposal\n",
-        encoding="utf-8",
+        "installed without an LLM proposal"
     )
+    ctx.proposal_attempts = []
     ctx.gate_source = source
     ctx.seeded = True
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
@@ -1319,7 +1471,7 @@ def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
 
 def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> None:
     """Persist a failed candidate so the run continues and the store keeps the lesson."""
-    from .gate_store import write_gate_summary
+    from .gate_store import write_gate_record
 
     reason = f"{type(exc).__name__}: {exc}"
     print(f"[GATE SEARCH] gate {gate_id:03d} FAILED, continuing: {reason}")
@@ -1328,13 +1480,27 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
         "gate_code": ctx.gate_source,
         "structural_hash": structural_hash(ctx.gate_source) if ctx.gate_source else None,
         "reference_gate_id": ctx.reference_gate_id,
-        "author_mode": getattr(ctx.args, "gate_carry_forward", None) or ctx.args.gate_author,
+        "author_mode": (
+            getattr(ctx.args, "gate_carry_forward", None)
+            or getattr(ctx.args, "gate_author", None)
+        ),
         "author_gate_id": ctx.author_gate_id,
         "carry_source_gate_id": getattr(ctx, "carry_source_id", None),
         "carry_forward": getattr(ctx, "carry_forward_metrics", None),
-        "rematch_for": ctx.rematch_for,
-        "llm_version": ctx.llm_version,
+        "rematch_for": getattr(ctx, "rematch_for", None),
+        "llm_version": getattr(ctx, "llm_version", "base"),
         "seeded": getattr(ctx, "seeded", False),
+        "created_at": getattr(ctx, "created_at", None),
+        "running": False,
+        "install": getattr(ctx, "install_metrics", None),
+        "proposal": {
+            "prompt": getattr(ctx, "proposal_prompt", None),
+            "reference_gate_id": getattr(ctx, "reference_gate_id", None),
+            "reference_accuracy": getattr(ctx, "reference_accuracy", None),
+            "goal_accuracy": getattr(ctx, "goal_accuracy", None),
+            "attempts": len(getattr(ctx, "proposal_attempts", [])),
+        },
+        "protocol": _protocol(ctx.args),
         "score": {
             "objective": "mean_of_epoch_means_v1",
             "accuracy": None,
@@ -1348,7 +1514,13 @@ def _record_failed_candidate(ctx: RunContext, gate_id: int, exc: Exception) -> N
         "epochs": ctx.gate_epoch_metrics,
         "failure": reason[:2000],
     }
-    write_gate_summary(ctx.gate_root, gate_id, record)
+    write_gate_record(
+        ctx.gate_root,
+        gate_id,
+        record,
+        run_root=getattr(ctx, "run_root", None),
+        model=getattr(ctx.args, "model", None),
+    )
 
 
 def _run_candidate_once(
@@ -1368,11 +1540,17 @@ def _run_candidate_once(
     # candidate's code/id in the failed record.
     ctx.gate_source = None
     ctx.reference_gate_id = None
+    ctx.reference_accuracy = None
+    ctx.goal_accuracy = None
     ctx.gate_epoch_metrics = []
     ctx.seeded = False
     ctx.carry_source_id = None
     ctx.parent_logits = None
     ctx.carry_forward_metrics = None
+    ctx.install_metrics = None
+    ctx.proposal_prompt = None
+    ctx.proposal_attempts = []
+    ctx.created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     carry_mode = getattr(args, "gate_carry_forward", None)
     author_mode = carry_mode or args.gate_author
     author_gate_id = (
@@ -1441,6 +1619,21 @@ def _run_candidate_once(
                     ctx.carry_source_id = rematch_for
                 elif not seed:
                     ctx.carry_source_id = author_gate_id
+            # One consolidated header per candidate: kind, routing it was
+            # authored under, weight-carry source, and the proposer version —
+            # everything a post-run log analysis needs on a single line.
+            candidate_kind = (
+                f"rematch of gate_{rematch_for:03d}" if rematch_for is not None
+                else "seed" if seed
+                else "pool" if pooled_source is not None
+                else "llm-proposal"
+            )
+            print(
+                f"[{_ts()}] [CYCLE] gate_{gate_id:03d} START: {candidate_kind}, "
+                f"author={'native' if author_gate_id is None else f'gate_{author_gate_id:03d}'}, "
+                f"carry={'none' if ctx.carry_source_id is None else f'gate_{ctx.carry_source_id:03d}'}, "
+                f"proposer={ctx.llm_version}"
+            )
             _install_and_verify(ctx)
             epoch_paths = _run_epochs(ctx)
         record = _write_gate_record(ctx)
@@ -1474,11 +1667,16 @@ def _prepare_rematch_candidate(ctx: RunContext, gate_id: int, source_gate_id: in
 
     ctx.candidate_index = gate_id
     ctx.candidate_root = store_gate_dir(ctx.gate_root, gate_id)
-    ctx.gate_dir = ctx.candidate_root / "gate_source"
-    ctx.gate_dir.mkdir(parents=True, exist_ok=True)
+    ctx.gate_dir = ctx.candidate_root
+    ctx.candidate_root.mkdir(parents=True, exist_ok=True)
     source_file = store_gate_dir(ctx.gate_root, source_gate_id) / "gate.py"
     source = source_file.read_text(encoding="utf-8")
     (ctx.candidate_root / "gate.py").write_text(source, encoding="utf-8")
+    ctx.proposal_prompt = (
+        f"[rematch] re-measuring gate {source_gate_id:03d} under proposer "
+        f"{ctx.llm_version}"
+    )
+    ctx.proposal_attempts = []
     ctx.gate_source = source
     ctx.reference_gate_id = source_gate_id
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
@@ -1518,17 +1716,29 @@ def _run_phase_b_batch(ctx: RunContext, batch_index: int) -> str | None:
     ]
     if len(current_version_pairs) >= getattr(ctx.args, "gate_min_pairs", 2):
         pairs = current_version_pairs
+        version_scope = "current-version"
     else:
         pairs = all_pairs
+        version_scope = "cross-version fallback"
     if len(pairs) < getattr(ctx.args, "gate_min_pairs", 2):
         print(
             f"[PHASE B] skipping batch {batch_index}: {len(pairs)} comparable "
             f"pair(s) < --gate-min-pairs {getattr(ctx.args, 'gate_min_pairs', 2)}"
         )
         return None
+    # SFT batch receipt: WHICH pairs trained the proposer and under which
+    # version scope — the first question of any post-run analysis of the
+    # self-improvement loop ("what did the LoRA actually learn from?").
+    pair_ids = ", ".join(pair["pair_id"] for pair in pairs[:8]) + (
+        f" (+{len(pairs) - 8} more)" if len(pairs) > 8 else ""
+    )
+    print(
+        f"[{_ts()}] [CYCLE] proposer SFT batch {batch_index}: {len(pairs)} pair(s) "
+        f"[{pair_ids}] ({version_scope}), parent proposer {ctx.llm_version}"
+    )
     adapter_dir = ctx.run_root / "proposer_adapters" / f"batch_{batch_index:03d}"
     parent_version = ctx.llm_version
-    train_proposer(
+    training_summary = train_proposer(
         ctx.session,
         ctx.tokenizer,
         pairs,
@@ -1537,6 +1747,11 @@ def _run_phase_b_batch(ctx: RunContext, batch_index: int) -> str | None:
         adapter_dir,
     )
     new_version = version_of(ctx.session.model, ctx.args, merged_from=parent_version)
+    print(
+        f"[{_ts()}] [CYCLE] proposer SFT batch {batch_index} TRAINED: "
+        f"steps={training_summary.get('steps')}, pairs={training_summary.get('pairs')}, "
+        f"mode={training_summary.get('mode')}, adapter={training_summary.get('output_dir')}"
+    )
     if ctx.args.gate_store is not None:
         # Persist the newest adapter so the next run continues from it
         # (Tune.py-style weight compounding across runs).
@@ -1624,10 +1839,10 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
 
     seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
     # Seed architectures are also off-limits for verbatim LLM re-emission.
-    from .gate_seeds import SEED_GATES
+    from .gate_seeds import SEED_GATES, seed_gate_source
 
-    for seed_source, _seed_name in SEED_GATES:
-        seen_hashes.add(structural_hash(seed_source))
+    for index in range(len(SEED_GATES)):
+        seen_hashes.add(structural_hash(seed_gate_source(index)))
     sft_batch = 0
     candidates_run = 0
 
@@ -1712,12 +1927,18 @@ def main() -> None:
                 # reach later candidates through the log and the best-gate
                 # reference prompt.
                 print(outer_feedback)
+            ctx.created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            ctx.proposal_attempts = []
+            ctx.install_metrics = None
             _prepare_gate_candidate(ctx, candidate_index)
             # The context restores native routers after every candidate, so no
             # candidate inherits another candidate's trained gate parameters.
             with ctx.session:
                 _install_and_verify(ctx)
                 epoch_paths = _run_epochs(ctx)
+            _write_gate_record(ctx)
             candidate_epochs.append(epoch_paths)
-            outer_feedback += "\n" + _candidate_feedback(epoch_paths, candidate_index)
-    _write_final_summary(ctx, candidate_epochs)
+            outer_feedback += "\n" + _candidate_feedback(
+                ctx.gate_epoch_metrics, candidate_index,
+            )
+    _write_final_summary(ctx)
