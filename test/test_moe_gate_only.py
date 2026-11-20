@@ -638,6 +638,30 @@ def _assert_step_zero_exact(model):
         assert torch.equal(model(**sample).logits, native)
 
 
+def test_gate_returning_probabilities_is_rejected():
+    from moe_cycle.gate_source import _validate_gate_source
+
+    source = """
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LLMGeneratedGate(nn.Module):
+    def __init__(self, model_dim, num_experts):
+        super().__init__()
+        self.base = nn.Linear(model_dim, num_experts, bias=False)
+        self.branch = nn.Linear(model_dim, num_experts, bias=False)
+
+    def forward(self, x):
+        return F.softmax(self.base(x) + self.branch(x), dim=-1)
+"""
+    try:
+        _validate_gate_source(source, [(16, 4)])
+        raise AssertionError("probability output must be rejected")
+    except ValueError as exc:
+        assert "raw router logits" in str(exc)
+
+
 def test_phimoe_replacement_preserves_native_logits():
     _assert_step_zero_exact(_tiny_phimoe())
     print("  phimoe: step-zero logits exactly equal native")

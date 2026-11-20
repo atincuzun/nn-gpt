@@ -88,6 +88,16 @@ def _validate_gate_source(
                 raise ValueError(f"Expected gate output {expected}, got {getattr(output, 'shape', None)}")
             if not torch.isfinite(output).all():
                 raise ValueError("Generated gate returned non-finite logits")
+            flat = output.detach().float()
+            if flat.min().item() >= 0.0 and torch.allclose(
+                flat.sum(dim=-1),
+                torch.ones_like(flat.sum(dim=-1)),
+                atol=1e-3,
+            ):
+                raise ValueError(
+                    "Generated gate must return raw router logits; the host applies "
+                    "softmax/sigmoid, so returning probabilities is invalid"
+                )
         if require_base:
             # Reject degenerate proposals: the architecture must add trainable
             # parameters that participate in forward. Connectivity (grad is not
