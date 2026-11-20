@@ -139,7 +139,7 @@ class MoEGateSession:
         self,
         source: str,
         *,
-        class_name: str = "LLMGeneratedGate",
+        class_name: str = "Net",
         **replace_kwargs: Any,
     ) -> list[GateInstall]:
         gate_class = compile_gate_from_string(source, class_name=class_name)

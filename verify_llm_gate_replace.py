@@ -193,7 +193,7 @@ def main() -> None:
                 "Write a PyTorch Mixture-of-Experts router gate.\n"
                 "Contract:\n"
                 "* Start the module with `import torch` and `import torch.nn as nn`.\n"
-                "* Define class LLMGeneratedGate(nn.Module) with "
+                "* Define class Net(nn.Module) with "
                 "__init__(self, model_dim: int, num_experts: int) and "
                 "forward(self, x: torch.Tensor) -> torch.Tensor.\n"
                 "* Expose exactly self.base = nn.Linear(model_dim, num_experts, "
@@ -234,7 +234,7 @@ def main() -> None:
     _section("REPLACING ROUTERS AND VERIFYING STEP ZERO")
     installs = session.replace_source(
         source,
-        class_name="LLMGeneratedGate",
+        class_name="Net",
         layers=None,
         sample_input=sample_input,
         verify=True,

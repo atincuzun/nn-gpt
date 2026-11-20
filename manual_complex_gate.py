@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 
-class LLMGeneratedGate(nn.Module):
+class Net(nn.Module):
     def __init__(self, model_dim: int, num_experts: int):
         super().__init__()
         width = max(16, model_dim // 16)

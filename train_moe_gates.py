@@ -73,8 +73,8 @@ def _default_gate_factory(model_dim: int, num_experts: int) -> torch.nn.Module:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="LiquidAI/LFM2.5-8B-A1B")
-    parser.add_argument("--gate-source", type=Path, help="Python file defining LLMGeneratedGate")
-    parser.add_argument("--gate-class", default="LLMGeneratedGate")
+    parser.add_argument("--gate-source", type=Path, help="Python file defining Net")
+    parser.add_argument("--gate-class", default="Net")
     parser.add_argument("--checkpoint", type=Path, help="Existing gate checkpoint to resume")
     parser.add_argument(
         "--data-source",

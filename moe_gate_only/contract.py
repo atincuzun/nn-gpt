@@ -39,7 +39,7 @@ Gates are supplied to :func:`moe_gate_only.install_gates` (or
 from __future__ import annotations
 
 
-def compile_gate_from_string(code_string: str, class_name: str = "LLMGeneratedGate") -> type:
+def compile_gate_from_string(code_string: str, class_name: str = "Net") -> type:
     """Compile a PyTorch ``nn.Module`` class from a Python code string.
 
     Parameters
@@ -58,7 +58,7 @@ def compile_gate_from_string(code_string: str, class_name: str = "LLMGeneratedGa
     Example
     -------
     >>> code = '''
-    ... class LLMGeneratedGate(nn.Module):
+    ... class Net(nn.Module):
     ...     def __init__(self, model_dim, num_experts):
     ...         super().__init__()
     ...         self.proj = nn.Linear(model_dim, num_experts)
