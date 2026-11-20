@@ -17,10 +17,36 @@ from .context import (
     _release_cuda_memory,
     _ts,
 )
+from .code_normalization import unescape_single_line_code
 from .eval_safety import _moe_cv_eval_environment
 from .feedback import _build_gate_feedback_summary, feedback_record
 from .morphism import _seed_all
 from .records import _harvest_epoch_metrics, _write_gate_record
+
+
+def _normalize_escaped_generated_code(epoch_path: Path) -> int:
+    """Unescape single-line ``new_nn.py`` payloads that still compile.
+
+    Only files with no real newline are candidates, and the recovered text
+    must parse before it replaces the model output, so legitimate backslashes
+    in normal code are never rewritten.
+    """
+    fixed = 0
+    for path in sorted((Path(epoch_path) / "synth_nn").glob("B*/new_nn.py")):
+        original = path.read_text(encoding="utf-8")
+        recovered = unescape_single_line_code(original)
+        if recovered == original:
+            continue
+        try:
+            compile(recovered, str(path), "exec")
+        except SyntaxError:
+            continue
+        path.write_text(recovered, encoding="utf-8")
+        fixed += 1
+        print(
+            f"[MOE CODE] {path.parent.name}: expanded escaped newlines in {path.name}"
+        )
+    return fixed
 
 
 def _run_epochs(ctx: RunContext) -> list[Path]:
@@ -106,6 +132,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             1,
             legacy_prompt_selection=True,
         )
+        _normalize_escaped_generated_code(epoch_path)
         with _moe_cv_eval_environment():
             _evaluate_epoch(
                 epoch,

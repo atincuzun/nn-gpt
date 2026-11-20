@@ -8,6 +8,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from .code_normalization import unescape_single_line_code
 from .gate_prompt import (
     gate_prompt_scope,
     gate_proposal_prompt,
@@ -171,17 +172,22 @@ def _generate_gate(
         # A single generation can yield several parseable strings; every valid
         # distinct one is harvested, not just the first.
         for candidate in _gate_candidates(raw):
-            try:
-                _validate_gate_source(candidate, shapes)
-            except Exception as exc:
-                errors.append(str(exc))
-                continue
-            if is_duplicate_gate(candidate, seen):
-                errors.append("structurally identical to an earlier gate candidate")
-                continue
-            seen.add(structural_hash(candidate))
-            harvested.append(candidate)
-            new_this_attempt += 1
+            sources = [candidate]
+            recovered = unescape_single_line_code(candidate)
+            if recovered != candidate:
+                sources.append(recovered)
+            for source in sources:
+                try:
+                    _validate_gate_source(source, shapes)
+                except Exception as exc:
+                    errors.append(str(exc))
+                    continue
+                if is_duplicate_gate(source, seen):
+                    errors.append("structurally identical to an earlier gate candidate")
+                    continue
+                seen.add(structural_hash(source))
+                harvested.append(source)
+                new_this_attempt += 1
         if harvested and new_this_attempt == 0:
             break  # productive streak drained; stop polishing
         if not harvested:
