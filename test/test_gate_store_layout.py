@@ -73,7 +73,7 @@ def test_write_gate_record_is_the_only_gate_json(tmp_path: Path):
     assert record["nn"]["id"]
     assert record["stats"][0]["accuracy"] == 0.5
     assert record["stats"][0]["model"] == record["nn"]["name"]
-    assert record["stats"][0]["train_stat"]["train_accuracy"] == 0.5
+    assert record["stats"][0]["train_stat"]["train_accuracy"] is None
     assert not (gate / "summary.json").exists()
 
 
@@ -161,3 +161,47 @@ def test_unmeasured_gate_is_not_archived(tmp_path: Path):
 
     assert (store / "gate_000" / "record.json").is_file()
     assert not (tmp_path / "archive").exists()
+
+
+def test_running_gate_is_not_best_or_pairable(tmp_path: Path):
+    """A gate killed mid-run must never win best_gate or form a Phase B pair.
+
+    Incremental writes leave ``running: True`` on disk after each epoch.  If
+    the process dies, that record stays forever.  Without the running filter,
+    a gate scored on 1 of 4 epochs would beat a complete gate scored on all
+    4, poison carry-forward, and corrupt Phase B pairs.
+    """
+    from moe_cycle.gate_pairs import build_gate_pairs
+    from moe_cycle.gate_store import best_gate, write_gate_record
+
+    store = tmp_path / "store"
+
+    # A running gate with a lucky 1-epoch score.
+    running_gate = store / "gate_000"
+    running_gate.mkdir(parents=True)
+    (running_gate / "gate.py").write_text(SOURCE, encoding="utf-8")
+    write_gate_record(store, 0, {**_record(0, 0.9), "running": True})
+
+    on_disk = json.loads((running_gate / "record.json").read_text(encoding="utf-8"))
+    assert on_disk["running"] is True
+    assert on_disk["status"] == "running"
+
+    # A finished gate with a lower but complete score.
+    finished_gate = store / "gate_001"
+    finished_gate.mkdir(parents=True)
+    (finished_gate / "gate.py").write_text(SOURCE, encoding="utf-8")
+    write_gate_record(store, 1, _record(1, 0.5))
+
+    # The running gate must be invisible to selection and pairing.
+    best = best_gate(store)
+    assert best is not None
+    assert best["gate_id"] == 1
+    assert best["score"]["accuracy"] == 0.5
+
+    pairs = build_gate_pairs(store)
+    running_ids = {
+        gate_id
+        for pair in pairs
+        for gate_id in (pair["lower_gate_id"], pair["higher_gate_id"])
+    }
+    assert 0 not in running_ids

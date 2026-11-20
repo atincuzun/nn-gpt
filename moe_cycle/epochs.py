@@ -354,13 +354,19 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
 
     return epoch_paths
 def _save_latest_weights(ctx: RunContext) -> Path | None:
-    """Atomically replace ``<gate>/weights`` with the current trained gate."""
+    """Atomically replace ``<gate>/weights`` with the current trained gate.
+
+    The previous checkpoint is renamed aside before the new one moves in, so
+    a failure at any point leaves either the old or the new weights on disk
+    — never neither.
+    """
     from .gate_store import WEIGHTS_DIR
 
     if ctx.candidate_root is None:
         return None
     target = ctx.candidate_root / WEIGHTS_DIR
     temporary = ctx.candidate_root / f".{WEIGHTS_DIR}.tmp"
+    backup = ctx.candidate_root / f".{WEIGHTS_DIR}.bak"
     if temporary.exists():
         shutil.rmtree(temporary)
     try:
@@ -368,9 +374,13 @@ def _save_latest_weights(ctx: RunContext) -> Path | None:
         if not temporary.exists():
             return None
         if target.exists():
-            shutil.rmtree(target)
+            target.rename(backup)
         temporary.rename(target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
+        if not target.exists() and backup.exists():
+            backup.rename(target)
         raise
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
     return target

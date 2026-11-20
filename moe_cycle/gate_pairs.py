@@ -33,6 +33,8 @@ def eligible_gates(root, *, required_match: tuple[str, ...] = PAIR_REQUIRED_MATC
     gates = []
     for summary in load_gate_summaries(root):
         score = summary.get("score") or {}
+        if summary.get("running"):
+            continue
         if not score.get("eligible"):
             continue
         if not isinstance(score.get("accuracy"), float):

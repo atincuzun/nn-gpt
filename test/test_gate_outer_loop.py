@@ -233,7 +233,7 @@ def test_record_json_is_canonical_and_nn_dataset_ready(tmp_path: Path):
     assert canonical["stats"][0]["metric"] == "cv_accuracy"
     assert canonical["stats"][0]["accuracy"] == 0.4
     assert canonical["stats"][0]["model"] == "moe-gate-" + "a" * 16
-    assert canonical["stats"][0]["train_stat"]["train_accuracy"] == 0.4
+    assert canonical["stats"][0]["train_stat"]["train_accuracy"] is None
 
     assert not (gate_path / "summary.json").exists()
     loaded = load_gate_summaries(root)

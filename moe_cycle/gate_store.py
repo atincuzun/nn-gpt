@@ -259,7 +259,7 @@ def _gate_stats(
             "train_stat": {
                 "train_loss": epoch.get("train_loss"),
                 "test_loss": epoch.get("validation_loss"),
-                "train_accuracy": float(mean),
+                "train_accuracy": None,
                 "epoch_max": epoch_max,
             },
         })
@@ -287,10 +287,10 @@ def build_gate_record(
     failure = record.get("failure")
     if failure:
         status = "failed"
-    elif score.get("eligible"):
-        status = "success"
     elif record.get("running"):
         status = "running"
+    elif score.get("eligible"):
+        status = "success"
     else:
         status = "ineligible"
 
@@ -478,7 +478,8 @@ def best_gate(root: Path) -> dict | None:
     """Highest-scoring eligible gate seen so far, or None during bootstrap."""
     eligible = [
         summary for summary in load_gate_summaries(root)
-        if (summary.get("score") or {}).get("eligible")
+        if not summary.get("running")
+        and (summary.get("score") or {}).get("eligible")
         and isinstance((summary.get("score") or {}).get("accuracy"), float)
     ]
     if not eligible:

@@ -21,6 +21,7 @@ unsloth_compiled_cache/
 **/tokenizer/
 output.log
 stat/
+gate_archive/
 /db/
 path/
 *.safetensors
