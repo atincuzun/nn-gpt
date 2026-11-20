@@ -13,6 +13,7 @@ from .contracts import (
     _Glm4MoeGate,
     _GraniteTopKGate,
     _HashScoreFnGate,
+    _Lfm2TopKGate,
     _LogitsOnlyGate,
     _ScoreFnTopKGate,
     _SigmoidTopKGate,
@@ -92,6 +93,11 @@ def _wrap_gate_for_contract(
     post = _detect_post_processing(site.gate)
     if post == "glm4_grouped_topk":
         return _Glm4MoeGate(
+            new_gate,
+            top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
+        )
+    if post == "lfm2_topk":
+        return _Lfm2TopKGate(
             new_gate,
             top_k=_resolve_top_k(site.gate, site.block, site.num_experts, top_k),
         )

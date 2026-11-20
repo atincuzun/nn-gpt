@@ -205,6 +205,42 @@ class _Glm4MoeGate(nn.Module):
         return _glm4_route_from_logits(self, logits, self.top_k)
 
 
+def _is_lfm2_router(gate: nn.Module | None) -> bool:
+    cls = type(gate)
+    return (
+        cls.__module__ == "transformers.models.lfm2_moe.modeling_lfm2_moe"
+        and cls.__name__ == "Lfm2MoeTopKRouter"
+    )
+
+
+class _Lfm2TopKGate(nn.Module):
+    """Preserve LFM2's sigmoid routing, selection bias, and scaling.
+
+    The block passes its ``expert_bias`` buffer into the router; the bias only
+    shifts expert *selection*, while the mixing weights come from the raw
+    sigmoid scores (renormalized only when ``norm_topk_prob`` is set).
+    """
+
+    def __init__(self, new_gate: nn.Module, top_k: int):
+        super().__init__()
+        self.gate = new_gate
+        self.top_k = top_k
+
+    def forward(self, x: torch.Tensor, expert_bias: Optional[torch.Tensor] = None):
+        flat = x.reshape(-1, x.shape[-1])
+        logits = self.gate(_prepare_gate_input(self.gate, flat))
+        scores = logits.sigmoid()
+        if self.use_expert_bias:
+            _, indices = torch.topk(scores + expert_bias, k=self.top_k, dim=-1)
+            weights = torch.gather(scores, dim=1, index=indices).type_as(logits)
+        else:
+            weights, indices = torch.topk(scores, k=self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+        weights = weights * self.routed_scaling_factor
+        return logits, weights, indices
+
+
 class _DeepSeekV2Gate(nn.Module):
     """Preserve DeepSeek-V2 routing for remote and built-in HF models."""
 
@@ -524,6 +560,10 @@ def _detect_post_processing(gate: nn.Module) -> str:
     # Its scatter selects expert groups, not the output tensor's layout.
     if _is_modern_glm4_router(gate):
         return "glm4_grouped_topk"
+    # Runtime tracing cannot see the block-supplied expert bias or the
+    # sigmoid weighting behind the (logits, weights, indices) triple.
+    if _is_lfm2_router(gate):
+        return "lfm2_topk"
 
     cls = type(gate)
     if (

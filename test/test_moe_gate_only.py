@@ -578,6 +578,34 @@ def test_lfm_install_forward():
     _check_install_and_forward("lfm2_moe", _tiny_lfm())
 
 
+def test_lfm_replacement_preserves_native_logits():
+    """Exact step zero needs LFM2's sigmoid scores and block-supplied expert bias."""
+    from moe_cycle.gate_seeds import seed_gate_source
+    from moe_gate_only import MoEGateSession
+
+    torch.manual_seed(42)
+    model = _tiny_lfm().eval()
+    session = MoEGateSession(model)
+    sample = {"input_ids": torch.randint(3, 32, (1, 8))}
+    with torch.no_grad():
+        native = model(**sample).logits.clone()
+    assert len(session.inspect()) > 0
+    with session:
+        session.replace_source(
+            seed_gate_source(0),
+            sample_input=sample,
+            verify=True,
+            dynamic_discovery=False,
+            initialize_from_original=True,
+        )
+        with torch.no_grad():
+            replaced = model(**sample).logits
+        assert torch.equal(native, replaced)
+    with torch.no_grad():
+        assert torch.equal(model(**sample).logits, native)
+    print("  lfm2_moe: step-zero logits exactly equal native")
+
+
 def test_mixtral_install_forward():
     print("Mixtral install + forward:")
     _check_install_and_forward("mixtral", _tiny_mixtral())
