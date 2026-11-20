@@ -128,6 +128,14 @@ def test_moe_wrapper_targets_canonical_tune(monkeypatch):
     assert Tune._evaluate_epoch._moe_original is original
 
 
+def test_moe_eval_environment_exposes_gpu_only_inside_the_context(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("NNGPT_MOE_EVAL_CUDA", "0")
+    with _moe_cv_eval_environment():
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+
+
 def test_moe_inline_evaluation_keeps_batch_precedence_and_does_not_retry_oom(tmp_path, monkeypatch):
     from ab.gpt.util.tune import Tune
 

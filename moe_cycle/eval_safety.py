@@ -111,8 +111,17 @@ def _wrap_evaluate_epoch(original: Callable[..., Any]) -> Callable[..., Any]:
 
 @contextmanager
 def _moe_cv_eval_environment():
-    """Retain the fork's parameter precedence and fixed-batch scoring in MoE."""
+    """Retain the fork's parameter precedence and scoring in MoE.
+
+    ``NNGPT_MOE_EVAL_CUDA`` optionally exposes a GPU to the evaluator
+    subprocess only, so a CPU-resident proposer can still train the
+    generated CV models on a GPU without ChatBot trying to place the LLM
+    there.
+    """
     overrides = {"NNGPT_EVAL_PRM_MODE": "seed", "NNGPT_OOM_RETRY": "0"}
+    eval_cuda = os.environ.get("NNGPT_MOE_EVAL_CUDA", "").strip()
+    if eval_cuda:
+        overrides["CUDA_VISIBLE_DEVICES"] = eval_cuda
     previous = {name: os.environ.get(name) for name in overrides}
     os.environ.update(overrides)
     try:
