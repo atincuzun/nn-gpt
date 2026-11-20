@@ -69,7 +69,7 @@ PARENT_SOURCE = seed_gate_source(0)
 SUCCESSOR_SOURCE = """import torch
 import torch.nn as nn
 
-class LLMGeneratedGate(nn.Module):
+class Net(nn.Module):
     def __init__(self, model_dim: int, num_experts: int):
         super().__init__()
         self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -95,7 +95,7 @@ class LLMGeneratedGate(nn.Module):
 REWRITTEN_SOURCE = """import torch
 import torch.nn as nn
 
-class LLMGeneratedGate(nn.Module):
+class Net(nn.Module):
     def __init__(self, model_dim: int, num_experts: int):
         super().__init__()
         self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -151,7 +151,7 @@ def _build_trained_parent_checkpoint(tmp_path: Path):
     with session:
         session.replace_source(
             PARENT_SOURCE,
-            class_name="LLMGeneratedGate",
+            class_name="Net",
             sample_input=sample_input,
             verify=True,
             # The cycle installs and saves with dynamic discovery off; the
@@ -204,7 +204,7 @@ def test_carry_propagates_architecture_weights_and_function(tmp_path: Path) -> N
     with session:
         session.replace_source(
             SUCCESSOR_SOURCE,
-            class_name="LLMGeneratedGate",
+            class_name="Net",
             sample_input=built.sample_input,
             verify=False,
             initialize_from_original=True,
@@ -259,7 +259,7 @@ def test_rewritten_successor_fails_the_parent_function_check(tmp_path: Path) -> 
     with session:
         session.replace_source(
             REWRITTEN_SOURCE,
-            class_name="LLMGeneratedGate",
+            class_name="Net",
             sample_input=built.sample_input,
             verify=False,
             initialize_from_original=True,
@@ -386,7 +386,7 @@ def test_sft_batch_falls_back_when_best_gate_source_is_corrupt(
 ) -> None:
     built = _build_trained_parent_checkpoint(tmp_path / "parent")
     store = _write_best_gate_store(tmp_path / "store", built.checkpoint)
-    (store / "gate_002" / "gate.py").write_text("class LLMGeneratedGate(:\n", encoding="utf-8")
+    (store / "gate_002" / "gate.py").write_text("class Net(:\n", encoding="utf-8")
     ctx = SimpleNamespace(
         gate_root=store, session=built.session, args=_sft_args(store),
         sample_input=built.sample_input,

@@ -48,6 +48,9 @@ class RunContext:
     rematch_for: int | None = None
     gate_pool: list = field(default_factory=list)
     seeded: bool = False
+    seed_name: str | None = None
+    gate_kind: str = "llm"
+    reused_from: int | None = None
     carry_source_id: int | None = None
     parent_logits: Any = None
     carry_forward_metrics: dict | None = None

@@ -27,7 +27,7 @@ def _gate_candidates(raw: str):
         pos for pos in (
             cleaned.find("import torch"),
             cleaned.find("from torch"),
-            cleaned.find("class LLMGeneratedGate"),
+            cleaned.find("class Net"),
         ) if pos >= 0
     ]
     if starts:
@@ -42,7 +42,7 @@ def _gate_candidates(raw: str):
 def _validate_gate_source(
     source: str,
     shapes: list[tuple[int, int]],
-    class_name: str = "LLMGeneratedGate",
+    class_name: str = "Net",
     *,
     require_base: bool = True,
 ) -> None:

@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gate-class",
-        default="LLMGeneratedGate",
+        default="Net",
         help="Class name to load from --gate-source",
     )
     parser.add_argument(
@@ -106,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         "compliant seed gates (50 distinct mechanisms available) instead of LLM "
         "proposals, so the store accumulates scored, valid references before the "
         "proposer generates its own. Use 50 for the full catalog; 0 disables seeding.",
+    )
+    parser.add_argument(
+        "--gate-seed-policy",
+        choices=("reuse", "evaluate"),
+        default="reuse",
+        help="With a persistent gate store, reuse an already measured seed gate "
+        "whose code hash, proposer version and protocol fingerprint match. "
+        "'evaluate' forces a fresh measurement (used for seed materialization).",
     )
     parser.add_argument(
         "--gate-candidates",

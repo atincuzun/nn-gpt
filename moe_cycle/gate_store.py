@@ -2,13 +2,17 @@
 
 One self-contained directory per gate candidate under ``--gate-store``:
 
-    gate_000/
-      gate.py                     canonical proposed source
+    gate-<name>-<md5>/            LEMUR-style content name (seed name or "llm")
+      gate.py                     canonical proposed source (class Net)
       record.json                 canonical gate record (LEMUR-shaped stats)
+      stats.json                  score/protocol/stats export view
       weights/                    latest trained gate checkpoint
       epochs/
         A0/
           synth_nn/B0..B9/        generated CV candidates (NNGPT layout)
+
+``index.json`` maps the numeric runtime gate ids used for ordering to these
+named directories. Legacy ``gate_XXX`` directories remain readable.
 
 ``record.json`` is the only gate-level JSON. It carries the structural hash,
 provenance, aggregate score, LEMUR-shaped ``stats`` rows, per-epoch feedback,
@@ -43,7 +47,9 @@ GATE_RECORD_SCHEMA_VERSION = 2
 GATE_TASK = "moe-gate"
 GATE_METRIC = "cv_accuracy"
 GATE_TRANSFORM = "moe-gate"
-GATE_NN_PREFIX = "moe-gate-"
+GATE_NN_PREFIX = "gate-"
+GATE_INDEX = "index.json"
+STATS_FILE = "stats.json"
 WEIGHTS_DIR = "weights"
 SYNTH_DIR = "synth_nn"
 GATE_ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "gate_archive"
@@ -86,20 +92,104 @@ def structural_hash(source: str) -> str:
     return fingerprint(ast.dump(tree, include_attributes=False))
 
 
-def next_gate_id(root: Path) -> int:
-    """First gate id not already recorded in the store (0 for a fresh store).
+def _load_index(root: Path) -> dict[str, dict]:
+    path = Path(root) / GATE_INDEX
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    Lets a persistent store shared across runs continue its numbering instead
-    of overwriting earlier ``gate_XXX`` directories.
+
+def _write_index(root: Path, index: dict[str, dict]) -> None:
+    write_json(Path(root) / GATE_INDEX, index)
+
+
+def gate_library_name(
+    source: str, *, seed_name: str | None = None, kind: str = "llm",
+) -> str:
+    """LEMUR-style ``gate-<name>-<md5>`` directory name.
+
+    The hash is LEMUR's whitespace-insensitive content id, so the same gate
+    code keeps the same identity across runs and stores.
     """
+    slug = _slug(seed_name, kind) if seed_name else _slug(kind, "llm")
+    return f"{GATE_NN_PREFIX}{slug}-{lemur_id(source)}"
+
+
+def create_gate_entry(
+    root: Path,
+    gate_id: int,
+    source: str,
+    *,
+    seed_name: str | None = None,
+    kind: str = "llm",
+) -> Path:
+    """Create or reuse the named directory for one gate id and index it."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    index = _load_index(root)
+    target = root / gate_library_name(source, seed_name=seed_name, kind=kind)
+    if target.exists():
+        existing = target / "gate.py"
+        same = False
+        if existing.is_file():
+            try:
+                same = lemur_id(existing.read_text(encoding="utf-8")) == lemur_id(source)
+            except OSError:
+                same = False
+        indexed_elsewhere = any(
+            entry.get("directory") == target.name
+            for entry_id, entry in index.items()
+            if str(entry_id) != str(gate_id)
+        )
+        has_record = (target / "record.json").is_file()
+        if (not same or indexed_elsewhere or has_record) and (
+            index.get(str(gate_id), {}).get("directory") != target.name
+        ):
+            target = root / f"{target.name}-g{gate_id}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
+    index = _load_index(root)
+    try:
+        digest = structural_hash(source)
+    except SyntaxError:
+        digest = None
+    index[str(gate_id)] = {
+        "directory": target.name,
+        "name": target.name,
+        "code_hash": lemur_id(source),
+        "structural_hash": digest,
+        "seed_name": seed_name,
+        "kind": kind,
+    }
+    _write_index(root, index)
+    return target
+
+
+def next_gate_id(root: Path) -> int:
+    """First gate id not already recorded in the store (0 for a fresh store)."""
     root = Path(root)
     if not root.is_dir():
         return 0
-    used = {
-        int(match.group(1))
-        for directory in root.glob("gate_*")
-        if (match := re.fullmatch(r"gate_(\d+)", directory.name))
-    }
+    used = {int(key) for key in _load_index(root) if str(key).isdigit()}
+    for directory in root.iterdir():
+        if not directory.is_dir():
+            continue
+        legacy = _gate_number(directory)
+        if legacy is not None:
+            used.add(legacy)
+            continue
+        record_path = directory / "record.json"
+        if record_path.is_file():
+            try:
+                gate_id = json.loads(record_path.read_text(encoding="utf-8")).get("gate_id")
+            except (OSError, ValueError):
+                gate_id = None
+            if isinstance(gate_id, int):
+                used.add(gate_id)
     return max(used) + 1 if used else 0
 
 
@@ -116,7 +206,14 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def gate_dir(root: Path, gate_id: int) -> Path:
-    return Path(root) / f"gate_{gate_id:03d}"
+    root = Path(root)
+    entry = _load_index(root).get(str(gate_id)) or {}
+    directory = entry.get("directory")
+    if directory:
+        path = root / directory
+        if path.is_dir():
+            return path
+    return root / f"gate_{gate_id:03d}"
 
 
 def epoch_dir(root: Path, gate_id: int, epoch: int) -> Path:
@@ -301,7 +398,8 @@ def build_gate_record(
             source = gate_source.read_text(encoding="utf-8")
         except OSError:
             source = None
-    nn_name = _nn_name(digest)
+    nn_name = gate_path.name if gate_path.name.startswith(GATE_NN_PREFIX) else _nn_name(digest)
+    code_hash = lemur_id(source) if source is not None else None
     created_at = (
         record.get("created_at")
         or (record.get("provenance") or {}).get("created_at")
@@ -311,6 +409,10 @@ def build_gate_record(
     canonical.update({
         "schema_version": GATE_RECORD_SCHEMA_VERSION,
         "status": status,
+        "name": nn_name,
+        "code_hash": code_hash,
+        "seed_name": record.get("seed_name"),
+        "kind": record.get("kind") or ("seed" if record.get("seeded") else "llm"),
         "nn": {
             "name": nn_name,
             "code": source,
@@ -366,15 +468,29 @@ def write_gate_record(
     run_root: Path | None = None,
     model: str | None = None,
 ) -> Path:
-    """Write the single canonical ``record.json`` (no legacy sidecars)."""
-    path = gate_dir(root, gate_id) / "record.json"
+    """Write the canonical ``record.json`` and its ``stats.json`` export."""
+    gate_path = gate_dir(root, gate_id)
+    path = gate_path / "record.json"
     record.setdefault("gate_id", gate_id)
+    canonical = build_gate_record(
+        record, gate_path=gate_path, run_root=run_root, model=model,
+    )
+    write_json(path, canonical)
     write_json(
-        path,
-        build_gate_record(
-            record, gate_path=gate_dir(root, gate_id),
-            run_root=run_root, model=model,
-        ),
+        gate_path / STATS_FILE,
+        {
+            "gate_id": canonical.get("gate_id"),
+            "name": canonical.get("name") or gate_path.name,
+            "code_hash": canonical.get("code_hash"),
+            "seeded": canonical.get("seeded"),
+            "task": canonical.get("task"),
+            "dataset": canonical.get("dataset"),
+            "metric": canonical.get("metric"),
+            "protocol": canonical.get("protocol"),
+            "score": canonical.get("score"),
+            "stats": canonical.get("stats"),
+            "epochs": canonical.get("epochs"),
+        },
     )
     return path
 
@@ -397,10 +513,11 @@ def load_gate_summaries(root: Path) -> list[dict]:
     root = Path(root)
     if not root.is_dir():
         return []
-    directories = sorted(
-        (path for path in root.glob("gate_*") if _gate_number(path) is not None),
-        key=lambda path: _gate_number(path) or 0,
-    )
+    directories = [
+        path for path in root.iterdir()
+        if path.is_dir()
+        and (path.name.startswith(GATE_NN_PREFIX) or _gate_number(path) is not None)
+    ]
     summaries = []
     for directory in directories:
         data = None
@@ -435,6 +552,7 @@ def load_gate_summaries(root: Path) -> list[dict]:
                 except (OSError, ValueError):
                     pass
         summaries.append(data)
+    summaries.sort(key=lambda summary: summary.get("gate_id", 0))
     return summaries
 
 
@@ -451,7 +569,11 @@ def backfill_gate_records(
     """
     root = Path(root)
     written: list[Path] = []
-    for directory in sorted(root.glob("gate_*")):
+    for directory in sorted(
+        path for path in root.iterdir()
+        if path.is_dir()
+        and (path.name.startswith(GATE_NN_PREFIX) or _gate_number(path) is not None)
+    ):
         if (directory / "record.json").is_file():
             continue
         summary_path = directory / "summary.json"
@@ -472,6 +594,40 @@ def backfill_gate_records(
             root, gate_id, record, run_root=run_root, model=model,
         ))
     return written
+
+
+def find_reusable_seed(
+    root: Path,
+    source: str,
+    *,
+    llm_version: str,
+    protocol: dict,
+    require_weights: bool = True,
+) -> tuple[dict, Path] | None:
+    """An eligible seed record measured under identical conditions, if any.
+
+    The cache key is the LEMUR code hash plus the proposer version and the
+    full protocol fingerprint (model, dataset, epochs, prompts, gate steps).
+    A score measured under different conditions must never be reused.
+    """
+    code_hash = lemur_id(source)
+    protocol_hash = (protocol or {}).get("fingerprint")
+    for summary in load_gate_summaries(root):
+        if not summary.get("seeded"):
+            continue
+        if summary.get("code_hash") != code_hash:
+            continue
+        if summary.get("llm_version") != llm_version:
+            continue
+        if protocol_hash and (summary.get("protocol") or {}).get("fingerprint") != protocol_hash:
+            continue
+        if (summary.get("score") or {}).get("eligible") is not True:
+            continue
+        gate_path = gate_dir(root, summary.get("gate_id"))
+        if require_weights and not _is_checkpoint(gate_path / WEIGHTS_DIR):
+            continue
+        return summary, gate_path
+    return None
 
 
 def best_gate(root: Path) -> dict | None:
@@ -524,12 +680,18 @@ def archive_gate(
         archive_root
         / _slug(model, "model")
         / _slug(run_name, "run")
-        / f"gate_{gate_id:03d}"
+        / Path(candidate_root).name
     )
     try:
         target.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target / "gate.py")
         shutil.copy2(record_path, target / "record.json")
+        stats_path = Path(candidate_root) / STATS_FILE
+        if stats_path.is_file():
+            shutil.copy2(stats_path, target / STATS_FILE)
+        weights_path = Path(candidate_root) / WEIGHTS_DIR
+        if weights_path.is_dir():
+            shutil.copytree(weights_path, target / WEIGHTS_DIR, dirs_exist_ok=True)
     except OSError as exc:
         print(f"[GATE ARCHIVE] gate {gate_id:03d} archive skipped: {exc}")
         return None

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from manual_fresh_gate import LLMGeneratedGate
+from manual_fresh_gate import Net
 from moe_cycle.candidates import _install_and_verify
 from moe_cycle.cli import parse_args
 from moe_cycle.gate_source import _validate_gate_source
@@ -37,7 +37,7 @@ def test_fresh_source_needs_explicit_mode():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fresh_gate_shapes_and_immediate_gradients(dtype):
     torch.manual_seed(42)
-    gate = LLMGeneratedGate(2048, 64).to(dtype=dtype)
+    gate = Net(2048, 64).to(dtype=dtype)
     assert not hasattr(gate, "base")
     assert gate.output.weight.count_nonzero() > 0
     x = torch.randn(2, 3, 2048, dtype=dtype)

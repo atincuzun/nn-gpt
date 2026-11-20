@@ -36,7 +36,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -57,7 +57,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -77,7 +77,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -97,7 +97,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -116,7 +116,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -137,7 +137,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -156,7 +156,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -177,7 +177,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -199,7 +199,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -221,7 +221,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -242,7 +242,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -262,7 +262,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -282,7 +282,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -303,7 +303,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -321,7 +321,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -340,7 +340,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -361,7 +361,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -383,7 +383,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -404,7 +404,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -425,7 +425,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -445,7 +445,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -465,7 +465,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -488,7 +488,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -506,7 +506,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -528,7 +528,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -551,7 +551,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -570,7 +570,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -591,7 +591,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -612,7 +612,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -634,7 +634,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -653,7 +653,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -674,7 +674,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -695,7 +695,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -716,7 +716,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -737,7 +737,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -757,7 +757,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -775,7 +775,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -796,7 +796,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -816,7 +816,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -836,7 +836,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -859,7 +859,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -877,7 +877,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -901,7 +901,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -921,7 +921,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -942,7 +942,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -963,7 +963,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -982,7 +982,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -1003,7 +1003,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -1024,7 +1024,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)
@@ -1045,7 +1045,7 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
             import torch
             import torch.nn as nn
 
-            class LLMGeneratedGate(nn.Module):
+            class Net(nn.Module):
                 def __init__(self, model_dim: int, num_experts: int):
                     super().__init__()
                     self.base = nn.Linear(model_dim, num_experts, bias=False)

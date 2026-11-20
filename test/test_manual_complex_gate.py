@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from manual_complex_gate import LLMGeneratedGate
+from manual_complex_gate import Net
 from moe_cycle.gate_source import _validate_gate_source
 from moe_gate_only.contract import compile_gate_from_string
 from moe_gate_only.contracts import _DeepSeekV2Gate
@@ -15,7 +15,7 @@ from moe_gate_only.morphism import initialize_gate_from_projection
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_native_initialization_shapes_and_reload(model_dim, num_experts, dtype):
     torch.manual_seed(42)
-    gate = LLMGeneratedGate(model_dim, num_experts).to(dtype=dtype)
+    gate = Net(model_dim, num_experts).to(dtype=dtype)
     weight = torch.randn(num_experts, model_dim, dtype=dtype)
     initialize_gate_from_projection(gate, weight)
     for shape in [(model_dim,), (6, model_dim), (2, 3, model_dim)]:
@@ -26,7 +26,7 @@ def test_native_initialization_shapes_and_reload(model_dim, num_experts, dtype):
             assert output.shape == (*shape[:-1], num_experts)
             assert torch.isfinite(output).all()
             assert torch.equal(output, F.linear(x, weight))
-    restored = LLMGeneratedGate(model_dim, num_experts).to(dtype=dtype)
+    restored = Net(model_dim, num_experts).to(dtype=dtype)
     restored.load_state_dict(gate.state_dict())
     assert torch.equal(restored(x), gate(x))
 
@@ -40,7 +40,7 @@ def test_manual_source_passes_cycle_validator_and_loader():
 
 def test_correction_and_hidden_layers_learn_without_changing_base():
     torch.manual_seed(42)
-    gate = LLMGeneratedGate(32, 4)
+    gate = Net(32, 4)
     gate.base.requires_grad_(False)
     original_base = gate.base.weight.detach().clone()
     optimizer = torch.optim.SGD(gate.parameters(), lr=0.1)
@@ -68,7 +68,7 @@ def test_correction_and_hidden_layers_learn_without_changing_base():
 
 def test_deepseek_wrapper_preserves_native_routing_at_initialization():
     torch.manual_seed(42)
-    gate = LLMGeneratedGate(2048, 64)
+    gate = Net(2048, 64)
     weight = torch.randn(64, 2048) * 0.02
     initialize_gate_from_projection(gate, weight)
     wrapped = _DeepSeekV2Gate(gate, top_k=6)

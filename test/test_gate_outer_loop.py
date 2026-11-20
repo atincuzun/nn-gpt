@@ -37,7 +37,7 @@ from moe_cycle.gate_store import (
 
 GATE_SOURCE = (
     "import torch\nimport torch.nn as nn\n\n"
-    "class LLMGeneratedGate(nn.Module):\n"
+    "class Net(nn.Module):\n"
     "    def __init__(self, model_dim: int, num_experts: int):\n"
     "        super().__init__()\n"
     "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
@@ -135,7 +135,7 @@ def _write_gate(root, gate_id, accuracy, *, eligible=True, source=None,
         # same-architecture reruns by structural hash, so a shared default
         # source would silently empty the pair set.
         source = GATE_SOURCE.replace(
-            "class LLMGeneratedGate", f"class LLMGeneratedGateV{gate_id}"
+            "class Net", f"class NetV{gate_id}"
         )
     record = {
         "gate_id": gate_id,
@@ -164,7 +164,7 @@ def test_record_json_is_canonical_and_nn_dataset_ready(tmp_path: Path):
     gate_path.mkdir(parents=True)
     source = (
         "import torch\nimport torch.nn as nn\n\n"
-        "class LLMGeneratedGate(nn.Module):\n"
+        "class Net(nn.Module):\n"
         "    def __init__(self, model_dim, num_experts):\n"
         "        super().__init__()\n"
         "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
@@ -219,7 +219,7 @@ def test_record_json_is_canonical_and_nn_dataset_ready(tmp_path: Path):
     assert canonical["status"] == "success"
     assert "gate_code" not in canonical
     assert canonical["nn"] == {
-        "name": "moe-gate-" + "a" * 16,
+        "name": "gate-" + "a" * 16,
         "code": source,
         "id": lemur_id(source),
         "code_file": "gate.py",
@@ -232,7 +232,7 @@ def test_record_json_is_canonical_and_nn_dataset_ready(tmp_path: Path):
     assert canonical["stats"][0]["task"] == "moe-gate"
     assert canonical["stats"][0]["metric"] == "cv_accuracy"
     assert canonical["stats"][0]["accuracy"] == 0.4
-    assert canonical["stats"][0]["model"] == "moe-gate-" + "a" * 16
+    assert canonical["stats"][0]["model"] == "gate-" + "a" * 16
     assert canonical["stats"][0]["train_stat"]["train_accuracy"] is None
 
     assert not (gate_path / "summary.json").exists()
@@ -343,7 +343,7 @@ def test_proposal_prompt_includes_reference_pairing():
         [(8, 4)], reference_source=GATE_SOURCE,
         reference_accuracy=0.45, goal_accuracy=0.52, dataset="cifar-10",
     )
-    assert "<gate>" in prompt and "LLMGeneratedGate" in prompt
+    assert "<gate>" in prompt and "Net" in prompt
     assert "self.base = nn.Linear" in prompt
     assert GATE_SOURCE.strip() in prompt           # reference present
     assert "0.4500" in prompt                      # reference score
@@ -399,7 +399,7 @@ def test_prompt_states_the_contract_and_leaves_the_architecture_open():
     prompt = gate_proposal_prompt([(2048, 64)])
     assert len(prompt) < 5000, "prompt over-specified for the proposal context"
     # The seam.
-    assert "LLMGeneratedGate(nn.Module)" in prompt
+    assert "Net(nn.Module)" in prompt
     assert "__init__(self, model_dim: int, num_experts: int)" in prompt
     assert "self.base = nn.Linear(model_dim, num_experts, bias=False)" in prompt
     assert "Input shape:" in prompt and "Output shape:" in prompt
@@ -427,7 +427,7 @@ def test_baseline_gate_satisfies_the_contract():
 
     namespace = {}
     exec(compile(BASELINE_GATE_CODE, "<baseline>", "exec"), namespace)
-    gate = namespace["LLMGeneratedGate"](8, 4)
+    gate = namespace["Net"](8, 4)
     assert isinstance(gate, nn.Module)
     assert torch.equal(gate(torch.zeros(2, 8)), torch.zeros(2, 4))
     assert not is_duplicate_gate(BASELINE_GATE_CODE, set())
@@ -579,7 +579,7 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
             layers=None,
             router_top_k=None,
             gate_source=None,
-            gate_class="LLMGeneratedGate",
+            gate_class="Net",
             gate_init_noise_scale=0.0,
             gate_random_init=True,
             load_in_8bit=False,
@@ -591,7 +591,7 @@ def test_random_init_skips_the_native_weight_copy(monkeypatch, tmp_path):
         native_logits = torch.zeros(1)
         native_repeatable = True
         native_repeat_max_abs_difference = 0.0
-        gate_source = "class LLMGeneratedGate: pass"
+        gate_source = "class Net: pass"
         candidate_index = 0
 
     monkeypatch.setattr(
@@ -789,7 +789,7 @@ def test_seed_gates_satisfy_the_llm_proposal_validator():
         hashes.add(structural_hash(source))
         namespace: dict = {}
         exec(compile(source, "<seed>", "exec"), namespace)
-        gate_cls = namespace["LLMGeneratedGate"]
+        gate_cls = namespace["Net"]
         for model_dim, num_experts in ((2048, 64), (512, 8)):
             gate = gate_cls(model_dim, num_experts).float().eval()
             sample = torch.randn(2, 3, model_dim)
@@ -825,12 +825,14 @@ def test_seed_candidates_prepare_without_llm(tmp_path: Path, monkeypatch):
         "moe_cycle.candidates._initial_feedback_summary", lambda source: ""
     )
     _prepare_seed_candidate(ctx, 1)
-    assert (tmp_path / "gate_001" / "gate.py").is_file()
+    seed_root = next(tmp_path.glob("gate-*"))
+    assert seed_root.name.startswith("gate-02-bottleneck-quarter-gelu-")
+    assert (seed_root / "gate.py").is_file()
     assert ctx.seeded is True
-    source = (tmp_path / "gate_001" / "gate.py").read_text(encoding="utf-8")
+    source = (seed_root / "gate.py").read_text(encoding="utf-8")
     namespace = {}
     exec(compile(source, "<seed>", "exec"), namespace)
-    gate = namespace["LLMGeneratedGate"](2048, 64).float().eval()
+    gate = namespace["Net"](2048, 64).float().eval()
     with torch.no_grad():
         out = gate(torch.randn(2, 2048))
     assert out.shape == (2, 64) and torch.isfinite(out).all()

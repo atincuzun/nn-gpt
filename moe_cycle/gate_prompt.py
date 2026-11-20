@@ -25,7 +25,7 @@ GATE_SYSTEM_PROMPT = (
 BASELINE_GATE_CODE = (
     "import torch\n"
     "import torch.nn as nn\n\n"
-    "class LLMGeneratedGate(nn.Module):\n"
+    "class Net(nn.Module):\n"
     "    def __init__(self, model_dim: int, num_experts: int):\n"
     "        super().__init__()\n"
     "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
@@ -149,7 +149,7 @@ def gate_proposal_prompt(
         parts.append(reference_sentence)
     parts.append("")
     parts.append("Gate contract:")
-    parts.append("""* Define `class LLMGeneratedGate(nn.Module)` with:
+    parts.append("""* Define `class Net(nn.Module)` with:
   `__init__(self, model_dim: int, num_experts: int)`
 
 * Define:

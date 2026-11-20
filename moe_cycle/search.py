@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from argparse import Namespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from .context import (
     _ts,
 )
 from .epochs import _run_epochs
-from .gate_store import structural_hash
+from .gate_store import find_reusable_seed, protocol_metadata, structural_hash
 from .morphism import _model_logits
 from .phase_b_runner import _run_sft_batch_under_best_gate
 from .records import _record_failed_candidate, _write_gate_record
@@ -99,6 +100,9 @@ def _run_candidate_once(
     ctx.goal_accuracy = None
     ctx.gate_epoch_metrics = []
     ctx.seeded = False
+    ctx.seed_name = None
+    ctx.gate_kind = "llm"
+    ctx.reused_from = None
     ctx.carry_source_id = None
     ctx.parent_logits = None
     ctx.carry_forward_metrics = None
@@ -190,7 +194,30 @@ def _run_candidate_once(
                 f"proposer={ctx.llm_version}"
             )
             _install_and_verify(ctx)
-            epoch_paths = _run_epochs(ctx)
+            epoch_paths = []
+            reusable = None
+            if seed and getattr(args, "gate_seed_policy", "reuse") == "reuse":
+                reusable = find_reusable_seed(
+                    ctx.gate_root, ctx.gate_source,
+                    llm_version=ctx.llm_version,
+                    protocol=protocol_metadata(args),
+                )
+            if reusable is not None:
+                cached, cached_path = reusable
+                weights = cached_path / "weights"
+                ctx.session.load_weights(weights)
+                ctx.gate_epoch_metrics = [
+                    dict(epoch) for epoch in cached.get("epochs") or []
+                ]
+                ctx.reused_from = cached.get("gate_id")
+                if ctx.candidate_root != cached_path:
+                    shutil.copytree(weights, ctx.candidate_root / "weights", dirs_exist_ok=True)
+                print(
+                    f"[GATE SEARCH] gate {gate_id:03d} reuses measured seed "
+                    f"gate_{ctx.reused_from:03d} ({cached_path.name})"
+                )
+            else:
+                epoch_paths = _run_epochs(ctx)
         record = _write_gate_record(ctx)
         score = record["score"]
         accuracy = score.get("accuracy")

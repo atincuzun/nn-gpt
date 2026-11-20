@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import shutil
+
 from typing import Any
 
 from .context import (
@@ -12,7 +15,12 @@ from .context import (
 )
 from .gate_seeds import seed_gate_name, seed_gate_source
 from .gate_source import _generate_gate, _validate_gate_source
-from .gate_store import best_gate, gate_dir, latest_trained_checkpoint
+from .gate_store import (
+    best_gate,
+    create_gate_entry,
+    gate_dir,
+    latest_trained_checkpoint,
+)
 from .morphism import (
     _model_logits,
     _perturb_gate_weights,
@@ -77,8 +85,18 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             )
     else:
         ctx.proposal_prompt = "[pooled valid gate from an earlier proposal round]"
+    final_root = create_gate_entry(ctx.gate_root, candidate_index, source, kind="llm")
+    if final_root != ctx.candidate_root:
+        final_root.mkdir(parents=True, exist_ok=True)
+        for child in list(ctx.candidate_root.iterdir()):
+            shutil.move(str(child), final_root / child.name)
+        ctx.candidate_root.rmdir()
+    ctx.candidate_root = final_root
+    ctx.gate_dir = final_root
     (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
     ctx.gate_source = source
+    ctx.seed_name = None
+    ctx.gate_kind = "llm"
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
     ctx.used_prompts.clear()
 
@@ -118,9 +136,18 @@ def _install_author_gate(ctx: RunContext, author_gate_id: int, *,
             f"Author gate checkpoint not found under {author_root / 'weights'}"
         )
     session = ctx.session
+    metadata_path = checkpoint / "metadata.json"
+    class_name = getattr(args, "gate_class", "Net")
+    if metadata_path.is_file():
+        try:
+            class_name = json.loads(metadata_path.read_text(encoding="utf-8")).get(
+                "gate_class_name", class_name,
+            )
+        except (OSError, ValueError):
+            pass
     session.replace_source(
         (author_root / "gate.py").read_text(encoding="utf-8"),
-        class_name="LLMGeneratedGate",
+        class_name=class_name,
         layers=args.layers,
         sample_input=ctx.sample_input,
         verify=False,
@@ -173,7 +200,7 @@ def _install_and_verify(ctx: RunContext) -> None:
         class_name=(
             args.gate_class
             if args.gate_source is not None
-            else "LLMGeneratedGate"
+            else "Net"
         ),
         **replace_kwargs,
     )
@@ -288,12 +315,13 @@ def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
     if they ever stop complying.
     """
     ctx.candidate_index = gate_id
-    ctx.candidate_root = gate_dir(ctx.gate_root, gate_id)
-    ctx.gate_dir = ctx.candidate_root
-    ctx.candidate_root.mkdir(parents=True, exist_ok=True)
     source = seed_gate_source(gate_id)
     _validate_gate_source(source, ctx.shapes)
-    (ctx.candidate_root / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
+    ctx.candidate_root = create_gate_entry(
+        ctx.gate_root, gate_id, source,
+        seed_name=seed_gate_name(gate_id), kind="seed",
+    )
+    ctx.gate_dir = ctx.candidate_root
     ctx.proposal_prompt = (
         f"[cold-start bootstrap] built-in seed gate '{seed_gate_name(gate_id)}' "
         "installed without an LLM proposal"
@@ -301,6 +329,8 @@ def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
     ctx.proposal_attempts = []
     ctx.gate_source = source
     ctx.seeded = True
+    ctx.seed_name = seed_gate_name(gate_id)
+    ctx.gate_kind = "seed"
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
     ctx.used_prompts.clear()
     print(
@@ -316,18 +346,18 @@ def _prepare_rematch_candidate(ctx: RunContext, gate_id: int, source_gate_id: in
     exists precisely to re-score the incumbent under the current proposer.
     """
     ctx.candidate_index = gate_id
-    ctx.candidate_root = gate_dir(ctx.gate_root, gate_id)
-    ctx.gate_dir = ctx.candidate_root
-    ctx.candidate_root.mkdir(parents=True, exist_ok=True)
     source_file = gate_dir(ctx.gate_root, source_gate_id) / "gate.py"
     source = source_file.read_text(encoding="utf-8")
-    (ctx.candidate_root / "gate.py").write_text(source, encoding="utf-8")
+    ctx.candidate_root = create_gate_entry(ctx.gate_root, gate_id, source, kind="rematch")
+    ctx.gate_dir = ctx.candidate_root
     ctx.proposal_prompt = (
         f"[rematch] re-measuring gate {source_gate_id:03d} under proposer "
         f"{ctx.llm_version}"
     )
     ctx.proposal_attempts = []
     ctx.gate_source = source
+    ctx.seed_name = None
+    ctx.gate_kind = "rematch"
     ctx.reference_gate_id = source_gate_id
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
     ctx.used_prompts.clear()

@@ -232,7 +232,7 @@ def test_validate_args_carry_forward_rejects_init_noise() -> None:
 def test_gate_prompt_inherit_mode_extends_reference() -> None:
     prompt = gate_proposal_prompt(
         [(4, 3)],
-        reference_source="class LLMGeneratedGate:\n    pass",
+        reference_source="class Net:\n    pass",
         reference_accuracy=0.4,
         goal_accuracy=0.4,
         dataset="cifar-10",
@@ -246,7 +246,7 @@ def test_gate_prompt_inherit_mode_extends_reference() -> None:
 
     plain = gate_proposal_prompt(
         [(4, 3)],
-        reference_source="class LLMGeneratedGate:\n    pass",
+        reference_source="class Net:\n    pass",
         reference_accuracy=0.4,
         inherit_reference=False,
     )

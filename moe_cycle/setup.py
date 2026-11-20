@@ -103,10 +103,10 @@ def _setup_run(args: Namespace) -> RunContext:
     gate_root = (
         args.gate_store.resolve()
         if args.gate_store is not None
-        else nngpt_dir / "gates"
+        else Path(__file__).resolve().parents[1] / "gate_library"
     )
     gate_root.mkdir(parents=True, exist_ok=True)
-    if args.gate_store is not None and any(gate_root.glob("gate_*")):
+    if any(gate_root.glob("gate_*")) or any(gate_root.glob("gate-*")):
         print(
             f"[GATE SEARCH] persistent store: continuing from existing records in {gate_root}"
         )
@@ -211,8 +211,8 @@ def _setup_run(args: Namespace) -> RunContext:
     if getattr(args, "gate_outer_sft", False):
         # Tune.py L1139-1142 pattern: continue from the newest persisted
         # proposer adapter so outer-loop weights compound across runs.
-        if args.gate_store is not None and not args.gate_fresh_proposer:
-            persisted = args.gate_store.resolve() / "proposer"
+        if not args.gate_fresh_proposer:
+            persisted = gate_root / "proposer"
             if (persisted / "adapter" / "adapter_config.json").is_file():
                 merge_from = persisted / "adapter"
                 lineage_file = persisted / "lineage.json"

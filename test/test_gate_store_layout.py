@@ -13,7 +13,7 @@ from moe_cycle.gate_store import (
 SOURCE = (
     "import torch\n"
     "import torch.nn as nn\n\n"
-    "class LLMGeneratedGate(nn.Module):\n"
+    "class Net(nn.Module):\n"
     "    def __init__(self, model_dim, num_experts):\n"
     "        super().__init__()\n"
     "        self.base = nn.Linear(model_dim, num_experts, bias=False)\n"
@@ -205,3 +205,55 @@ def test_running_gate_is_not_best_or_pairable(tmp_path: Path):
         for gate_id in (pair["lower_gate_id"], pair["higher_gate_id"])
     }
     assert 0 not in running_ids
+
+
+def test_create_gate_entry_uses_lemur_name_and_index(tmp_path: Path):
+    from moe_cycle.gate_store import create_gate_entry, gate_dir, gate_library_name
+
+    store = tmp_path / "store"
+    path = create_gate_entry(
+        store, 0, SOURCE, seed_name="01-additive-mlp-gelu", kind="seed",
+    )
+    assert path.name == gate_library_name(
+        SOURCE, seed_name="01-additive-mlp-gelu", kind="seed",
+    )
+    assert path.name.startswith("gate-01-additive-mlp-gelu-")
+    assert gate_dir(store, 0) == path
+    assert (path / "gate.py").is_file()
+
+    write_gate_record(store, 0, _record(0, 0.5))
+    assert (path / "stats.json").is_file()
+
+    second = create_gate_entry(
+        store, 1, SOURCE, seed_name="01-additive-mlp-gelu", kind="seed",
+    )
+    assert second != path
+    assert second.name.endswith("-g1")
+
+
+def test_find_reusable_seed_requires_matching_protocol_and_weights(tmp_path: Path):
+    from moe_cycle.gate_store import create_gate_entry, find_reusable_seed
+
+    store = tmp_path / "store"
+    path = create_gate_entry(store, 0, SOURCE, seed_name="01-additive-mlp-gelu", kind="seed")
+    weights = path / "weights"
+    weights.mkdir()
+    (weights / "metadata.json").write_text("{}", encoding="utf-8")
+    (weights / "gate_weights.pt").write_bytes(b"")
+    write_gate_record(store, 0, {
+        **_record(0, 0.5),
+        "seeded": True,
+        "llm_version": "model-v1",
+        "protocol": {"fingerprint": "protocol-1"},
+    })
+
+    hit = find_reusable_seed(
+        store, SOURCE, llm_version="model-v1", protocol={"fingerprint": "protocol-1"},
+    )
+    assert hit is not None and hit[1] == path
+    assert find_reusable_seed(
+        store, SOURCE, llm_version="model-v2", protocol={"fingerprint": "protocol-1"},
+    ) is None
+    assert find_reusable_seed(
+        store, SOURCE, llm_version="model-v1", protocol={"fingerprint": "protocol-2"},
+    ) is None

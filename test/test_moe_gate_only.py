@@ -646,7 +646,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class LLMGeneratedGate(nn.Module):
+class Net(nn.Module):
     def __init__(self, model_dim, num_experts):
         super().__init__()
         self.base = nn.Linear(model_dim, num_experts, bias=False)
