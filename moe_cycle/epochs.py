@@ -146,12 +146,109 @@ def _normalize_escaped_generated_code(epoch_path: Path) -> int:
     return fixed
 
 
-def _run_epochs(ctx: RunContext) -> list[Path]:
-    """Run the generation/evaluation/gate-training cycle for each epoch."""
+def _measure_cv_epoch(ctx: RunContext, epoch: int, epoch_path: Path) -> dict:
+    """Generate CV models with the current routing, evaluate them, summarize."""
+    import json as _json
+
+    from ab.gpt.util.Const import nngpt_dir, synth_dir
+    from ab.gpt.util.tune.Tune import _evaluate_epoch, nn_gen
+
+    args = ctx.args
+    _prepare_model_for_generation(ctx)
+    # Candidates are compared on CV accuracy, so a candidate's own gate
+    # code/score must never leak into the prompt it is being scored on;
+    # gate feedback therefore lives only in the outer proposal prompt and
+    # the on-disk records.
+    generation_prompt_dict = _pinned_prompt_dict(
+        ctx.prompt_dict,
+        args.conf_keys,
+        dataset=args.dataset,
+        nn_prefixes=_generation_prefixes(args),
+    )
+    pinned = bool(getattr(args, "pinned_seed_prompts", False))
+    nn_gen(
+        epoch,
+        epoch_path,
+        ctx.chat_bot,
+        tuple(args.conf_keys),
+        args.nn_train_epochs,
+        generation_prompt_dict,
+        args.test_nn,
+        args.generation_max_new_tokens,
+        True,
+        args.nn_name_prefix,
+        args.generation_max_input_length,
+        max(1, int(getattr(args, "generation_batch", 1) or 1)),
+        legacy_prompt_selection=not pinned,
+    )
+    _normalize_escaped_generated_code(epoch_path)
+    _repair_candidate_classifier_widths(epoch_path, args.fixed_eval_hyperparameters)
+    if getattr(args, "gate_eval_seed", None) is not None:
+        # The evaluation forks a worker that inherits this process's RNG
+        # state, so seeding here makes the CV training reproducible and
+        # the same candidate index comparable across gates.
+        _seed_all(args.gate_eval_seed + epoch)
+    with _moe_cv_eval_environment(
+        (args.fixed_eval_hyperparameters or {}).get('transform')
+    ):
+        _evaluate_epoch(
+            epoch,
+            epoch_path,
+            args.nn_name_prefix,
+            args.nn_train_epochs,
+            False,
+            custom_synth_dir=synth_dir(epoch_path),
+            prm_json=args.fixed_eval_hyperparameters,
+            batch=64,  # Fork fallback; seed and explicit overrides still win.
+        )
+
+    # Preserve cycle results written by NNEval.
+    cycle_src = nngpt_dir / "cycle_results.json"
+    if not cycle_src.is_file():
+        raise RuntimeError(f"A{epoch} did not produce cycle_results.json")
+    shutil.copy2(cycle_src, nngpt_dir / f"cycle_results_A{epoch}.json")
+    cycle_results = _json.loads(cycle_src.read_text(encoding="utf-8"))
+    cycle_models_trained = int(
+        cycle_results.get("evaluation", {}).get("models_trained", 0)
+    )
+    cycle_cv_success = bool(cycle_results.get("success")) and cycle_models_trained > 0
+    if not cycle_cv_success:
+        print(
+            f"[epoch={epoch}] No CV candidate trained successfully; "
+            "continuing gate training from existing valid LEMUR examples."
+        )
+
+    gate_feedback = _build_gate_feedback_summary(
+        epoch_path, ctx.used_prompts, cycle_results, ctx.session
+    )
+    # Per-epoch CV receipt: without this line the measured accuracies
+    # live only in the record and every post-run question
+    # ("did this gate measure anything?") means file digging.
+    _mean = gate_feedback["mean_accuracy"]
+    _best = gate_feedback["best_accuracy"]
+    print(
+        f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
+        f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
+        f"measured={gate_feedback['n_measured']}, "
+        f"mean={_mean:.4f} best={_best:.4f}" if _mean is not None else
+        f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
+        f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
+        f"measured=0, mean=n/a best=n/a"
+    )
+    ctx.previous_feedback_summary = gate_feedback["summary"]
+    return {
+        "gate_feedback": gate_feedback,
+        "cycle_results": cycle_results,
+        "cycle_models_trained": cycle_models_trained,
+        "cycle_cv_success": cycle_cv_success,
+    }
+
+
+def _train_gates_epoch(ctx: RunContext, epoch: int, training_prefixes) -> dict:
+    """One inner-epoch gate-training phase; never measures CV accuracy."""
     import torch
 
-    from ab.gpt.util.Const import conf_train_dir, nngpt_dir, synth_dir
-    from ab.gpt.util.tune.Tune import _evaluate_epoch, nn_gen
+    from ab.gpt.util.Const import conf_train_dir
     from moe_gate_only import (
         build_nngenprompt_dataloaders,
         evaluate_language_model_loss,
@@ -159,14 +256,143 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
     )
 
     args = ctx.args
+    session = ctx.session
+    train_prompt_path = conf_train_dir / args.train_prompt_config
+    try:
+        train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
+            ctx.tokenizer,
+            train_prompt_path,
+            context_length=args.max_length,
+            max_prompts=args.max_prompts,
+            max_new_tokens=args.generation_max_new_tokens,
+            batch_size=args.batch_size,
+            validation_fraction=args.validation_fraction,
+            seed=args.seed + epoch,
+            dataset_name=args.dataset,
+            nn_prefixes=training_prefixes,
+        )
+    except ValueError as exc:
+        if "NNGenPrompt produced no usable examples" not in str(exc):
+            raise
+        print(
+            f"[epoch={epoch}] Gate training skipped: {exc}. "
+            "Continuing to the next generation cycle."
+        )
+        return {"skipped": True, "skip_reason": str(exc)}
+
+    train_lengths = [len(row["input_ids"]) for row in train_dataset]
+    train_length_stats = {
+        "minimum": min(train_lengths),
+        "maximum": max(train_lengths),
+        "mean": sum(train_lengths) / len(train_lengths),
+    }
+    print(
+        f"[epoch={epoch}] Gate-training sequences: examples={len(train_dataset)} "
+        f"min={train_length_stats['minimum']} max={train_length_stats['maximum']} "
+        f"mean={train_length_stats['mean']:.1f}; "
+        f"gradient_checkpointing={args.gradient_checkpointing}"
+    )
+
+    if args.gate_outer_search:
+        # CV generation/evaluation consumes RNG; reset before gate training so
+        # each candidate's gate update starts from the same sampling state.
+        _seed_all(args.seed + epoch)
+    session.model.train()
+    session.model.config.use_cache = False
+    if args.gradient_checkpointing:
+        if hasattr(session.model, "gradient_checkpointing_enable"):
+            session.model.gradient_checkpointing_enable()
+        if hasattr(session.model, "enable_input_require_grads"):
+            session.model.enable_input_require_grads()
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    pre_training_vram = _log_cuda_memory(f"epoch={epoch} before gate training")
+
+    def log_step(step: int, loss: float) -> None:
+        print(f"epoch={epoch} gate_step={step:04d} total_loss={loss:.6f}")
+
+    oom_recovered = False
+    try:
+        result, _ = train_gates(
+            session.model,
+            session.installs,
+            train_loader,
+            steps=args.gate_train_steps,
+            learning_rate=args.gate_learning_rate,
+            validation_loader=None,
+            validation_steps=None,
+            auxiliary_loss_fn=None,
+            on_step=log_step,
+        )
+    except torch.cuda.OutOfMemoryError:
+        _log_cuda_memory(f"epoch={epoch} gate-training OOM")
+        print(
+            "[VRAM] Gate-training OOM: 4-bit quantization reduces frozen "
+            "weights but not attention/MLP activations. Harvesting the "
+            "epochs measured so far and stopping this candidate early "
+            "instead of discarding its score; reduce --max-length or "
+            "--batch-size to avoid a recurrence."
+        )
+        _release_cuda_memory()
+        oom_recovered = True
+        result = None
+    post_training_vram = _log_cuda_memory(f"epoch={epoch} after gate training")
+
+    validation_loss = None
+    if val_loader is not None and not oom_recovered:
+        try:
+            validation_loss = evaluate_language_model_loss(
+                session.model,
+                val_loader,
+                max_steps=args.validation_steps,
+            )
+        except torch.cuda.OutOfMemoryError:
+            print(f"[epoch={epoch}] validation-loss evaluation OOM; skipping it")
+            _release_cuda_memory()
+            validation_loss = None
+
+    if args.gradient_checkpointing:
+        if hasattr(session.model, "disable_input_require_grads"):
+            session.model.disable_input_require_grads()
+        if hasattr(session.model, "gradient_checkpointing_disable"):
+            session.model.gradient_checkpointing_disable()
+    # Gate training turned the KV cache off; the next epoch's CV generation
+    # needs it back, otherwise every generated token reprocesses the prompt.
+    session.model.config.use_cache = True
+
+    # Save the single latest trained checkpoint + metrics.
+    _save_latest_weights(ctx)
+    return {
+        "skipped": False,
+        "result": result,
+        "validation_loss": validation_loss,
+        "oom_recovered": oom_recovered,
+        "examples": len(train_dataset),
+        "sequence_lengths": train_length_stats,
+        "vram_before_training": pre_training_vram,
+        "vram_after_training": post_training_vram,
+    }
+
+
+def _run_epochs(ctx: RunContext) -> list[Path]:
+    """Run the generation/evaluation/gate-training cycle for each epoch.
+
+    Each inner epoch measures CV accuracy and trains the gates. By default it
+    measures first, so epoch 0 sees the freshly installed gate. With
+    ``--measure-after-training`` it trains first, so every recorded score
+    reflects the gate after its own training.
+    """
+    args = ctx.args
     outer_mode = args.gate_outer_search
     session = ctx.session
-    chat_bot = ctx.chat_bot
-    tokenizer = ctx.tokenizer
     epoch_paths: list[Path] = []
     ctx.gate_epoch_metrics = []
     training_prefixes = _nas_prefixes(args)
     generation_prefixes = _generation_prefixes(args)
+    measure_after = bool(getattr(args, "measure_after_training", False))
+    from ab.gpt.util.Const import conf_train_dir
+
     train_prompt_path = conf_train_dir / args.train_prompt_config
     if not train_prompt_path.is_file():
         raise FileNotFoundError(f"Train prompt config does not exist: {train_prompt_path}")
@@ -200,116 +426,19 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 install.site.layer_index for install in session.installs
             }
 
-        # ── 1. Generate NN architectures + evaluate (like nn_gen in tune()) ──
-
-        _prepare_model_for_generation(ctx)
-
-        # Candidates are compared on CV accuracy, so a candidate's own gate
-        # code/score must never leak into the prompt it is being scored on;
-        # gate feedback therefore lives only in the outer proposal prompt and
-        # the on-disk records.
-        generation_prompt_dict = _pinned_prompt_dict(
-            ctx.prompt_dict,
-            args.conf_keys,
-            dataset=args.dataset,
-            nn_prefixes=generation_prefixes,
-        )
-        nn_gen(
-            epoch,
-            epoch_path,
-            chat_bot,
-            tuple(args.conf_keys),
-            args.nn_train_epochs,
-            generation_prompt_dict,
-            args.test_nn,
-            args.generation_max_new_tokens,
-            True,
-            args.nn_name_prefix,
-            args.generation_max_input_length,
-            1,
-            legacy_prompt_selection=True,
-        )
-        _normalize_escaped_generated_code(epoch_path)
-        _repair_candidate_classifier_widths(epoch_path, args.fixed_eval_hyperparameters)
-        if getattr(args, "gate_eval_seed", None) is not None:
-            # The evaluation forks a worker that inherits this process's RNG
-            # state, so seeding here makes the CV training reproducible and
-            # the same candidate index comparable across gates.
-            _seed_all(args.gate_eval_seed + epoch)
-        with _moe_cv_eval_environment(
-            (args.fixed_eval_hyperparameters or {}).get('transform')
-        ):
-            _evaluate_epoch(
-                epoch,
-                epoch_path,
-                args.nn_name_prefix,
-                args.nn_train_epochs,
-                False,
-                custom_synth_dir=synth_dir(epoch_path),
-                prm_json=args.fixed_eval_hyperparameters,
-                batch=64,  # Fork fallback; seed and explicit overrides still win.
-            )
-
-        # Preserve cycle results written by NNEval.
-        cycle_src = nngpt_dir / "cycle_results.json"
-        if cycle_src.is_file():
-            shutil.copy2(cycle_src, nngpt_dir / f"cycle_results_A{epoch}.json")
-            cycle_results = json.loads(cycle_src.read_text(encoding="utf-8"))
-            cycle_models_trained = int(
-                cycle_results.get("evaluation", {}).get("models_trained", 0)
-            )
-            cycle_cv_success = bool(cycle_results.get("success")) and cycle_models_trained > 0
-            if not cycle_cv_success:
-                print(
-                    f"[epoch={epoch}] No CV candidate trained successfully; "
-                    "continuing gate training from existing valid LEMUR examples."
-                )
+        if measure_after:
+            training = _train_gates_epoch(ctx, epoch, training_prefixes)
+            _seed_all(args.seed + epoch)
+            measured = _measure_cv_epoch(ctx, epoch, epoch_path)
         else:
-            raise RuntimeError(f"A{epoch} did not produce cycle_results.json")
+            measured = _measure_cv_epoch(ctx, epoch, epoch_path)
+            training = _train_gates_epoch(ctx, epoch, training_prefixes)
+        gate_feedback = measured["gate_feedback"]
+        cycle_results = measured["cycle_results"]
+        cycle_models_trained = measured["cycle_models_trained"]
+        cycle_cv_success = measured["cycle_cv_success"]
 
-        # Preserve gate outcome feedback for the training prompts
-        used_prompts = ctx.used_prompts
-        gate_feedback = _build_gate_feedback_summary(
-            epoch_path, used_prompts, cycle_results, session
-        )
-        # Per-epoch CV receipt: without this line the measured accuracies
-        # live only in the record and every post-run question
-        # ("did this gate measure anything?") means file digging.
-        _mean = gate_feedback["mean_accuracy"]
-        _best = gate_feedback["best_accuracy"]
-        print(
-            f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
-            f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
-            f"measured={gate_feedback['n_measured']}, "
-            f"mean={_mean:.4f} best={_best:.4f}" if _mean is not None else
-            f"[{_ts()}] [CYCLE] gate_{ctx.candidate_index:03d} epoch {epoch} CV: "
-            f"generated={gate_feedback['n_generated']} trained={gate_feedback['n_trained']} "
-            f"measured=0, mean=n/a best=n/a"
-        )
-        ctx.previous_feedback_summary = gate_feedback["summary"]
-
-        # ── 2. Build training data from real evaluated LEMUR results ──
-
-        try:
-            train_loader, val_loader, train_dataset = build_nngenprompt_dataloaders(
-                tokenizer,
-                train_prompt_path,
-                context_length=args.max_length,
-                max_prompts=args.max_prompts,
-                max_new_tokens=args.generation_max_new_tokens,
-                batch_size=args.batch_size,
-                validation_fraction=args.validation_fraction,
-                seed=args.seed + epoch,
-                dataset_name=args.dataset,
-                nn_prefixes=training_prefixes,
-            )
-        except ValueError as exc:
-            if "NNGenPrompt produced no usable examples" not in str(exc):
-                raise
-            print(
-                f"[epoch={epoch}] Gate training skipped: {exc}. "
-                "Continuing to the next generation cycle."
-            )
+        if training["skipped"]:
             epoch_metrics = _harvest_epoch_metrics(
                 epoch, epoch_path, gate_feedback, cycle_results,
                 cycle_models_trained, None, None, active_layers,
@@ -317,12 +446,13 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             )
             epoch_metrics.update({
                 "training_skipped": True,
-                "skip_reason": str(exc),
+                "skip_reason": training["skip_reason"],
+                "measured_after_training": measure_after,
                 "training": {
                     "epoch": epoch,
                     "active_gate_layers": sorted(active_layers),
                     "training_skipped": True,
-                    "skip_reason": str(exc),
+                    "skip_reason": training["skip_reason"],
                     "current_cycle_cv_success": cycle_cv_success,
                     "current_cycle_models_trained": cycle_models_trained,
                     "prompt_feedback_injected": True,
@@ -336,103 +466,17 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             _write_gate_record(ctx, finalize=False)
             continue
 
-        train_lengths = [len(row["input_ids"]) for row in train_dataset]
-        train_length_stats = {
-            "minimum": min(train_lengths),
-            "maximum": max(train_lengths),
-            "mean": sum(train_lengths) / len(train_lengths),
-        }
-        print(
-            f"[epoch={epoch}] Gate-training sequences: examples={len(train_dataset)} "
-            f"min={train_length_stats['minimum']} max={train_length_stats['maximum']} "
-            f"mean={train_length_stats['mean']:.1f}; "
-            f"gradient_checkpointing={args.gradient_checkpointing}"
-        )
-
-        # ── 3. Train gates on formatted NN-generation examples ──
-
-        if outer_mode:
-            # CV generation/evaluation consumes RNG; reset before gate training so
-            # each candidate's gate update starts from the same sampling state.
-            _seed_all(args.seed + epoch)
-        session.model.train()
-        session.model.config.use_cache = False
-        if args.gradient_checkpointing:
-            if hasattr(session.model, "gradient_checkpointing_enable"):
-                session.model.gradient_checkpointing_enable()
-            if hasattr(session.model, "enable_input_require_grads"):
-                session.model.enable_input_require_grads()
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        pre_training_vram = _log_cuda_memory(
-            f"epoch={epoch} before gate training"
-        )
-
-        def log_step(step: int, loss: float) -> None:
-            print(f"epoch={epoch} gate_step={step:04d} total_loss={loss:.6f}")
-
-        oom_recovered = False
-        try:
-            result, _ = train_gates(
-                session.model,
-                session.installs,
-                train_loader,
-                steps=args.gate_train_steps,
-                learning_rate=args.gate_learning_rate,
-                validation_loader=None,
-                validation_steps=None,
-                auxiliary_loss_fn=None,
-                on_step=log_step,
-            )
-        except torch.cuda.OutOfMemoryError:
-            _log_cuda_memory(f"epoch={epoch} gate-training OOM")
-            print(
-                "[VRAM] Gate-training OOM: 4-bit quantization reduces frozen "
-                "weights but not attention/MLP activations. Harvesting the "
-                "epochs measured so far and stopping this candidate early "
-                "instead of discarding its score; reduce --max-length or "
-                "--batch-size to avoid a recurrence."
-            )
-            _release_cuda_memory()
-            oom_recovered = True
-            result = None
-        post_training_vram = _log_cuda_memory(
-            f"epoch={epoch} after gate training"
-        )
-
-        validation_loss = None
-        if val_loader is not None and not oom_recovered:
-            try:
-                validation_loss = evaluate_language_model_loss(
-                    session.model,
-                    val_loader,
-                    max_steps=args.validation_steps,
-                )
-            except torch.cuda.OutOfMemoryError:
-                print(f"[epoch={epoch}] validation-loss evaluation OOM; skipping it")
-                _release_cuda_memory()
-                validation_loss = None
-
-        if args.gradient_checkpointing:
-            if hasattr(session.model, "disable_input_require_grads"):
-                session.model.disable_input_require_grads()
-            if hasattr(session.model, "gradient_checkpointing_disable"):
-                session.model.gradient_checkpointing_disable()
-        # Gate training turned the KV cache off; the next epoch's CV generation
-        # needs it back, otherwise every generated token reprocesses the prompt.
-        session.model.config.use_cache = True
-
-        # Save the single latest trained checkpoint + metrics.
-        _save_latest_weights(ctx)
+        result = training["result"]
+        validation_loss = training["validation_loss"]
+        oom_recovered = training["oom_recovered"]
         training_metrics = {
             "epoch": epoch,
             "active_gate_layers": sorted(active_layers),
-            "examples": len(train_dataset),
-            "sequence_lengths": train_length_stats,
+            "examples": training["examples"],
+            "sequence_lengths": training["sequence_lengths"],
             "gradient_checkpointing": args.gradient_checkpointing,
-            "vram_before_training": pre_training_vram,
-            "vram_after_training": post_training_vram,
+            "vram_before_training": training["vram_before_training"],
+            "vram_after_training": training["vram_after_training"],
             "steps": result.steps if result is not None else 0,
             "mean_train_loss": result.mean_train_loss if result is not None else None,
             "validation_loss": validation_loss,
@@ -440,6 +484,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             "current_cycle_cv_success": cycle_cv_success,
             "current_cycle_models_trained": cycle_models_trained,
             "outer_gate_search": outer_mode,
+            "measured_after_training": measure_after,
             "train_prompt_config": args.train_prompt_config,
             "test_prompt_config": args.test_prompt_config,
             "training_nn_prefixes": list(training_prefixes),
@@ -468,6 +513,7 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             duration_ns=int((time.monotonic() - epoch_started) * 1e9),
         )
         epoch_metrics.update({
+            "measured_after_training": measure_after,
             "training": training_metrics,
             "feedback": feedback_record(gate_feedback),
             "cv": cycle_results,
@@ -492,6 +538,8 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
         )
 
     return epoch_paths
+
+
 def _save_latest_weights(ctx: RunContext) -> Path | None:
     """Atomically replace ``<gate>/weights`` with the current trained gate.
 

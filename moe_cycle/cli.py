@@ -41,7 +41,8 @@ def _json_object(value: str) -> dict[str, object]:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """The cycle's argument parser; ``moe_cycle.experiment`` extends it."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="LiquidAI/LFM2.5-8B-A1B")
     parser.add_argument(
@@ -356,4 +357,30 @@ def parse_args() -> argparse.Namespace:
         "The re-match re-runs the current best gate under the updated proposer so "
         "cross-version score comparisons stay fair (king-of-the-hill).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--measure-after-training",
+        action="store_true",
+        help="Train the gate first and measure CV accuracy afterwards in every inner "
+        "epoch. Without it each epoch measures before training, so with --epochs 1 "
+        "the score is taken while every function-preserving gate is still an exact "
+        "copy of the native router and cannot reflect the architecture.",
+    )
+    parser.add_argument(
+        "--generation-batch",
+        type=int,
+        default=1,
+        help="CV prompts generated together in one batched generate() call. Each "
+        "row stops at its own closing </nn> tag.",
+    )
+    parser.add_argument(
+        "--pinned-seed-prompts",
+        action="store_true",
+        help="Draw CV generation seeds from the pinned list named by NNGPT_SEED_FILE "
+        "(upstream pin_generation_seeds) instead of the legacy alphabetical draw, so "
+        "every gate is measured on the same seed networks.",
+    )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
