@@ -614,7 +614,7 @@ def test_lfm_install_forward():
 
 
 def _assert_step_zero_exact(model):
-    from moe_cycle.gate_seeds import seed_gate_source
+    from moe_cycle.gate_catalog import catalog_gate_source
     from moe_gate_only import MoEGateSession
 
     torch.manual_seed(42)
@@ -626,7 +626,7 @@ def _assert_step_zero_exact(model):
     assert len(session.inspect()) > 0
     with session:
         session.replace_source(
-            seed_gate_source(0),
+            catalog_gate_source(0),
             sample_input=sample,
             verify=True,
             dynamic_discovery=False,
@@ -681,7 +681,7 @@ def test_qwen3_moe_replacement_preserves_native_logits():
 
 def test_lfm_replacement_preserves_native_logits():
     """Exact step zero needs LFM2's sigmoid scores and block-supplied expert bias."""
-    from moe_cycle.gate_seeds import seed_gate_source
+    from moe_cycle.gate_catalog import catalog_gate_source
     from moe_gate_only import MoEGateSession
 
     torch.manual_seed(42)
@@ -693,7 +693,7 @@ def test_lfm_replacement_preserves_native_logits():
     assert len(session.inspect()) > 0
     with session:
         session.replace_source(
-            seed_gate_source(0),
+            catalog_gate_source(0),
             sample_input=sample,
             verify=True,
             dynamic_discovery=False,

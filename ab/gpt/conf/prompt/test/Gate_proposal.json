@@ -1,0 +1,45 @@
+{
+  "comment": [
+    "Gate proposal prompts for the MoE NAS outer loop.",
+    "",
+    "Two variants are selectable with --gate-prompt-key so they can be compared",
+    "empirically under one protocol:",
+    "",
+    "  reference_best : the best gate so far is the baseline and its measured",
+    "                   accuracy is the goal (the original single-reference",
+    "                   framing).",
+    "  pair          : the lower-scoring member of the best (lower, higher)",
+    "                   pair is the baseline and the higher member's accuracy",
+    "                   is the goal. This is the framing the Phase B proposer",
+    "                   SFT trains on (gate_sft_examples), so the proposal and",
+    "                   the training prompt share one format.",
+    "",
+    "Placeholders: {goal_accuracy} {reference_accuracy} {dataset_text}.",
+    "The shared interface contract stays in moe_cycle/gate_prompt.py; only the",
+    "framing that differs between the variants lives here."
+  ],
+  "reference_best": {
+    "goal_with_accuracy": "Your task is to write a router gate that increases the mean CV accuracy of the neural networks generated through it to at least {goal_accuracy}{dataset_text}.",
+    "goal_without_accuracy": "Your task is to write a router gate that increases the mean CV accuracy of the neural networks generated through it{dataset_text}.",
+    "reference_with_accuracy": "Use the following reference gate, which achieved a mean CV accuracy of {reference_accuracy} under identical evaluation conditions, as the baseline for architectural inspiration. Improve it by making fundamental changes to the gate design.",
+    "reference_without_accuracy": "Use the following reference gate as the baseline for architectural inspiration. Improve it by making fundamental changes to the gate design.",
+    "reference_inherit_with_accuracy": "The following reference gate is your current router architecture; it achieved a mean CV accuracy of {reference_accuracy} under identical evaluation conditions. Its trained weights are copied into your new code by parameter name. Improve it by extending it.",
+    "reference_inherit_without_accuracy": "The following reference gate is your current router architecture. Its trained weights are copied into your new code by parameter name. Improve it by extending it.",
+    "closing_new": "Develop your own architecture rather than copying the reference. Your design must go beyond the reference's mechanism, not restate it.\n\nRespond with only the complete Python module between `<gate>` and `</gate>`.",
+    "closing_inherit": "Keep the reference's module and parameter names for every part you reuse; put all new ideas in new submodules.\n\nRespond with only the complete Python module between `<gate>` and `</gate>`.",
+    "header_baseline": "Baseline gate code:",
+    "header_current": "Current gate code:"
+  },
+  "pair": {
+    "goal_with_accuracy": "Your task is to write a router gate that increases the mean CV accuracy of the neural networks generated through it to at least {goal_accuracy}{dataset_text}.",
+    "goal_without_accuracy": "Your task is to write a router gate that increases the mean CV accuracy of the neural networks generated through it{dataset_text}.",
+    "reference_with_accuracy": "Use the following lower-scoring gate, which achieved a mean CV accuracy of {reference_accuracy} under identical evaluation conditions, as the baseline for architectural inspiration. A different gate from the same search reached {goal_accuracy} under the same conditions, so that level is reachable. Improve on the baseline by making fundamental changes to the gate design.",
+    "reference_without_accuracy": "Use the following lower-scoring gate as the baseline for architectural inspiration. Improve on the baseline by making fundamental changes to the gate design.",
+    "reference_inherit_with_accuracy": "The following reference gate is your current router architecture; it achieved a mean CV accuracy of {reference_accuracy} under identical evaluation conditions. Its trained weights are copied into your new code by parameter name. Improve it by extending it.",
+    "reference_inherit_without_accuracy": "The following reference gate is your current router architecture. Its trained weights are copied into your new code by parameter name. Improve it by extending it.",
+    "closing_new": "Develop your own architecture rather than copying the reference. The search already contains a stronger gate; do not restate either the baseline or that design. Your design must go beyond the reference's mechanism.\n\nRespond with only the complete Python module between `<gate>` and `</gate>`.",
+    "closing_inherit": "Keep the reference's module and parameter names for every part you reuse; put all new ideas in new submodules.\n\nRespond with only the complete Python module between `<gate>` and `</gate>`.",
+    "header_baseline": "Baseline gate code:",
+    "header_current": "Current gate code:"
+  }
+}

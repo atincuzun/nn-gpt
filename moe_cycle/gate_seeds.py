@@ -16,7 +16,7 @@ per-expert scale/shift.
 
 The catalog is ordered round-robin across mechanism families, so any prefix
 (including the default first three) is architecturally diverse. Selection is
-deterministic: seed index i uses ``SEED_GATES[i % len(SEED_GATES)]``.
+deterministic: seed index i uses ``GATE_CATALOG[i % len(GATE_CATALOG)]``.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _src(text: str) -> str:
     return textwrap.dedent(text).strip("\n") + "\n"
 
 
-SEED_GATES: tuple[tuple[str, str], ...] = (
+GATE_CATALOG: tuple[tuple[str, str], ...] = (
     (
         "01-additive-mlp-gelu",
         _src("""
@@ -1063,9 +1063,9 @@ SEED_GATES: tuple[tuple[str, str], ...] = (
 )
 
 
-def seed_gate_source(index: int) -> str:
-    return SEED_GATES[index % len(SEED_GATES)][1]
+def catalog_gate_source(index: int) -> str:
+    return GATE_CATALOG[index % len(GATE_CATALOG)][1]
 
 
-def seed_gate_name(index: int) -> str:
-    return SEED_GATES[index % len(SEED_GATES)][0]
+def catalog_gate_name(index: int) -> str:
+    return GATE_CATALOG[index % len(GATE_CATALOG)][0]

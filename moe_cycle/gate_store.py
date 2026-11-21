@@ -596,7 +596,7 @@ def backfill_gate_records(
     return written
 
 
-def find_reusable_seed(
+def find_reusable_gate(
     root: Path,
     source: str,
     *,
@@ -722,6 +722,8 @@ def protocol_metadata(args: Any) -> dict:
         "initialize_from_original": not getattr(args, "gate_random_init", False),
         "train_prompt_config": getattr(args, "train_prompt_config", None),
         "test_prompt_config": getattr(args, "test_prompt_config", None),
+        "gate_prompt_key": getattr(args, "gate_prompt_key", None),
+        "gate_prompt_split": getattr(args, "gate_prompt_split", None),
     }
     protocol["fingerprint"] = fingerprint(protocol)
     return protocol

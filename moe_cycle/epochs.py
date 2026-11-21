@@ -17,11 +17,93 @@ from .context import (
     _release_cuda_memory,
     _ts,
 )
-from .code_normalization import unescape_single_line_code
+from .code_normalization import (
+    ensure_lemur_cv_interface,
+    strip_xml_tags,
+    unescape_single_line_code,
+)
 from .eval_safety import _moe_cv_eval_environment
 from .feedback import _build_gate_feedback_summary, feedback_record
 from .morphism import _seed_all
 from .records import _harvest_epoch_metrics, _write_gate_record
+
+
+def _candidate_eval_prm(candidate_dir: Path, fixed: dict | None) -> dict:
+    """The prm the evaluation will use for this candidate.
+
+    The evaluator starts from its own defaults, lets the seed record's prm
+    override them, and then applies the fixed evaluation hyperparameters. A
+    generated model routinely uses a key it did not declare in
+    ``supported_hyperparameters`` (``prm['dropout']``), so a smoke check built
+    from the declared keys alone fails in the constructor.
+    """
+    prm: dict = {"lr": 0.01, "momentum": 0.9, "dropout": 0.5, "batch": 8}
+    try:
+        from ab.gpt.util.eval.smoke import PRM_DEFAULTS
+
+        prm.update(PRM_DEFAULTS)
+    except ImportError:
+        pass
+    frame = candidate_dir / "dataframe.df"
+    if frame.is_file():
+        try:
+            import pandas as pd
+
+            row = pd.read_pickle(frame)
+            raw = row.get("prm") if hasattr(row, "get") else None
+            if isinstance(raw, dict):
+                prm.update({
+                    key: value for key, value in raw.items()
+                    if isinstance(value, (int, float, str, bool))
+                })
+        except Exception:
+            pass
+    if fixed:
+        prm.update(fixed)
+    return prm
+
+
+def _repair_candidate_classifier_widths(epoch_path: Path, fixed_prm: dict | None = None) -> int:
+    """Repair candidates whose classifier width contradicts the feature map.
+
+    A generated model that never updates its channel counter hands the
+    classifier a width it never receives and dies at the first forward. The
+    width is recomputed from the conv stack, and the repair is kept only when
+    the model then runs (the smoke check executes it in a subprocess).
+    """
+    from ab.gpt.util.eval.smoke import smoke_check
+
+    from .code_normalization import repair_classifier_width
+
+    fixed = 0
+    for path in sorted((Path(epoch_path) / "synth_nn").glob("B*/new_nn.py")):
+        original = path.read_text(encoding="utf-8")
+        repaired = repair_classifier_width(original)
+        if repaired is None or repaired == original:
+            continue
+        try:
+            compile(repaired, str(path), "exec")
+        except SyntaxError:
+            continue
+        prm = _candidate_eval_prm(path.parent, fixed_prm)
+        path.write_text(repaired, encoding="utf-8")
+        try:
+            ok, reason = smoke_check(str(path.resolve()), prm=prm, light=True)
+        except Exception as exc:  # a subprocess that cannot start is not a verdict
+            ok, reason = False, f"{type(exc).__name__}: {exc}"
+        if ok:
+            fixed += 1
+            print(
+                f"[MOE CODE] {path.parent.name}: repaired classifier width "
+                f"({path.name})"
+            )
+        else:
+            path.write_text(original, encoding="utf-8")
+            print(
+                f"[MOE CODE] {path.parent.name}: classifier-width repair "
+                f"rejected ({reason})"
+            )
+    return fixed
 
 
 def _normalize_escaped_generated_code(epoch_path: Path) -> int:
@@ -30,22 +112,37 @@ def _normalize_escaped_generated_code(epoch_path: Path) -> int:
     Only files with no real newline are candidates, and the recovered text
     must parse before it replaces the model output, so legitimate backslashes
     in normal code are never rewritten.
+
+    The XML framing of the LEMUR chat format is stripped as well: a payload
+    that kept its ``</nn></tr>`` closing tags never compiles, so the escape
+    repair alone would leave it unusable.
     """
     fixed = 0
     for path in sorted((Path(epoch_path) / "synth_nn").glob("B*/new_nn.py")):
         original = path.read_text(encoding="utf-8")
-        recovered = unescape_single_line_code(original)
-        if recovered == original:
+        candidates = []
+        for base in (original, unescape_single_line_code(original)):
+            for variant in (base, strip_xml_tags(base)):
+                if variant not in candidates:
+                    candidates.append(variant)
+        for candidate in candidates:
+            if candidate == original:
+                continue
+            try:
+                candidate = ensure_lemur_cv_interface(candidate)
+                compile(candidate, str(path), "exec")
+            except (SyntaxError, ValueError):
+                continue
+            if candidate != original:
+                path.write_text(candidate, encoding="utf-8")
+                fixed += 1
+                print(
+                    f"[MOE CODE] {path.parent.name}: normalized {path.name} "
+                    "(escapes/LEMUR interface)"
+                )
+            break
+        else:
             continue
-        try:
-            compile(recovered, str(path), "exec")
-        except SyntaxError:
-            continue
-        path.write_text(recovered, encoding="utf-8")
-        fixed += 1
-        print(
-            f"[MOE CODE] {path.parent.name}: expanded escaped newlines in {path.name}"
-        )
     return fixed
 
 
@@ -133,7 +230,15 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
             legacy_prompt_selection=True,
         )
         _normalize_escaped_generated_code(epoch_path)
-        with _moe_cv_eval_environment():
+        _repair_candidate_classifier_widths(epoch_path, args.fixed_eval_hyperparameters)
+        if getattr(args, "gate_eval_seed", None) is not None:
+            # The evaluation forks a worker that inherits this process's RNG
+            # state, so seeding here makes the CV training reproducible and
+            # the same candidate index comparable across gates.
+            _seed_all(args.gate_eval_seed + epoch)
+        with _moe_cv_eval_environment(
+            (args.fixed_eval_hyperparameters or {}).get('transform')
+        ):
             _evaluate_epoch(
                 epoch,
                 epoch_path,
@@ -314,6 +419,9 @@ def _run_epochs(ctx: RunContext) -> list[Path]:
                 session.model.disable_input_require_grads()
             if hasattr(session.model, "gradient_checkpointing_disable"):
                 session.model.gradient_checkpointing_disable()
+        # Gate training turned the KV cache off; the next epoch's CV generation
+        # needs it back, otherwise every generated token reprocesses the prompt.
+        session.model.config.use_cache = True
 
         # Save the single latest trained checkpoint + metrics.
         _save_latest_weights(ctx)

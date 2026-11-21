@@ -110,18 +110,30 @@ def _wrap_evaluate_epoch(original: Callable[..., Any]) -> Callable[..., Any]:
 
 
 @contextmanager
-def _moe_cv_eval_environment():
+def _moe_cv_eval_environment(fixed_transform: str | None = None):
     """Retain the fork's parameter precedence and scoring in MoE.
 
     ``NNGPT_MOE_EVAL_CUDA`` optionally exposes a GPU to the evaluator
     subprocess only, so a CPU-resident proposer can still train the
     generated CV models on a GPU without ChatBot trying to place the LLM
-    there.
+    there.  The value ``cpu`` keeps the evaluator off the GPU entirely, which
+    is what a shared card needs: the evaluator's training run then cannot
+    collide with the LLM's weights.
+
+    The evaluation runs in ``fixed`` prm mode so the transform is the one the
+    run declares.  In the default ``seed`` mode the seed record's own
+    transform wins, which measured at 256 square while the protocol stored
+    with every gate said 32: the recorded protocol did not describe what was
+    measured, and the training cost 64 times more than the protocol implied.
     """
-    overrides = {"NNGPT_EVAL_PRM_MODE": "seed", "NNGPT_OOM_RETRY": "0"}
+    overrides = {"NNGPT_EVAL_PRM_MODE": "fixed", "NNGPT_OOM_RETRY": "0"}
+    if fixed_transform:
+        overrides["NNGPT_FIXED_EVAL_TRANSFORM"] = fixed_transform
     eval_cuda = os.environ.get("NNGPT_MOE_EVAL_CUDA", "").strip()
     if eval_cuda:
-        overrides["CUDA_VISIBLE_DEVICES"] = eval_cuda
+        overrides["CUDA_VISIBLE_DEVICES"] = (
+            "" if eval_cuda.lower() == "cpu" else eval_cuda
+        )
     previous = {name: os.environ.get(name) for name in overrides}
     os.environ.update(overrides)
     try:

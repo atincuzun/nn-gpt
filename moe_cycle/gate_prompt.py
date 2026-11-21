@@ -7,10 +7,34 @@ on a reference artefact and measured feedback when available.
 
 from __future__ import annotations
 
+import json
 import re
 from contextlib import contextmanager
+from functools import lru_cache
+from pathlib import Path
 
 from .gate_store import structural_hash
+
+#: The proposal framing lives in the prompt-config folders next to the CV
+#: prompts, so the outer-loop variants can be compared under one protocol.
+GATE_PROMPT_CONFIG_DIR = (
+    Path(__file__).resolve().parents[1] / "ab" / "gpt" / "conf" / "prompt"
+)
+DEFAULT_GATE_PROMPT_KEY = "reference_best"
+
+
+@lru_cache(maxsize=8)
+def load_gate_prompt_variant(key: str, split: str = "test") -> dict:
+    """Return the framing strings of one gate-prompt variant."""
+    path = GATE_PROMPT_CONFIG_DIR / split / "Gate_proposal.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if key not in config:
+        raise KeyError(
+            f"gate prompt variant {key!r} is not defined in {path}; "
+            f"available: {sorted(k for k in config if k != 'comment')}"
+        )
+    return config[key]
+
 
 GATE_SYSTEM_PROMPT = (
     "You are an expert PyTorch neural network architect designing trainable MoE router gates. "
@@ -48,78 +72,56 @@ def gate_proposal_prompt(
     goal_accuracy: float | None = None,
     dataset: str | None = None,
     inherit_reference: bool = False,
+    variant_key: str = DEFAULT_GATE_PROMPT_KEY,
+    variant_split: str = "test",
 ) -> str:
     """Single-reference gate proposal prompt, LEMUR-CV pairing style.
 
-    Mirrors NN_gen.json's improvement rows: one reference artifact with its
+    Mirrors NN_gen.json's improvement rows: one reference artefact with its
     measured score, one goal score, no history tables. With no scored
     reference (fresh store) the accuracy clauses degrade gracefully.
+
+    ``variant_key`` selects the framing from the prompt-config folder, so the
+    single-reference and good/bad-pair framings can be compared under one
+    protocol.
     """
+    variant = load_gate_prompt_variant(variant_key, variant_split)
     dataset_text = f" on the '{dataset}' image-classification task" if dataset else ""
     if goal_accuracy is not None:
-        goal_sentence = (
-            "Your task is to write a router gate that increases the mean CV "
-            f"accuracy of the neural networks generated through it to at least "
-            f"{goal_accuracy:.4f}{dataset_text}."
+        goal_sentence = variant["goal_with_accuracy"].format(
+            goal_accuracy=f"{goal_accuracy:.4f}", dataset_text=dataset_text,
         )
     else:
-        goal_sentence = (
-            "Your task is to write a router gate that increases the mean CV "
-            f"accuracy of the neural networks generated through it{dataset_text}."
+        goal_sentence = variant["goal_without_accuracy"].format(
+            dataset_text=dataset_text,
         )
     if reference_source.strip():
         if inherit_reference:
             if reference_accuracy is not None:
-                reference_sentence = (
-                    "The following reference gate is your current router "
-                    f"architecture; it achieved a mean CV accuracy of {reference_accuracy:.4f} "
-                    "under identical evaluation conditions. Its trained weights are "
-                    "copied into your new code by parameter name. Improve it by "
-                    "extending it."
+                reference_sentence = variant["reference_inherit_with_accuracy"].format(
+                    reference_accuracy=f"{reference_accuracy:.4f}",
                 )
             else:
-                reference_sentence = (
-                    "The following reference gate is your current router "
-                    "architecture. Its trained weights are copied into your new "
-                    "code by parameter name. Improve it by extending it."
-                )
-            closing = (
-                "Keep the reference's module and parameter names for every part "
-                "you reuse; put all new ideas in new submodules.\n\n"
-                "Respond with only the complete Python module between `<gate>` and `</gate>`."
-            )
+                reference_sentence = variant["reference_inherit_without_accuracy"]
+            closing = variant["closing_inherit"]
         elif reference_accuracy is not None:
-            reference_sentence = (
-                "Use the following reference gate, which achieved a mean CV "
-                f"accuracy of {reference_accuracy:.4f} under identical "
-                "evaluation conditions, as the baseline for architectural "
-                "inspiration. Improve it by making fundamental changes to the "
-                "gate design."
+            reference_sentence = variant["reference_with_accuracy"].format(
+                reference_accuracy=f"{reference_accuracy:.4f}",
+                goal_accuracy=f"{goal_accuracy:.4f}" if goal_accuracy is not None else "",
             )
-            closing = (
-                "Develop your own architecture rather than copying the reference. "
-                "Your design must go beyond the reference's mechanism, not restate it.\n\n"
-                "Respond with only the complete Python module between `<gate>` and `</gate>`."
-            )
+            closing = variant["closing_new"]
         else:
-            reference_sentence = (
-                "Use the following reference gate as the baseline for "
-                "architectural inspiration. Improve it by making fundamental "
-                "changes to the gate design."
-            )
-            closing = (
-                "Develop your own architecture rather than copying the reference. "
-                "Your design must go beyond the reference's mechanism, not restate it.\n\n"
-                "Respond with only the complete Python module between `<gate>` and `</gate>`."
-            )
+            reference_sentence = variant["reference_without_accuracy"]
+            closing = variant["closing_new"]
         reference_block = (
-            ("Current gate code:" if inherit_reference else "Baseline gate code:") + "\n"
+            (variant["header_current"] if inherit_reference else variant["header_baseline"])
+            + "\n"
             f"<gate>\n{reference_source.strip()}\n</gate>\n"
         )
     else:
         reference_sentence = ""
         reference_block = ""
-        closing = "Respond with only the complete Python module between `<gate>` and `</gate>`."
+        closing = variant["closing_new"]
 
     parts = [
         "Generate a PyTorch neural network to serve as the router gate of a "

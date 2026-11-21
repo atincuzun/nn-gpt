@@ -12,7 +12,7 @@ from .candidates import (
     _install_author_gate,
     _prepare_gate_candidate,
     _prepare_rematch_candidate,
-    _prepare_seed_candidate,
+    _prepare_catalog_candidate,
     _select_author_gate_id,
 )
 from .context import (
@@ -22,7 +22,7 @@ from .context import (
     _ts,
 )
 from .epochs import _run_epochs
-from .gate_store import find_reusable_seed, protocol_metadata, structural_hash
+from .gate_store import find_reusable_gate, protocol_metadata, structural_hash
 from .morphism import _model_logits
 from .phase_b_runner import _run_sft_batch_under_best_gate
 from .records import _record_failed_candidate, _write_gate_record
@@ -39,23 +39,38 @@ def _propose_gate(ctx: RunContext, gate_id: int, seen_hashes: set[str],
     The prompt is one LEMUR-CV pairing: the best prior gate's code with its
     measured accuracy as the reference, its score as the goal. Round 0 (or an
     empty store) bootstraps from the baseline contract without scores.
+
+    With the ``pair`` prompt variant the framing is the one the Phase B
+    proposer SFT trains on: the lower-scoring member of the best measured pair
+    is the baseline and the higher member's accuracy is the goal.
     """
     from .gate_prompt import BASELINE_GATE_CODE
     from .gate_store import best_gate
 
-    reference = best_gate(ctx.gate_root)
     reference_source = ""
     reference_accuracy = None
     goal_accuracy = None
     ctx.reference_gate_id = None
-    if reference is not None:
-        reference_source = reference.get("gate_code") or ""
-        ctx.reference_gate_id = reference.get("gate_id")
-        score = (reference.get("score") or {}).get("accuracy")
-        if isinstance(score, float):
-            reference_accuracy = score
-            goal_accuracy = score
-    elif gate_id > 0:
+    if getattr(ctx.args, "gate_prompt_key", "reference_best") == "pair":
+        from .gate_pairs import build_gate_pairs
+
+        pairs = build_gate_pairs(ctx.gate_root)
+        if pairs:
+            pair = pairs[0]
+            reference_source = pair["lower_source"]
+            reference_accuracy = pair["lower_accuracy"]
+            goal_accuracy = pair["higher_accuracy"]
+            ctx.reference_gate_id = pair["lower_gate_id"]
+    else:
+        reference = best_gate(ctx.gate_root)
+        if reference is not None:
+            reference_source = reference.get("gate_code") or ""
+            ctx.reference_gate_id = reference.get("gate_id")
+            score = (reference.get("score") or {}).get("accuracy")
+            if isinstance(score, float):
+                reference_accuracy = score
+                goal_accuracy = score
+    if not reference_source and gate_id > 0:
         # No eligible prior gate yet: fall back to the baseline contract so the
         # model still has an explicit reference to diverge from.
         reference_source = BASELINE_GATE_CODE
@@ -147,7 +162,7 @@ def _run_candidate_once(
             elif seed:
                 # Cold-start bootstrap: built-in compliant gates fill the store
                 # with scored references before the proposer is trusted.
-                _prepare_seed_candidate(ctx, gate_id)
+                _prepare_catalog_candidate(ctx, gate_id)
             else:
                 if author_gate_id is not None:
                     try:
@@ -196,8 +211,8 @@ def _run_candidate_once(
             _install_and_verify(ctx)
             epoch_paths = []
             reusable = None
-            if seed and getattr(args, "gate_seed_policy", "reuse") == "reuse":
-                reusable = find_reusable_seed(
+            if seed and getattr(args, "gate_reuse_policy", "reuse") == "reuse":
+                reusable = find_reusable_gate(
                     ctx.gate_root, ctx.gate_source,
                     llm_version=ctx.llm_version,
                     protocol=protocol_metadata(args),
@@ -262,10 +277,10 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
 
     seen_hashes.add(structural_hash(BASELINE_GATE_CODE))
     # Seed architectures are also off-limits for verbatim LLM re-emission.
-    from .gate_seeds import SEED_GATES, seed_gate_source
+    from .gate_catalog import GATE_CATALOG, catalog_gate_source
 
-    for index in range(len(SEED_GATES)):
-        seen_hashes.add(structural_hash(seed_gate_source(index)))
+    for index in range(len(GATE_CATALOG)):
+        seen_hashes.add(structural_hash(catalog_gate_source(index)))
     sft_batch = 0
     candidates_run = 0
 
@@ -275,7 +290,7 @@ def _run_outer_search(ctx: RunContext, args: Namespace) -> list[list[Path]]:
         candidate_epochs.append(
             _run_candidate_once(
                 ctx, next_gate_id(ctx.gate_root), seen_hashes,
-                seed=candidates_run < getattr(args, "gate_seed_candidates", 0),
+                seed=candidates_run < getattr(args, "gate_catalog_candidates", 0),
             )
         )
         candidates_run += 1

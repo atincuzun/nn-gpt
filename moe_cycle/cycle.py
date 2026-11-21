@@ -22,8 +22,11 @@ from .setup import _setup_run, _validate_args
 def main() -> None:
     from .eval_safety import ensure_moe_eval_safety
     from .generation_dtype import ensure_generation_dtype_policy
+    from .kernel_compat import ensure_device_aware_causal_conv1d
 
     ensure_generation_dtype_policy()
+    # The installed causal_conv1d kernel is CUDA-only; keep CPU runs working.
+    ensure_device_aware_causal_conv1d()
     # Keep malformed LLM-generated hp payloads from aborting the shared
     # evaluator without changing Tune.py or Eval.py themselves.
     ensure_moe_eval_safety()

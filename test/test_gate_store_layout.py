@@ -231,8 +231,8 @@ def test_create_gate_entry_uses_lemur_name_and_index(tmp_path: Path):
     assert second.name.endswith("-g1")
 
 
-def test_find_reusable_seed_requires_matching_protocol_and_weights(tmp_path: Path):
-    from moe_cycle.gate_store import create_gate_entry, find_reusable_seed
+def test_find_reusable_gate_requires_matching_protocol_and_weights(tmp_path: Path):
+    from moe_cycle.gate_store import create_gate_entry, find_reusable_gate
 
     store = tmp_path / "store"
     path = create_gate_entry(store, 0, SOURCE, seed_name="01-additive-mlp-gelu", kind="seed")
@@ -247,13 +247,13 @@ def test_find_reusable_seed_requires_matching_protocol_and_weights(tmp_path: Pat
         "protocol": {"fingerprint": "protocol-1"},
     })
 
-    hit = find_reusable_seed(
+    hit = find_reusable_gate(
         store, SOURCE, llm_version="model-v1", protocol={"fingerprint": "protocol-1"},
     )
     assert hit is not None and hit[1] == path
-    assert find_reusable_seed(
+    assert find_reusable_gate(
         store, SOURCE, llm_version="model-v2", protocol={"fingerprint": "protocol-1"},
     ) is None
-    assert find_reusable_seed(
+    assert find_reusable_gate(
         store, SOURCE, llm_version="model-v1", protocol={"fingerprint": "protocol-2"},
     ) is None

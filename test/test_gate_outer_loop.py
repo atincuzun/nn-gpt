@@ -780,11 +780,11 @@ def test_seed_gates_satisfy_the_llm_proposal_validator():
     """Seeds must pass the SAME contract/degenerate checks as LLM proposals."""
     import torch
 
-    from moe_cycle.gate_seeds import SEED_GATES
+    from moe_cycle.gate_catalog import GATE_CATALOG
     from moe_cycle.gate_source import _validate_gate_source
 
     hashes = set()
-    for name, source in SEED_GATES:
+    for name, source in GATE_CATALOG:
         _validate_gate_source(source, [(2048, 64), (512, 8)])
         hashes.add(structural_hash(source))
         namespace: dict = {}
@@ -797,25 +797,25 @@ def test_seed_gates_satisfy_the_llm_proposal_validator():
                 expected = gate.base(sample)
                 actual = gate(sample)
             assert torch.equal(expected, actual), f"{name} is not silent at step zero"
-    assert len(hashes) == len(SEED_GATES), "seed mechanisms must be distinct"
+    assert len(hashes) == len(GATE_CATALOG), "seed mechanisms must be distinct"
 
 
 def test_baseline_reference_is_not_degenerate():
     """The round-0 reference must itself satisfy the enforced contract."""
     from moe_cycle.gate_prompt import BASELINE_GATE_CODE
-    from moe_cycle.gate_seeds import SEED_GATES
+    from moe_cycle.gate_catalog import GATE_CATALOG
     from moe_cycle.gate_source import _validate_gate_source
 
     _validate_gate_source(BASELINE_GATE_CODE, [(2048, 64)])
-    seed_hashes = {structural_hash(source) for _name, source in SEED_GATES}
+    seed_hashes = {structural_hash(source) for _name, source in GATE_CATALOG}
     assert structural_hash(BASELINE_GATE_CODE) not in seed_hashes
 
 
 def test_seed_candidates_prepare_without_llm(tmp_path: Path, monkeypatch):
-    """_prepare_seed_candidate writes a valid gate with no chatbot involved."""
+    """_prepare_catalog_candidate writes a valid gate with no chatbot involved."""
     import torch
 
-    from moe_cycle.candidates import _prepare_seed_candidate
+    from moe_cycle.candidates import _prepare_catalog_candidate
 
     ctx = SimpleNamespace(
         gate_root=tmp_path, shapes=[(2048, 64)], gate_source=None,
@@ -824,7 +824,7 @@ def test_seed_candidates_prepare_without_llm(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         "moe_cycle.candidates._initial_feedback_summary", lambda source: ""
     )
-    _prepare_seed_candidate(ctx, 1)
+    _prepare_catalog_candidate(ctx, 1)
     seed_root = next(tmp_path.glob("gate-*"))
     assert seed_root.name.startswith("gate-02-bottleneck-quarter-gelu-")
     assert (seed_root / "gate.py").is_file()

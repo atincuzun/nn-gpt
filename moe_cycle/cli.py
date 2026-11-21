@@ -67,6 +67,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-train-steps", type=int, default=50)
     parser.add_argument("--gate-learning-rate", type=float, default=1e-4)
     parser.add_argument(
+        "--gate-eval-seed",
+        type=int,
+        default=None,
+        help="Seed the RNG before each gate's CV evaluation so the same "
+        "candidate index is measured under the same training randomness in "
+        "every gate (paired comparison across architectures)",
+    )
+    parser.add_argument(
         "--gate-source",
         type=Path,
         help="Python file defining the replacement gate class (external gate; "
@@ -99,21 +107,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gate-generation-attempts", type=int, default=100)
     parser.add_argument(
+        "--gate-catalog-candidates",
         "--gate-seed-candidates",
+        dest="gate_catalog_candidates",
         type=int,
-        default=3,
-        help="Cold-start bootstrap: the first N outer candidates install built-in "
-        "compliant seed gates (50 distinct mechanisms available) instead of LLM "
-        "proposals, so the store accumulates scored, valid references before the "
-        "proposer generates its own. Use 50 for the full catalog; 0 disables seeding.",
+        default=0,
+        help="Evaluate the first N built-in catalog gates as initial data instead "
+        "of LLM proposals. The catalog is a source of gate code, not a separate "
+        "data kind; records and selection treat it like any other gate. Use 50 "
+        "to materialize the full catalog; 0 goes straight to LLM proposals.",
     )
     parser.add_argument(
+        "--gate-reuse-policy",
         "--gate-seed-policy",
+        dest="gate_reuse_policy",
         choices=("reuse", "evaluate"),
         default="reuse",
-        help="With a persistent gate store, reuse an already measured seed gate "
-        "whose code hash, proposer version and protocol fingerprint match. "
-        "'evaluate' forces a fresh measurement (used for seed materialization).",
+        help="With a persistent gate store, reuse a measured gate whose code hash, "
+        "proposer version and protocol fingerprint match. 'evaluate' forces a "
+        "fresh measurement (used for catalog materialization and ablation).",
     )
     parser.add_argument(
         "--gate-candidates",
@@ -205,6 +217,31 @@ def parse_args() -> argparse.Namespace:
         "the two options are mutually exclusive",
     )
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--gate-prompt-key",
+        default="reference_best",
+        help="Gate proposal prompt variant, read from "
+        "ab/gpt/conf/prompt/<split>/Gate_proposal.json. 'reference_best' uses "
+        "the best prior gate as the baseline; 'pair' uses the lower-scoring "
+        "member of the best measured pair as the baseline and the higher "
+        "member's accuracy as the goal (the framing Phase B trains on)",
+    )
+    parser.add_argument(
+        "--gate-prompt-split",
+        default="test",
+        help="Prompt-config folder the gate prompt variant is read from",
+    )
+    parser.add_argument(
+        "--gate-expert-quant",
+        choices=("none", "nf4", "int8", "int8_per_expert"),
+        default="none",
+        help="Quantize the fused MoE expert stacks, which bitsandbytes' "
+        "nn.Linear walker cannot reach. 'nf4' is 4-bit (~9%% weight error), "
+        "'int8' is row-wise 8-bit (~0.8%% error) and keeps code generation "
+        "intact at twice the memory, 'int8_per_expert' is the same 8-bit "
+        "encoding but dequantizes only the routed experts, which is several "
+        "times faster to generate with. 'none' leaves the experts in bf16",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--generation-backend",

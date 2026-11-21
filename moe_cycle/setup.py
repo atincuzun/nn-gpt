@@ -114,7 +114,7 @@ def _setup_run(args: Namespace) -> RunContext:
 
     if args.load_in_8bit and args.load_in_4bit:
         raise ValueError("--load-in-8bit and --load-in-4bit are mutually exclusive")
-    if args.load_in_8bit or args.load_in_4bit:
+    if args.load_in_4bit or args.load_in_8bit:
         from importlib.util import find_spec
 
         if find_spec("bitsandbytes") is None:
@@ -130,6 +130,12 @@ def _setup_run(args: Namespace) -> RunContext:
         # NOTE: once any explicit skip list is supplied, transformers drops its
         # automatic output-head protection, so lm_head must be listed here too.
         keep_unquantized = ["gate", "lm_head"]
+
+    # A quantized load of the whole backbone also implies quantized experts: the
+    # fused stacks are the bulk of the weights and stay in bf16 otherwise.
+    expert_quant = getattr(args, "gate_expert_quant", "none")
+    if args.load_in_4bit and expert_quant == "none":
+        expert_quant = "nf4"
 
     model_kwargs: dict[str, Any] = {
         # ``torch_dtype`` is the Transformers ``from_pretrained`` API name.
@@ -152,19 +158,40 @@ def _setup_run(args: Namespace) -> RunContext:
             bnb_4bit_compute_dtype=_dtype(args.dtype),
             llm_int8_skip_modules=list(keep_unquantized),
         )
-    if args.device_map.lower() != "none":
+    if expert_quant != "none":
+        # The fused MoE expert stacks are 3-D nn.Parameters that bitsandbytes'
+        # nn.Linear walker cannot see, so a direct GPU load keeps ~92% of the
+        # weights in bf16 and peaks at the full model size on the device
+        # (transformers#43032). Stage the load on the CPU instead, quantize the
+        # expert stacks afterwards (see expert_quantization), then move the
+        # model to the GPU.
+        model_kwargs["device_map"] = {"": "cpu"}
+    elif args.device_map.lower() != "none":
         device_map = args.device_map
         if (
             device_map == "auto"
             and (args.load_in_8bit or args.load_in_4bit)
             and torch.cuda.device_count() == 1
         ):
-            # Accelerate's automatic mapper reserves enough headroom to push
-            # the final DeepSeek layers to CPU on a 24-GiB card.  The complete
+            # Accelerate's automatic mapper reserves enough headroom to push the
+            # final DeepSeek layers to CPU on a 24-GiB card.  The complete
             # quantized model fits on this GPU, and gate replacement/training
             # requires real (non-meta) router tensors on every layer.
             device_map = "cuda:0"
         model_kwargs["device_map"] = device_map
+
+    if args.load_in_4bit or args.load_in_8bit:
+        # Transformers pre-allocates a buffer the size of the *unquantized*
+        # model before loading quantized weights. On a shared 24 GiB card that
+        # warmup can exceed free VRAM even though the NF4 model itself fits.
+        # The warmup is only an allocator optimization; skip it for QLoRA.
+        try:
+            import transformers.modeling_utils as _modeling_utils
+            if hasattr(_modeling_utils, "caching_allocator_warmup"):
+                _modeling_utils.caching_allocator_warmup = lambda *a, **k: None
+                print("[CYCLE] skipped Transformers allocator warmup for quantized load")
+        except Exception as exc:
+            print(f"[CYCLE] allocator warmup patch unavailable: {exc}")
 
     session = MoEGateSession.from_pretrained(
         args.model,
@@ -194,6 +221,26 @@ def _setup_run(args: Namespace) -> RunContext:
             local_files_only=args.local_files_only,
         )
         session.model = adapted_model.merge_and_unload(safe_merge=True)
+
+    if expert_quant != "none":
+        from .expert_quantization import quantize_fused_experts
+
+        target_device = (
+            "cuda:0"
+            if args.device_map.lower() != "none" and torch.cuda.is_available()
+            else "cpu"
+        )
+        quantized = quantize_fused_experts(
+            session.model, device=target_device, quant_type=expert_quant
+        )
+        if quantized:
+            print(
+                f"[CYCLE] {expert_quant}-quantized {quantized} fused MoE expert "
+                f"stacks on {target_device}"
+            )
+        if target_device != "cpu":
+            session.model.to(target_device)
+        _log_cuda_memory("model on device after expert quantization")
 
     # --------------- discover sites ---------------
 
@@ -237,6 +284,12 @@ def _setup_run(args: Namespace) -> RunContext:
         session.model, tokenizer,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
     )
+    # The chat model has no stop-sequence support, so a generation runs to the
+    # token cap even when the requested block closed long before. Stopping at
+    # the closing tag is what makes a large CV sweep affordable.
+    from .generation_stop import install_tag_stopping_criterion
+
+    install_tag_stopping_criterion(session.model, tokenizer)
     # --------------- capture native behavior ---------------
 
     sample_input = tokenizer(

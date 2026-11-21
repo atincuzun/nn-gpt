@@ -39,7 +39,7 @@ sys.path.insert(0, str(ROOT))
 
 import moe_cycle.phase_b_runner as phase_b_runner_module  # noqa: E402
 from moe_cycle.phase_b_runner import _run_sft_batch_under_best_gate  # noqa: E402
-from moe_cycle.gate_seeds import seed_gate_source  # noqa: E402
+from moe_cycle.gate_catalog import catalog_gate_source  # noqa: E402
 from moe_cycle.morphism import (  # noqa: E402
     _model_logits,
     carry_gate_weights,
@@ -64,7 +64,7 @@ def _tiny_mixtral():
 # parent architecture whose trained weights the successor must inherit. The
 # successor below is what the LLM returns in inherit mode: parent modules
 # kept by name, one new zero-initialized branch appended to the computation.
-PARENT_SOURCE = seed_gate_source(0)
+PARENT_SOURCE = catalog_gate_source(0)
 
 SUCCESSOR_SOURCE = """import torch
 import torch.nn as nn

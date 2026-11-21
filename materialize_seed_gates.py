@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from moe_cycle.gate_seeds import SEED_GATES
+from moe_cycle.gate_catalog import GATE_CATALOG
 from moe_cycle.gate_store import gate_library_name, lemur_id, write_json
 
 
@@ -26,7 +26,7 @@ def main() -> None:
     args = parser.parse_args()
     root = args.out.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    for index, (name, source) in enumerate(SEED_GATES):
+    for index, (name, source) in enumerate(GATE_CATALOG):
         target = root / gate_library_name(source, seed_name=name, kind="seed")
         target.mkdir(parents=True, exist_ok=True)
         (target / "gate.py").write_text(source.rstrip() + "\n", encoding="utf-8")
@@ -40,7 +40,7 @@ def main() -> None:
                 "code_hash": lemur_id(source),
             },
         )
-    print(f"materialized {len(SEED_GATES)} seed gates -> {root}")
+    print(f"materialized {len(GATE_CATALOG)} seed gates -> {root}")
 
 
 if __name__ == "__main__":

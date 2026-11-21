@@ -13,7 +13,7 @@ from .context import (
     _prepare_model_for_generation,
     _ts,
 )
-from .gate_seeds import seed_gate_name, seed_gate_source
+from .gate_catalog import catalog_gate_name, catalog_gate_source
 from .gate_source import _generate_gate, _validate_gate_source
 from .gate_store import (
     best_gate,
@@ -70,7 +70,9 @@ def _prepare_gate_candidate(ctx: RunContext, candidate_index: int, *,
             dataset=dataset,
             seen_hashes=seen_hashes,
             inherit_reference=getattr(args, "gate_carry_forward", None) is not None,
-            write_artifacts=False,
+            variant_key=getattr(args, "gate_prompt_key", "reference_best"),
+            variant_split=getattr(args, "gate_prompt_split", "test"),
+            write_artifacts=True,
             prompt_out=ctx.proposal_attempts,
         )
         source = sources[0]
@@ -306,7 +308,7 @@ def _install_and_verify(ctx: RunContext) -> None:
     session.freeze_except_gates()
 
 
-def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
+def _prepare_catalog_candidate(ctx: RunContext, gate_id: int) -> None:
     """Cold-start bootstrap: install a built-in compliant seed gate.
 
     Seeds bypass the LLM proposal entirely so the store accumulates scored,
@@ -315,27 +317,27 @@ def _prepare_seed_candidate(ctx: RunContext, gate_id: int) -> None:
     if they ever stop complying.
     """
     ctx.candidate_index = gate_id
-    source = seed_gate_source(gate_id)
+    source = catalog_gate_source(gate_id)
     _validate_gate_source(source, ctx.shapes)
     ctx.candidate_root = create_gate_entry(
         ctx.gate_root, gate_id, source,
-        seed_name=seed_gate_name(gate_id), kind="seed",
+        seed_name=catalog_gate_name(gate_id), kind="seed",
     )
     ctx.gate_dir = ctx.candidate_root
     ctx.proposal_prompt = (
-        f"[cold-start bootstrap] built-in seed gate '{seed_gate_name(gate_id)}' "
+        f"[cold-start bootstrap] built-in seed gate '{catalog_gate_name(gate_id)}' "
         "installed without an LLM proposal"
     )
     ctx.proposal_attempts = []
     ctx.gate_source = source
     ctx.seeded = True
-    ctx.seed_name = seed_gate_name(gate_id)
+    ctx.seed_name = catalog_gate_name(gate_id)
     ctx.gate_kind = "seed"
     ctx.previous_feedback_summary = _initial_feedback_summary(source)
     ctx.used_prompts.clear()
     print(
         f"[GATE SEARCH] gate {gate_id:03d} seeded (cold-start bootstrap): "
-        f"{seed_gate_name(gate_id)}"
+        f"{catalog_gate_name(gate_id)}"
     )
 
 
